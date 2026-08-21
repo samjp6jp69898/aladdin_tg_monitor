@@ -1,0 +1,375 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<title>tg-monitor</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root{--bg:#0f1216;--panel:#171b21;--line:#262c35;--fg:#e6e9ee;--mute:#8b94a3;--ok:#3ddc84;--bad:#ff5c5c;--warn:#ffb547;--acc:#5aa9ff;--mono:ui-monospace,SFMono-Regular,Menlo,monospace}
+  *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:18px/1.5 -apple-system,BlinkMacSystemFont,"PingFang TC","Noto Sans TC",sans-serif}
+  header{display:flex;align-items:center;gap:20px;padding:12px 22px;border-bottom:1px solid var(--line);background:var(--panel);position:sticky;top:0;z-index:2}
+  header h1{font-size:20px;margin:0}
+  nav button{background:none;border:1px solid transparent;color:var(--mute);padding:8px 14px;border-radius:6px;cursor:pointer;font-size:18px}
+  nav button.on{color:var(--fg);border-color:var(--line);background:var(--bg)}
+  #clock{margin-left:auto;color:var(--mute);font-family:var(--mono);font-size:16px}
+  main{padding:20px 22px;max-width:1700px;margin:0 auto}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(440px,1fr));gap:16px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 18px;min-width:0}
+  .card h3{margin:0 0 8px;font-size:19px;display:flex;align-items:center;gap:10px}
+  .card h3 .nm{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .tags{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px}
+  .dot{width:12px;height:12px;border-radius:50%;background:var(--mute);flex:none}
+  .dot.up{background:var(--ok);box-shadow:0 0 8px var(--ok)}.dot.down{background:var(--bad);box-shadow:0 0 8px var(--bad)}
+  .kv{display:grid;grid-template-columns:minmax(96px,auto) 1fr;gap:6px 12px;font-size:16.5px;color:var(--mute)}
+  .kv b{color:var(--fg);font-weight:500;font-family:var(--mono);word-break:break-all}
+  .users{margin-top:8px;border-top:1px dashed var(--line);padding-top:8px}
+  .user{display:flex;justify-content:space-between;gap:12px;padding:4px 0;flex-wrap:wrap;font-size:17px}
+  .user .who{color:var(--acc);font-weight:600}.user .meta{color:var(--mute);font-family:var(--mono);font-size:15.5px}
+  .pill{display:inline-block;padding:2px 9px;border-radius:10px;font-size:15px;border:1px solid var(--line);color:var(--mute);font-family:var(--mono)}
+  .pill.ok{color:var(--ok);border-color:var(--ok)}.pill.bad{color:var(--bad);border-color:var(--bad)}.pill.warn{color:var(--warn);border-color:var(--warn)}
+  table{width:100%;border-collapse:collapse;font-size:16.5px}
+  th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top;white-space:nowrap}
+  th{color:var(--mute);font-weight:500;position:sticky;top:0;background:var(--panel)}
+  td.mono,th.mono{font-family:var(--mono);font-size:16px}
+  .tools{white-space:normal;min-width:260px;max-width:460px}
+  .tools span{display:inline-block;background:var(--bg);border:1px solid var(--line);border-radius:5px;padding:1px 7px;margin:2px 4px 2px 0;font-family:var(--mono);font-size:15px}
+  .bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
+  input,select{background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-size:17px}
+  button.btn{background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:8px 14px;cursor:pointer}
+  button.btn:hover{border-color:var(--acc)}
+  button.btn.danger{color:var(--bad);border-color:var(--bad);padding:4px 10px;font-size:15px}button.btn.danger:hover{background:var(--bad);color:#fff}
+  pre.log{background:#0a0c10;border:1px solid var(--line);border-radius:10px;padding:14px;font-family:var(--mono);font-size:16px;height:70vh;overflow:auto;white-space:pre-wrap;word-break:break-all;margin:0}
+  .section{margin-bottom:24px}.section h2{font-size:18px;color:var(--mute);margin:0 0 8px;font-weight:500}
+  .err{color:var(--bad)}.ok{color:var(--ok)}.mute{color:var(--mute)}
+  .spark{width:100%;overflow-x:auto}.spark .bar:hover rect{opacity:1;filter:brightness(1.25)}
+  .two{display:grid;grid-template-columns:1fr 1fr;gap:16px}@media(max-width:1000px){.two{grid-template-columns:1fr}}
+  .stack{display:grid;grid-template-columns:1fr;gap:16px}
+  .scroll{max-height:60vh;overflow:auto}
+  a{color:var(--acc)}
+  .turn{border-left:3px solid var(--line);padding:6px 12px;margin:8px 0}
+  .turn.assistant{border-color:var(--acc)}.turn.user{border-color:var(--mute)}
+  .turn .role{font-size:15px;color:var(--mute);margin-bottom:4px;font-family:var(--mono)}
+  .turn pre{white-space:pre-wrap;word-break:break-word;margin:4px 0;font-family:inherit;font-size:16.5px;line-height:1.5}
+  .turn details{margin:4px 0}.turn summary{cursor:pointer;color:var(--warn);font-family:var(--mono);font-size:15px}
+  .turn details.result summary{color:var(--mute)}.turn details.err summary{color:var(--bad)}
+  .turn details pre{font-family:var(--mono);font-size:14.5px;background:#0a0c10;border:1px solid var(--line);border-radius:8px;padding:10px;max-height:40vh;overflow:auto}
+  .turn .thinking{color:var(--mute);font-style:italic}
+  .final{border:1px solid var(--ok);border-radius:10px;padding:12px 14px;background:rgba(61,220,132,.05)}
+  .final pre{white-space:pre-wrap;word-break:break-word;margin:6px 0 0;font-family:inherit}
+  tr.agent-row{cursor:pointer}tr.agent-row:hover td{background:rgba(90,169,255,.08)}tr.agent-row.on td{background:rgba(90,169,255,.15)}
+</style>
+</head>
+<body>
+<header>
+  <h1>tg-monitor</h1>
+  <nav>
+    <button data-tab="overview" class="on">總覽</button>
+    <button data-tab="events">即時序列</button>
+    <button data-tab="sessions">使用 Session</button>
+    <button data-tab="stats">歷史統計</button>
+    <button data-tab="pipelines">Pipelines</button>
+    <button data-tab="logs">Logs</button>
+  </nav>
+  <span id="clock"></span>
+</header>
+<main>
+  <section id="tab-overview">
+    <div class="section"><h2>服務 / Port（每 5 秒探測；「目前使用中」= 最近 <span id="win">5</span> 分鐘內有稽核紀錄的人）</h2><div class="grid" id="cards"></div></div>
+    <div class="two">
+      <div class="card"><h3>背景 Pipeline 併發</h3><div id="pipe-now"></div></div>
+      <div class="card"><h3>最近狀態翻轉</h3><div id="status-log" class="scroll"></div></div>
+    </div>
+  </section>
+
+  <section id="tab-events" hidden>
+    <div class="bar">
+      <select id="ev-service"><option value="">全部服務</option></select>
+      <input id="ev-identity" placeholder="identity（使用者）">
+      <input id="ev-q" placeholder="搜尋 tool / path / result / IP">
+      <label><input type="checkbox" id="ev-errors"> 只看錯誤</label>
+      <label><input type="checkbox" id="ev-live" checked> 自動更新</label>
+      <button class="btn" id="ev-reload">查詢</button>
+      <span class="mute" id="ev-count"></span>
+    </div>
+    <div class="scroll" style="max-height:80vh"><table><thead><tr><th>#</th><th>時間</th><th>服務</th><th>使用者</th><th>事件</th><th>method</th><th>path</th><th>tool</th><th>結果</th><th>耗時</th><th>IP</th><th>agrabah 帳號</th></tr></thead><tbody id="ev-body"></tbody></table></div>
+    <div class="bar" style="margin-top:8px"><button class="btn" id="ev-more">載入更早</button></div>
+  </section>
+
+  <section id="tab-sessions" hidden>
+    <div class="bar">
+      <select id="ss-service"><option value="">全部服務</option></select>
+      <input id="ss-identity" placeholder="identity">
+      <select id="ss-days"><option value="1">1 天</option><option value="7" selected>7 天</option><option value="30">30 天</option><option value="365">1 年</option></select>
+      <button class="btn" id="ss-reload">查詢</button>
+      <span class="mute">同一人連續請求間隔 &lt; <span id="ss-gap">10</span> 分鐘視為同一段 session；tool 欄為該段依序呼叫的工具</span>
+    </div>
+    <div class="scroll" style="max-height:80vh"><table><thead><tr><th>使用者</th><th>服務</th><th>開始</th><th>結束</th><th>時長</th><th>請求</th><th>錯誤</th><th>登入帳號</th><th>IP</th><th>tool 序列</th><th></th></tr></thead><tbody id="ss-body"></tbody></table></div>
+  </section>
+
+  <section id="tab-stats" hidden>
+    <div class="bar"><select id="st-days"><option value="1">1 天</option><option value="7" selected>7 天</option><option value="30">30 天</option><option value="365">1 年</option></select><button class="btn" id="st-reload">重算</button><span class="mute" id="st-total"></span></div>
+    <div class="section card"><h3>近 24 小時每小時請求數</h3><div class="spark" id="st-spark"></div></div>
+    <div class="two">
+      <div class="card"><h3>每日 × 服務</h3><div class="scroll" id="st-perday"></div></div>
+      <div class="card"><h3>使用者排行</h3><div class="scroll" id="st-ident"></div></div>
+      <div class="card"><h3>tool 排行（次數 / 錯誤 / 平均耗時）</h3><div class="scroll" id="st-tools"></div></div>
+      <div class="card"><h3>認證失敗來源</h3><div class="scroll" id="st-auth"></div></div>
+    </div>
+    <div class="card" style="margin-top:12px"><h3>Token 名冊（不含 token 值）</h3><div class="scroll" id="st-roster"></div></div>
+  </section>
+
+  <section id="tab-pipelines" hidden>
+    <div class="bar"><button class="btn" id="pl-reload">重新整理</button><span class="mute">資料來源：telegram-dispatcher/logs 逐票 log 檔名 + ps 行程表。需求單（demand）的進度在共用的 demand-pipeline.log，逐票 stdout 為空是正常的。</span></div>
+    <div id="pl-list">
+    <div class="scroll" style="max-height:80vh"><table><thead><tr><th>狀態</th><th>類型</th><th>票號</th><th>開始</th><th>結束</th><th>耗時</th><th>agents</th><th>tokens in / out</th><th>費用</th><th>結果</th><th>log</th><th></th></tr></thead><tbody id="pl-body"></tbody></table></div>
+    </div>
+    <div id="pl-detail" hidden>
+      <div class="bar"><button class="btn" onclick="closeRun()">← 返回列表</button><span id="pd-title" style="font-size:20px;font-weight:600"></span><span id="pd-sub" class="mute"></span></div>
+      <div class="stack">
+        <div class="card"><h3>Agent 流程（依開始時間）</h3><div class="scroll"><table><thead><tr><th>#</th><th>stage</th><th>開始</th><th>耗時</th><th>model</th><th>turns</th><th>tools</th><th>in (fresh/cache)</th><th>out</th><th>費用</th><th>狀態</th></tr></thead><tbody id="pd-agents"></tbody></table></div><div id="pd-total" class="mute" style="margin-top:8px"></div></div>
+        <div class="card"><h3>進度 log</h3><div class="scroll" id="pd-progress"></div></div>
+      </div>
+      <div class="card" style="margin-top:16px" id="pd-conv-card" hidden>
+        <h3 id="pd-conv-title"></h3>
+        <div class="bar" id="pd-conv-meta"></div>
+        <details><summary>Prompt（輸入給 agent 的完整提示）</summary><pre class="log" style="height:auto;max-height:40vh" id="pd-prompt"></pre></details>
+        <div id="pd-turns" style="margin-top:12px"></div>
+        <div id="pd-result" style="margin-top:12px"></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="tab-logs" hidden>
+    <div class="bar">
+      <select id="lg-file" style="min-width:420px"></select>
+      <select id="lg-kb"><option value="16">16KB</option><option value="64" selected>64KB</option><option value="256">256KB</option><option value="1024">1MB</option></select>
+      <label><input type="checkbox" id="lg-follow" checked> 即時跟隨</label>
+      <button class="btn" id="lg-reload">重新載入</button>
+      <span class="mute" id="lg-info"></span>
+    </div>
+    <pre class="log" id="lg-out"></pre>
+  </section>
+</main>
+
+<script>
+const $ = s => document.querySelector(s)
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))
+const fmt = ts => ts ? new Date(ts).toLocaleString('zh-TW', {hour12:false}) : '-'
+const ago = ts => { if(!ts) return '-'; const s=Math.max(0,(Date.now()-Date.parse(ts))/1000); return s<60?`${s|0}s前`:s<3600?`${(s/60)|0}m前`:s<86400?`${(s/3600)|0}h前`:`${(s/86400)|0}d前` }
+const dur = (a,b) => { if(!a) return '-'; const s=((b?Date.parse(b):Date.now())-Date.parse(a))/1000; return s<60?`${s|0}s`:s<3600?`${(s/60)|0}m${(s%60)|0}s`:`${(s/3600)|0}h${((s%3600)/60)|0}m` }
+const upt = s => s==null?'-':s<3600?`${(s/60)|0}m`:s<86400?`${(s/3600)|0}h${((s%3600)/60)|0}m`:`${(s/86400)|0}d${((s%86400)/3600)|0}h`
+const resPill = r => { if(!r||r==='unknown') return '<span class="pill">'+esc(r||'-')+'</span>'; if(r==='success') return '<span class="pill ok">success</span>'; return '<span class="pill bad">'+esc(r)+'</span>' }
+const api = (p) => fetch(p).then(r => r.json())
+let services = []
+
+// ---- tabs ----
+let tab = location.hash.slice(1) || 'overview'
+document.querySelectorAll('nav button').forEach(b => b.onclick = () => showTab(b.dataset.tab))
+function showTab(t){ tab=t; location.hash=t; document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('on',b.dataset.tab===t)); document.querySelectorAll('main > section').forEach(s=>s.hidden = s.id!=='tab-'+t); refresh(true) }
+setInterval(()=>{ $('#clock').textContent = new Date().toLocaleString('zh-TW',{hour12:false}) },1000)
+
+// ---- overview ----
+async function loadOverview(){
+  const d = await api('/api/overview'); services = d.services; $('#win').textContent = d.activeWindowMin
+  fillServiceSelects()
+  $('#cards').innerHTML = d.services.map(s => {
+    const p = s.probe || {}; const up = p.status==='up'
+    const users = s.hasAudit ? (s.activeUsers.length ? s.activeUsers.map(u=>`<div class="user"><span class="who">${esc(u.identity)}</span><span class="meta">${u.n} req · ${esc(u.last_tool||'')} · ${ago(u.last_ts)}${u.source_ip?' · '+esc(u.source_ip):''}</span></div>`).join('') : '<div class="mute" style="font-size:12.5px">目前無人使用</div>') : '<div class="mute" style="font-size:12.5px">（此服務無稽核 log，無法歸屬使用者）</div>'
+    return `<div class="card"><h3><span class="dot ${p.status||''}"></span><span class="nm">${esc(s.name)}</span><span class="pill ${up?'ok':'bad'}" style="margin-left:auto">${up?'UP':'DOWN'}</span></h3>
+      <div class="tags"><span class="pill">port ${s.port}</span>${s.proxyPrefix?`<span class="pill">${esc(s.proxyPrefix)}</span>`:''}${s.launchdLabel?`<span class="pill" title="launchd label">${esc(s.launchdLabel.replace('com.aladdin.',''))}</span>`:''}</div>
+      <div class="kv">
+        ${p.detail?`<span>狀態</span><b class="${up?'ok':'err'}">${esc(p.detail)}</b>`:''}
+        <span>PID / 延遲</span><b>${p.pid??'-'} / ${p.latencyMs!=null?p.latencyMs+'ms':'-'}</b>
+        <span>uptime</span><b>${upt(p.uptimeSeconds)}${s.lastStatusChange?` <span class="mute">(${s.lastStatusChange.status} ${ago(s.lastStatusChange.ts)})</span>`:''}</b>
+        ${s.hasAudit?`<span>請求 1h / 24h</span><b>${s.req1h} / ${s.req24h} <span class="${s.err24h?'err':'mute'}">錯誤 ${s.err24h}</span></b>
+        <span>最後事件</span><b>${s.lastEvent?`${esc(s.lastEvent.identity||'-')} ${esc(s.lastEvent.tool||s.lastEvent.path||'')} ${ago(s.lastEvent.ts)}`:'-'}</b>
+        <span>名冊人數</span><b>${s.rosterSize}</b>`:''}
+      </div>
+      <div class="users">${users}</div></div>`
+  }).join('')
+  const pp = d.pipelines
+  $('#pipe-now').innerHTML = `<div class="kv"><span>Bug /create-mr</span><b>${pp.bugSlots.used} / ${pp.bugSlots.limit}</b><span>需求 pipeline</span><b>${pp.demandSlots.used} / ${pp.demandSlots.limit}</b><span>bug-lock</span><b>${pp.locks.length?pp.locks.map(l=>esc(l.ticket)).join(', '):'無'}</b></div>
+    ${pp.running.length?'<table style="margin-top:8px"><tr><th>類型</th><th>票號</th><th>已跑</th><th>PID</th><th>附註</th><th></th></tr>'+pp.running.map(r=>`<tr><td>${r.kind}</td><td class="mono">${esc(r.ticket)}</td><td class="mono">${esc(r.etime)}</td><td class="mono">${r.pid}</td><td class="mono" style="white-space:normal">${esc(r.kind==='demand'?r.extra:'')}</td><td>${cancelBtn(r.kind,r.ticket)}</td></tr>`).join('')+'</table>':'<div class="mute" style="margin-top:8px">目前沒有背景 pipeline 在跑</div>'}`
+  const sl = await api('/api/status-log')
+  $('#status-log').innerHTML = sl.rows.length ? '<table>'+sl.rows.slice(0,30).map(r=>`<tr><td class="mono">${fmt(r.ts)}</td><td>${esc(r.service)}</td><td class="${r.status==='up'?'ok':'err'}">${r.status}</td><td class="mono mute">${esc(r.detail||'')}</td></tr>`).join('')+'</table>' : '<div class="mute">尚無紀錄</div>'
+}
+function fillServiceSelects(){
+  for (const id of ['#ev-service','#ss-service']) { const sel=$(id); if (sel.options.length>1) continue; services.filter(s=>s.hasAudit).forEach(s=>{ const o=document.createElement('option'); o.value=s.id; o.textContent=`${s.name} :${s.port}`; sel.appendChild(o) }) }
+}
+
+// ---- events ----
+let evOldest = null
+function evQuery(before){ const p=new URLSearchParams(); const s=$('#ev-service').value, i=$('#ev-identity').value.trim(), q=$('#ev-q').value.trim(); if(s)p.set('service',s); if(i)p.set('identity',i); if(q)p.set('q',q); if($('#ev-errors').checked)p.set('errors','1'); if(before)p.set('before_id',before); p.set('limit','200'); return '/api/events?'+p }
+const evRow = r => `<tr><td class="mono mute">${r.id}</td><td class="mono">${fmt(r.ts)}</td><td>${esc(r.service)}</td><td><b style="color:var(--acc)">${esc(r.identity||'')}</b></td><td>${r.event==='auth_failure'?'<span class="pill bad">auth_failure</span>':'<span class="pill">req</span>'}</td><td class="mono">${esc(r.method||'')}</td><td class="mono">${esc(r.path||'')}</td><td class="mono">${esc(r.tool||'')}</td><td>${r.event==='auth_failure'?'<span class="pill bad">'+esc(r.reason||'')+'</span>':resPill(r.result)}</td><td class="mono">${r.duration_ms??''}${r.duration_ms!=null?'ms':''}</td><td class="mono mute">${esc(r.source_ip||'')}</td><td class="mono">${esc(r.agrabah_identifier||'')}</td></tr>`
+async function loadEvents(append){
+  const d = await api(evQuery(append?evOldest:null))
+  if (!append) $('#ev-body').innerHTML = ''
+  $('#ev-body').insertAdjacentHTML('beforeend', d.rows.map(evRow).join(''))
+  if (d.rows.length) evOldest = d.rows[d.rows.length-1].id
+  $('#ev-count').textContent = `顯示 ${$('#ev-body').children.length} 筆`
+}
+$('#ev-reload').onclick = () => loadEvents(false); $('#ev-more').onclick = () => loadEvents(true)
+;['#ev-service','#ev-errors'].forEach(s=>$(s).onchange=()=>loadEvents(false))
+;['#ev-identity','#ev-q'].forEach(s=>$(s).onkeydown=e=>{ if(e.key==='Enter') loadEvents(false) })
+
+// ---- sessions ----
+async function loadSessions(){
+  const p=new URLSearchParams(); if($('#ss-service').value)p.set('service',$('#ss-service').value); if($('#ss-identity').value.trim())p.set('identity',$('#ss-identity').value.trim()); p.set('days',$('#ss-days').value)
+  const d = await api('/api/sessions?'+p); $('#ss-gap').textContent=d.gapMin
+  $('#ss-body').innerHTML = d.sessions.map(s=>`<tr><td><b style="color:var(--acc)">${esc(s.identity)}</b></td><td>${esc(s.service)}</td><td class="mono">${fmt(s.start)}</td><td class="mono">${fmt(s.end)} <span class="mute">${ago(s.end)}</span></td><td class="mono">${dur(s.start,s.end)}</td><td class="mono">${s.count}</td><td class="mono ${s.errors?'err':''}">${s.errors}</td><td class="mono">${esc(s.logins.join(', '))}</td><td class="mono mute">${esc(s.ips.join(', '))}</td><td class="tools">${s.tools.length?s.tools.map(t=>`<span>${esc(t)}</span>`).join(''):'<span class="mute">（只有握手，未呼叫 tool）</span>'}</td><td><a href="#events" onclick="jumpEvents('${esc(s.service)}','${esc(s.identity)}')">看事件</a></td></tr>`).join('') || '<tr><td colspan="11" class="mute">無資料</td></tr>'
+}
+window.jumpEvents = (svc, who) => { $('#ev-service').value=svc; $('#ev-identity').value=who; showTab('events') }
+$('#ss-reload').onclick = loadSessions; ['#ss-service','#ss-days'].forEach(s=>$(s).onchange=loadSessions); $('#ss-identity').onkeydown=e=>{ if(e.key==='Enter') loadSessions() }
+
+// ---- SVG 長條圖 ----
+function barChart(items){
+  const W=1200,H=220,padL=46,padR=12,padT=26,padB=34
+  const max=Math.max(1,...items.map(x=>x.n))
+  const step=max<=5?1:Math.ceil(max/4)
+  const top=Math.ceil(max/step)*step
+  const cw=W-padL-padR, ch=H-padT-padB, bw=cw/items.length
+  const y=v=>padT+ch-(v/top)*ch
+  let g=''
+  for(let v=0;v<=top;v+=step){ g+=`<line x1="${padL}" x2="${W-padR}" y1="${y(v)}" y2="${y(v)}" stroke="var(--line)"/><text x="${padL-8}" y="${y(v)+5}" text-anchor="end" fill="var(--mute)" font-size="13" font-family="var(--mono)">${v}</text>` }
+  const bars=items.map((x,i)=>{
+    const h=(x.n/top)*ch, bx=padL+i*bw+bw*0.15, bh=Math.max(x.n?2:0,h)
+    const label=x.t.toLocaleString('zh-TW',{hour12:false,month:'numeric',day:'numeric',hour:'2-digit'})+':00'
+    return `<g class="bar"><title>${label} → ${x.n} 次</title>
+      <rect x="${bx}" y="${y(x.n)-(x.n?0:0)}" width="${bw*0.7}" height="${bh}" rx="3" fill="var(--acc)" opacity="${x.n?0.85:0.25}"/>
+      ${x.n?`<text x="${bx+bw*0.35}" y="${y(x.n)-6}" text-anchor="middle" fill="var(--fg)" font-size="13" font-family="var(--mono)">${x.n}</text>`:''}
+      <text x="${bx+bw*0.35}" y="${H-padB+18}" text-anchor="middle" fill="var(--mute)" font-size="12" font-family="var(--mono)">${String(x.t.getHours()).padStart(2,'0')}</text>
+    </g>`
+  }).join('')
+  return `<svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" style="display:block">${g}${bars}<text x="${W-padR}" y="14" text-anchor="end" fill="var(--mute)" font-size="12">X 軸：本地時間（時）　Y 軸：請求數</text></svg>`
+}
+
+// ---- stats ----
+async function loadStats(){
+  const d = await api('/api/stats?days='+$('#st-days').value)
+  $('#st-total').textContent = `資料庫共 ${d.totalEvents} 筆事件`
+  // 伺服器以 UTC 小時分組（ts 前 13 碼）；比對用 UTC key，顯示用本地時間
+  const hours=[...Array(24)].map((_,i)=>{ const t=new Date(Date.now()-(23-i)*3600e3); const h=t.toISOString().slice(0,13); return {h, t, n:(d.perHour.find(x=>x.hour===h)||{}).n||0} })
+  $('#st-spark').innerHTML = barChart(hours)
+  const days=[...new Set(d.perDay.map(x=>x.day))], svcs=[...new Set(d.perDay.map(x=>x.service))]
+  $('#st-perday').innerHTML = days.length?'<table><tr><th>日期</th>'+svcs.map(s=>`<th>${esc(s)}</th>`).join('')+'</tr>'+days.reverse().map(day=>`<tr><td class="mono">${day}</td>${svcs.map(s=>`<td class="mono">${(d.perDay.find(x=>x.day===day&&x.service===s)||{}).n||''}</td>`).join('')}</tr>`).join('')+'</table>':'<div class="mute">無資料</div>'
+  $('#st-ident').innerHTML = d.topIdentities.length?'<table>'+d.topIdentities.map(r=>`<tr><td><b style="color:var(--acc)">${esc(r.identity)}</b></td><td>${esc(r.service)}</td><td class="mono">${r.n}</td><td class="mono mute">${ago(r.last_ts)}</td></tr>`).join('')+'</table>':'<div class="mute">無資料</div>'
+  $('#st-tools').innerHTML = d.topTools.length?'<table>'+d.topTools.map(r=>`<tr><td class="mono">${esc(r.tool)}</td><td>${esc(r.service)}</td><td class="mono">${r.n}</td><td class="mono ${r.errors?'err':''}">${r.errors}</td><td class="mono mute">${r.avg_ms??'-'}ms</td></tr>`).join('')+'</table>':'<div class="mute">尚無 tool 呼叫</div>'
+  $('#st-auth').innerHTML = d.authFailures.length?'<table>'+d.authFailures.map(r=>`<tr><td>${esc(r.service)}</td><td class="mono">${esc(r.source_ip||'')}</td><td class="mono err">${esc(r.reason||'')}</td><td class="mono">${r.n}</td><td class="mono mute">${ago(r.last_ts)}</td></tr>`).join('')+'</table>':'<div class="ok">期間內無認證失敗</div>'
+  const ro = await api('/api/rosters')
+  $('#st-roster').innerHTML = '<table><tr><th>服務</th><th>id</th><th>display_name</th><th>核發時間</th></tr>'+ro.flatMap(x=>x.roster.map(t=>`<tr><td>${esc(x.service)}</td><td class="mono">${esc(t.id)}</td><td>${esc(t.display_name)}</td><td class="mono mute">${fmt(t.issued_at)}</td></tr>`)).join('')+'</table>'
+}
+$('#st-reload').onclick = loadStats; $('#st-days').onchange = loadStats
+
+// ---- cancel ----
+const cancelBtn = (kind, ticket) => `<button class="btn danger" onclick="cancelPipeline('${kind}','${esc(ticket)}')">取消</button>`
+window.cancelPipeline = async (kind, ticket) => {
+  if (!confirm(`確定要取消 ${kind} pipeline ${ticket}？\n\n會送 SIGTERM 給整棵行程樹；wrapper 的收尾會照常執行（釋放 bug-lock、發 TG「異常終止」通知給認領人、釋放併發名額）。`)) return
+  const r = await fetch('/api/pipelines/cancel', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ kind, ticket }) }).then(x=>x.json()).catch(e=>({ok:false, reason:String(e)}))
+  alert(r.ok ? `已送出取消：對 ${r.killed.length} 個子行程送出 SIGTERM（${r.killed.join(', ')}），wrapper ${r.wrapperPid} 會自行收尾。幾秒後列表會更新。` : `取消失敗：${r.reason||'unknown'}`)
+  refresh(true)
+}
+
+// ---- pipeline 詳情 ----
+const fmtTok = n => n==null?'-':n>=1e6?(n/1e6).toFixed(2)+'M':n>=1e3?(n/1e3).toFixed(1)+'k':String(n)
+let curRunKey = null, curAgentPath = null
+window.openRun = async key => { curRunKey = key; curAgentPath = null; $('#pl-list').hidden = true; $('#pl-detail').hidden = false; $('#pd-conv-card').hidden = true; await loadRunDetail() }
+window.closeRun = () => { curRunKey = null; curAgentPath = null; $('#pl-detail').hidden = true; $('#pl-list').hidden = false; loadPipelines() }
+async function loadRunDetail(){
+  if (!curRunKey) return
+  const d = await api('/api/pipelines/run?key='+encodeURIComponent(curRunKey))
+  if (d.error) { $('#pd-title').textContent = '找不到紀錄'; return }
+  const r = d.run
+  $('#pd-title').textContent = `${r.ticket}（${r.kind}）`
+  $('#pd-sub').textContent = `${fmt(r.started_at)} → ${r.finished_at?fmt(r.finished_at):'進行中'} · ${dur(r.started_at,r.finished_at)} · ${r.running?'running':(r.outcome||'')}`
+  $('#pd-agents').innerHTML = r.agents.length ? r.agents.map((a,i)=>`<tr class="agent-row ${a.path===curAgentPath?'on':''}" onclick="openAgent('${esc(a.path)}')">
+    <td class="mono mute">${i+1}</td><td class="mono"><b>${esc(a.stage)}</b></td><td class="mono">${fmt(a.started_at).slice(-8)}</td><td class="mono">${a.ended_at?dur(a.started_at,a.ended_at):'<span class="warn">進行中</span>'}</td>
+    <td class="mono" style="font-size:14px">${esc(a.model||'')}</td><td class="mono">${a.num_turns??''}</td><td class="mono">${a.tool_calls}</td>
+    <td class="mono">${fmtTok(a.input_tokens)} / ${fmtTok((a.cache_read_tokens||0)+(a.cache_create_tokens||0))}</td><td class="mono">${fmtTok(a.output_tokens)}</td>
+    <td class="mono">${a.cost_usd!=null?'$'+a.cost_usd.toFixed(3):''}</td><td>${a.is_error?'<span class="pill bad">error</span>':(a.ended_at?'<span class="pill ok">ok</span>':'<span class="pill warn">running</span>')}</td></tr>`).join('')
+    : `<tr><td colspan="11" class="mute">${r.kind==='demand'?'尚無 agent trace（只有 2026-08-21 12:30 之後觸發的需求單才有；更早的執行 dispatcher 沒有保存 agent 輸出）':'Bug pipeline 結束後才會解析 stdout 的用量'}</td></tr>`
+  $('#pd-total').textContent = r.agents.length ? `合計 ${r.agents.length} 個 agent · input ${fmtTok(r.total_input)}（含 cache）· output ${fmtTok(r.total_output)} · 費用 $${r.total_cost.toFixed(4)}` : ''
+  $('#pd-progress').innerHTML = d.progress.length ? '<table>'+d.progress.map(p=>`<tr><td class="mono mute">${fmt(p.ts).slice(-8)}</td><td style="white-space:normal">${esc(p.msg)}</td></tr>`).join('')+'</table>' : (r.kind==='demand'?'<div class="mute">此區間 demand-pipeline.log 沒有紀錄</div>':'<div class="mute">（Bug pipeline 的進度請看 stdout log）</div>')
+}
+const blockHtml = b => {
+  if (b.type==='text') return `<pre>${esc(b.text)}</pre>`
+  if (b.type==='thinking') return `<details><summary>thinking</summary><pre class="thinking">${esc(b.text)}</pre></details>`
+  if (b.type==='tool_use') return `<details><summary>🔧 ${esc(b.name)}</summary><pre>${esc(JSON.stringify(b.input,null,2))}</pre></details>`
+  if (b.type==='tool_result') return `<details class="result ${b.is_error?'err':''}"><summary>${b.is_error?'❌':'↩'} tool_result${b.is_error?'（錯誤）':''} · ${(b.content||'').length} 字</summary><pre>${esc(b.content)}</pre></details>`
+  return `<div class="mute">[${esc(b.type)}]</div>`
+}
+window.openAgent = async path => {
+  curAgentPath = path
+  document.querySelectorAll('.agent-row').forEach(tr=>tr.classList.toggle('on', tr.getAttribute('onclick').includes(path)))
+  const d = await api('/api/agent-trace?path='+encodeURIComponent(path))
+  $('#pd-conv-card').hidden = false
+  if (d.error) { $('#pd-conv-title').textContent = d.error; return }
+  const m = d.meta, sm = d.summary
+  $('#pd-conv-title').textContent = `${m.stage}${m.ticket?' · '+m.ticket:''}`
+  $('#pd-conv-meta').innerHTML = [
+    m.startedAt?`<span class="pill">${fmt(m.startedAt)} → ${m.endedAt?fmt(m.endedAt).slice(-8):'…'}（${dur(m.startedAt,m.endedAt)}）</span>`:'',
+    sm.model?`<span class="pill">${esc(sm.model)}</span>`:'',
+    `<span class="pill">turns ${sm.num_turns??'-'}</span><span class="pill">tool calls ${sm.tool_calls}</span>`,
+    `<span class="pill">in ${fmtTok(sm.input_tokens)} + cache ${fmtTok((sm.cache_read_tokens||0)+(sm.cache_create_tokens||0))}</span><span class="pill">out ${fmtTok(sm.output_tokens)}</span>`,
+    sm.cost_usd!=null?`<span class="pill ok">$${sm.cost_usd.toFixed(4)}</span>`:'',
+    m.cwd?`<span class="pill" title="cwd">${esc(m.cwd)}</span>`:'',
+    m.error?`<span class="pill bad">${esc(m.error.message||'error')}</span>`:'',
+  ].join('')
+  $('#pd-prompt').textContent = d.prompt ?? '（bug pipeline：prompt 為 /create-mr 指令，未另存）'
+  $('#pd-turns').innerHTML = d.turns.length ? d.turns.map((t,i)=>`<div class="turn ${t.role}"><div class="role">#${i+1} ${t.role==='assistant'?'🤖 assistant':'👤 tool results'}${t.ts?' · '+fmt(t.ts).slice(-8):''}</div>${t.blocks.map(blockHtml).join('')}</div>`).join('') : (d.rawStdout?`<pre class="log" style="height:auto">${esc(d.rawStdout)}</pre>`:'<div class="mute">沒有對話事件</div>')
+  $('#pd-result').innerHTML = d.result ? `<div class="final"><b>${d.result.is_error?'❌ 最終結果（錯誤）':'✅ 最終產出'}</b> <span class="mute">· ${d.result.subtype||''} · ${d.result.duration_ms?(d.result.duration_ms/1000).toFixed(1)+'s':''}</span><pre>${esc(d.result.text||'（無文字）')}</pre></div>` : ''
+  $('#pd-conv-card').scrollIntoView({behavior:'smooth', block:'start'})
+}
+
+// ---- pipelines ----
+async function loadPipelines(){
+  const d = await api('/api/pipelines')
+  $('#pl-body').innerHTML = d.rows.map(r=>`<tr><td>${r.running?'<span class="pill warn">running</span>':(r.finished_at?'<span class="pill">done</span>':'<span class="pill bad">unknown</span>')}</td><td>${r.kind}</td><td class="mono"><a href="#pipelines" onclick="openRun('${esc(r.key)}');return false">${esc(r.ticket)}</a></td><td class="mono">${fmt(r.started_at)}</td><td class="mono">${fmt(r.finished_at)}</td><td class="mono">${dur(r.started_at,r.finished_at)}</td><td class="mono">${r.agent_count||''}</td><td class="mono">${r.agent_count?fmtTok(r.total_input)+' / '+fmtTok(r.total_output):''}</td><td class="mono">${r.agent_count?'$'+r.total_cost.toFixed(3):''}</td><td>${r.outcome==='cancelled'?'<span class="pill warn">cancelled</span>':(r.outcome?resPill(r.outcome==='success'?'success':r.outcome.split(' ')[0]):'')}</td><td>${r.kind==='demand'?`<a href="#logs" onclick="openLog('/Users/user/aladdin/telegram-dispatcher/logs/demand-pipeline.log')" title="需求 pipeline 的進度全部寫在共用的 demand-pipeline.log，逐票 stdout 固定是空的">進度 log</a> · `:`<a href="#logs" onclick="openLog('${esc(r.stdout_path)}')">stdout</a> · `}<a href="#logs" onclick="openLog('${esc(r.stderr_path)}')">stderr</a></td><td>${r.running?cancelBtn(r.kind,r.ticket):''}</td></tr>`).join('') || '<tr><td colspan="12" class="mute">無資料</td></tr>'
+}
+$('#pl-reload').onclick = loadPipelines
+
+// ---- logs ----
+let lgTimer = null, lgOffset = 0
+async function loadLogList(){
+  const d = await api('/api/logs'); const sel=$('#lg-file'); const cur=sel.value; sel.innerHTML=''
+  const add=(label,path,dis)=>{ const o=document.createElement('option'); o.value=path; o.textContent=label; if(dis) o.disabled=true; sel.appendChild(o) }
+  d.registered.forEach(l=>add(`[${l.service}] ${l.label}${l.exists?` (${(l.size/1024).toFixed(1)}KB)`:' (不存在)'}`, l.path, !l.exists))
+  if (d.pipelineLogs.length){ add('── pipeline 逐票 log ──','',true); d.pipelineLogs.forEach(l=>add(`${l.label} (${(l.size/1024).toFixed(1)}KB, ${ago(l.mtime)})`, l.path)) }
+  if (cur) sel.value = cur
+}
+async function loadLog(){
+  const path=$('#lg-file').value; if(!path) return
+  if (lgTimer) { clearInterval(lgTimer); lgTimer=null }
+  const d = await api(`/api/log/tail?path=${encodeURIComponent(path)}&kb=${$('#lg-kb').value}`)
+  const out=$('#lg-out'); out.textContent = d.missing?'(檔案不存在)':d.text; out.scrollTop=out.scrollHeight
+  $('#lg-info').textContent = d.missing?'':`${(d.size/1024).toFixed(1)}KB`
+  lgOffset = d.size || 0
+  if ($('#lg-follow').checked && !d.missing){
+    lgTimer = setInterval(async () => {
+      try {
+        const r = await api(`/api/log/since?path=${encodeURIComponent(path)}&offset=${lgOffset}`)
+        if (r.offset < lgOffset) { out.textContent = '' }
+        lgOffset = r.offset
+        if (r.text) { const atBottom = out.scrollHeight-out.scrollTop-out.clientHeight<40; out.textContent += r.text; if (atBottom) out.scrollTop=out.scrollHeight; $('#lg-info').textContent = `${(lgOffset/1024).toFixed(1)}KB` }
+      } catch {}
+    }, 1500)
+  }
+}
+window.openLog = async p => { await loadLogList(); $('#lg-file').value=p; showTab('logs') }
+$('#lg-file').onchange = loadLog; $('#lg-kb').onchange = loadLog; $('#lg-follow').onchange = loadLog; $('#lg-reload').onclick = loadLog
+
+// ---- refresh loop ----
+async function refresh(force){
+  try {
+    if (tab==='overview') await loadOverview()
+    else if (tab==='events') { if (!services.length) await loadOverview(); if (force || $('#ev-live').checked) await loadEvents(false) }
+    else if (tab==='sessions') { if (!services.length) await loadOverview(); if (force) await loadSessions() }
+    else if (tab==='stats') { if (force) await loadStats() }
+    else if (tab==='pipelines') { if (curRunKey) await loadRunDetail(); else await loadPipelines() }
+    else if (tab==='logs') { if (force) { await loadLogList(); if (!$('#lg-file').value && $('#lg-file').options.length) $('#lg-file').selectedIndex=0; await loadLog() } }
+  } catch (e) { console.error(e) }
+}
+showTab(tab)
+setInterval(()=>refresh(false), 5000)
+</script>
+</body>
+</html>

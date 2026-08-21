@@ -1,0 +1,12 @@
+{
+  "name": "tg-monitor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun run server.ts"
+  },
+  "dependencies": {
+    "hono": "4.12.5"
+  }
+}

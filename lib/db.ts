@@ -1,0 +1,195 @@
+// SQLite 事件庫（bun:sqlite，Bun 內建，不需額外套件）。
+// 存三類東西：稽核事件（誰對哪個服務做了什麼）、服務狀態變化（up/down 序列）、
+// 檔案讀取位移（讓 ingest 重啟後能接著讀，不重複寫入）。
+
+import { Database } from 'bun:sqlite'
+import { mkdirSync } from 'node:fs'
+import { dirname } from 'node:path'
+
+const DB_PATH = process.env.TG_MONITOR_DB ?? new URL('../data/monitor.sqlite', import.meta.url).pathname
+mkdirSync(dirname(DB_PATH), { recursive: true })
+
+export const db = new Database(DB_PATH)
+db.exec('PRAGMA journal_mode = WAL')
+db.exec('PRAGMA synchronous = NORMAL')
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  service TEXT NOT NULL,
+  ts TEXT NOT NULL,
+  event TEXT NOT NULL,           -- request | auth_failure
+  identity TEXT,
+  source_ip TEXT,
+  method TEXT,
+  path TEXT,
+  tool TEXT,
+  result TEXT,
+  agrabah_identifier TEXT,
+  duration_ms INTEGER,
+  reason TEXT,                   -- auth_failure 的失敗原因
+  raw TEXT NOT NULL,
+  UNIQUE(service, raw)           -- 同一行 JSON 不重複匯入（輪替 / 重讀保險）
+);
+CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
+CREATE INDEX IF NOT EXISTS idx_events_service_ts ON events(service, ts);
+CREATE INDEX IF NOT EXISTS idx_events_identity_ts ON events(identity, ts);
+
+CREATE TABLE IF NOT EXISTS status_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  service TEXT NOT NULL,
+  ts TEXT NOT NULL,
+  status TEXT NOT NULL,          -- up | down
+  pid INTEGER,
+  detail TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_status_service_ts ON status_log(service, ts);
+
+CREATE TABLE IF NOT EXISTS file_offsets (
+  path TEXT PRIMARY KEY,
+  inode INTEGER NOT NULL,
+  offset INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS pipeline_runs (
+  key TEXT PRIMARY KEY,          -- <ticket>.<ts> 即 log 檔 base 名
+  kind TEXT NOT NULL,            -- bug | demand
+  ticket TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  stdout_path TEXT,
+  stderr_path TEXT,
+  finished_at TEXT,
+  outcome TEXT
+);
+`)
+db.exec(`
+CREATE TABLE IF NOT EXISTS agent_runs (
+  path TEXT PRIMARY KEY,         -- trace JSON 路徑（bug pipeline 則是 stdout.log 路徑）
+  ticket TEXT NOT NULL,
+  kind TEXT NOT NULL,            -- bug | demand
+  stage TEXT NOT NULL,           -- spec-gate | repo-scope | draft-A | review-* | synthesize | classify | create-mr
+  started_at TEXT NOT NULL,
+  ended_at TEXT,
+  model TEXT,
+  input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER, cache_create_tokens INTEGER,
+  cost_usd REAL,
+  num_turns INTEGER,
+  tool_calls INTEGER,
+  is_error INTEGER NOT NULL DEFAULT 0,
+  result_preview TEXT,
+  file_mtime TEXT NOT NULL       -- 檔案 mtime，變了才重新解析
+);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_ticket ON agent_runs(ticket, started_at);
+`)
+// 既有 DB 補欄位（ALTER 失敗 = 已存在）
+try { db.exec('ALTER TABLE pipeline_runs ADD COLUMN cancelled_at TEXT') } catch {}
+
+export type EventRow = {
+  id: number
+  service: string
+  ts: string
+  event: string
+  identity: string | null
+  source_ip: string | null
+  method: string | null
+  path: string | null
+  tool: string | null
+  result: string | null
+  agrabah_identifier: string | null
+  duration_ms: number | null
+  reason: string | null
+}
+
+const insertEventStmt = db.prepare(`
+  INSERT OR IGNORE INTO events
+    (service, ts, event, identity, source_ip, method, path, tool, result, agrabah_identifier, duration_ms, reason, raw)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`)
+
+export function insertAuditLine(service: string, raw: string): boolean {
+  let j: any
+  try {
+    j = JSON.parse(raw)
+  } catch {
+    return false
+  }
+  if (!j || typeof j !== 'object' || !j.ts) return false
+  const r = insertEventStmt.run(
+    service,
+    String(j.ts),
+    String(j.event ?? 'request'),
+    j.identity ?? null,
+    j.sourceIp ?? null,
+    j.method ?? null,
+    j.path ?? null,
+    j.tool ?? null,
+    j.result ?? null,
+    j.agrabahIdentifier ?? null,
+    typeof j.durationMs === 'number' ? j.durationMs : null,
+    j.reason ?? null,
+    raw,
+  )
+  return r.changes > 0
+}
+
+export const insertMany = db.transaction((service: string, lines: string[]) => {
+  let n = 0
+  for (const l of lines) if (insertAuditLine(service, l)) n++
+  return n
+})
+
+const getOffsetStmt = db.prepare('SELECT inode, offset FROM file_offsets WHERE path = ?')
+const setOffsetStmt = db.prepare(
+  'INSERT INTO file_offsets (path, inode, offset) VALUES (?, ?, ?) ON CONFLICT(path) DO UPDATE SET inode = excluded.inode, offset = excluded.offset',
+)
+export function getOffset(path: string): { inode: number; offset: number } | null {
+  return (getOffsetStmt.get(path) as any) ?? null
+}
+export function setOffset(path: string, inode: number, offset: number) {
+  setOffsetStmt.run(path, inode, offset)
+}
+
+const lastStatusStmt = db.prepare('SELECT status FROM status_log WHERE service = ? ORDER BY id DESC LIMIT 1')
+const insertStatusStmt = db.prepare('INSERT INTO status_log (service, ts, status, pid, detail) VALUES (?, ?, ?, ?, ?)')
+/** 只在狀態翻轉時寫一筆（第一次觀測也寫），回傳是否有寫入 */
+export function recordStatusIfChanged(service: string, status: 'up' | 'down', pid: number | null, detail: string | null): boolean {
+  const last = lastStatusStmt.get(service) as { status: string } | undefined
+  if (last?.status === status) return false
+  insertStatusStmt.run(service, new Date().toISOString(), status, pid, detail)
+  return true
+}
+
+const upsertRunStmt = db.prepare(`
+  INSERT INTO pipeline_runs (key, kind, ticket, started_at, stdout_path, stderr_path)
+  VALUES (?, ?, ?, ?, ?, ?)
+  ON CONFLICT(key) DO NOTHING
+`)
+const finishRunStmt = db.prepare("UPDATE pipeline_runs SET finished_at = ?, outcome = CASE WHEN cancelled_at IS NOT NULL THEN 'cancelled' ELSE ? END WHERE key = ? AND finished_at IS NULL")
+const markCancelledStmt = db.prepare('UPDATE pipeline_runs SET cancelled_at = ? WHERE kind = ? AND ticket = ? AND finished_at IS NULL')
+export function markCancelled(kind: string, ticket: string) {
+  markCancelledStmt.run(new Date().toISOString(), kind, ticket)
+}
+export function upsertRun(key: string, kind: string, ticket: string, startedAt: string, stdoutPath: string, stderrPath: string) {
+  upsertRunStmt.run(key, kind, ticket, startedAt, stdoutPath, stderrPath)
+}
+export function finishRun(key: string, finishedAt: string, outcome: string) {
+  finishRunStmt.run(finishedAt, outcome, key)
+}
+
+const agentMtimeStmt = db.prepare('SELECT file_mtime FROM agent_runs WHERE path = ?')
+const upsertAgentStmt = db.prepare(`
+  INSERT INTO agent_runs (path, ticket, kind, stage, started_at, ended_at, model, input_tokens, output_tokens, cache_read_tokens, cache_create_tokens, cost_usd, num_turns, tool_calls, is_error, result_preview, file_mtime)
+  VALUES (@path, @ticket, @kind, @stage, @started_at, @ended_at, @model, @input_tokens, @output_tokens, @cache_read_tokens, @cache_create_tokens, @cost_usd, @num_turns, @tool_calls, @is_error, @result_preview, @file_mtime)
+  ON CONFLICT(path) DO UPDATE SET ended_at=excluded.ended_at, model=excluded.model, input_tokens=excluded.input_tokens, output_tokens=excluded.output_tokens,
+    cache_read_tokens=excluded.cache_read_tokens, cache_create_tokens=excluded.cache_create_tokens, cost_usd=excluded.cost_usd, num_turns=excluded.num_turns,
+    tool_calls=excluded.tool_calls, is_error=excluded.is_error, result_preview=excluded.result_preview, file_mtime=excluded.file_mtime
+`)
+export function agentRunMtime(path: string): string | null {
+  return (agentMtimeStmt.get(path) as any)?.file_mtime ?? null
+}
+export function upsertAgentRun(row: Record<string, unknown>) {
+  // bun:sqlite 具名參數：綁定物件的 key 要帶 @ 前綴
+  const bound: Record<string, unknown> = {}
+  for (const [k, v] of Object.entries(row)) bound[`@${k}`] = v ?? null
+  upsertAgentStmt.run(bound as any)
+}
