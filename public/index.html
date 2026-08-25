@@ -68,6 +68,8 @@
     <button data-tab="sessions">使用 Session</button>
     <button data-tab="stats">歷史統計</button>
     <button data-tab="pipelines">Pipelines</button>
+    <button data-tab="tg-connected">TG 已連接</button>
+    <button data-tab="tg-pending">TG 待處理</button>
     <button data-tab="logs">Logs</button>
   </nav>
   <span id="clock"></span>
@@ -75,6 +77,10 @@
 <main>
   <section id="tab-overview">
     <div class="section"><h2>服務 / Port（每 5 秒探測；「目前使用中」= 最近 <span id="win">5</span> 分鐘內有稽核紀錄的人）</h2><div class="grid" id="cards"></div></div>
+    <div class="two">
+      <div class="card"><h3>Telegram Webhook</h3><div id="tg-webhook"></div></div>
+      <div class="card"><h3>TG 連接名單</h3><div id="tg-summary"></div></div>
+    </div>
     <div class="two">
       <div class="card"><h3>背景 Pipeline 併發</h3><div id="pipe-now"></div></div>
       <div class="card"><h3>最近狀態翻轉</h3><div id="status-log" class="scroll"></div></div>
@@ -139,6 +145,16 @@
     </div>
   </section>
 
+  <section id="tab-tg-connected" hidden>
+    <div class="bar"><button class="btn" id="tuc-reload">重新整理</button><span class="mute">tech-users.csv 已回填 tg_chat_id 的人。</span></div>
+    <div class="card"><h3>已連接（<span id="tuc-n">0</span>）</h3><div class="scroll" id="tuc-list"></div></div>
+  </section>
+
+  <section id="tab-tg-pending" hidden>
+    <div class="bar"><button class="btn" id="tup-reload">重新整理</button><span class="mute">DM 過 bot 但還沒對映回 CSV 的 chat_id。有人 DM 時會自動觸發 tg-auto-sync：高信心直接寫入，否則會通知維運者；這裡也可以直接手動指定。</span></div>
+    <div class="card"><h3>待處理（<span id="tup-n">0</span>）</h3><div class="scroll" id="tup-list"></div></div>
+  </section>
+
   <section id="tab-logs" hidden>
     <div class="bar">
       <select id="lg-file" style="min-width:420px"></select>
@@ -175,7 +191,7 @@ async function loadOverview(){
   $('#cards').innerHTML = d.services.map(s => {
     const p = s.probe || {}; const up = p.status==='up'
     const users = s.hasAudit ? (s.activeUsers.length ? s.activeUsers.map(u=>`<div class="user"><span class="who">${esc(u.identity)}</span><span class="meta">${u.n} req · ${esc(u.last_tool||'')} · ${ago(u.last_ts)}${u.source_ip?' · '+esc(u.source_ip):''}</span></div>`).join('') : '<div class="mute" style="font-size:12.5px">目前無人使用</div>') : '<div class="mute" style="font-size:12.5px">（此服務無稽核 log，無法歸屬使用者）</div>'
-    return `<div class="card"><h3><span class="dot ${p.status||''}"></span><span class="nm">${esc(s.name)}</span><span class="pill ${up?'ok':'bad'}" style="margin-left:auto">${up?'UP':'DOWN'}</span></h3>
+    return `<div class="card"><h3><span class="dot ${p.status||''}"></span><span class="nm">${esc(s.name)}</span><span class="pill ${up?'ok':'bad'}" style="margin-left:auto">${up?'UP':'DOWN'}</span>${s.launchdLabel?`<button class="btn" style="padding:3px 10px;font-size:14px" onclick="restartService('${esc(s.id)}','${esc(s.name)}')" title="launchctl kickstart -k ${esc(s.launchdLabel)}">重啟</button>`:''}</h3>
       <div class="tags"><span class="pill">port ${s.port}</span>${s.proxyPrefix?`<span class="pill">${esc(s.proxyPrefix)}</span>`:''}${s.launchdLabel?`<span class="pill" title="launchd label">${esc(s.launchdLabel.replace('com.aladdin.',''))}</span>`:''}</div>
       <div class="kv">
         ${p.detail?`<span>狀態</span><b class="${up?'ok':'err'}">${esc(p.detail)}</b>`:''}
@@ -187,11 +203,30 @@ async function loadOverview(){
       </div>
       <div class="users">${users}</div></div>`
   }).join('')
+  const wh = d.webhook || {}
+  $('#tg-webhook').innerHTML = wh.ok ? `<div class="kv">
+      <span>URL</span><b class="mono" style="word-break:break-all">${esc(wh.url||'-')}</b>
+      <span>待送達</span><b class="${wh.pendingUpdateCount?'err':'ok'}">${wh.pendingUpdateCount ?? '-'}</b>
+      <span>上次錯誤</span><b>${wh.lastErrorMessage?esc(wh.lastErrorMessage)+' <span class="mute">('+fmt(wh.lastErrorDate)+' · '+ago(wh.lastErrorDate)+'）</span>':'<span class="ok">無</span>'}</b>
+      <span>邊緣 IP</span><b class="mono">${esc(wh.ipAddress||'-')}</b>
+    </div><div class="mute" style="font-size:14px;margin-top:6px">查詢時間 ${fmt(wh.checkedAt)}（快取 30 秒）；「上次錯誤」只在真的有送達失敗時更新，修好後不會自動清空，時間比對照更重要</div>`
+    : `<div class="err">查詢失敗：${esc(wh.error||'unknown')}</div>`
+  const tgu = d.tgUsers || {}
+  $('#tg-summary').innerHTML = `<div class="kv">
+      <span>已連接</span><b>${tgu.connectedCount ?? '-'} <a href="#tg-connected" onclick="showTab('tg-connected');return false">查看</a></b>
+      <span>待處理</span><b class="${tgu.pendingCount?'err':''}">${tgu.pendingCount ?? '-'} <a href="#tg-pending" onclick="showTab('tg-pending');return false">查看</a></b>
+    </div>`
   const pp = d.pipelines
   $('#pipe-now').innerHTML = `<div class="kv"><span>Bug /create-mr</span><b>${pp.bugSlots.used} / ${pp.bugSlots.limit}</b><span>需求 pipeline</span><b>${pp.demandSlots.used} / ${pp.demandSlots.limit}</b><span>bug-lock</span><b>${pp.locks.length?pp.locks.map(l=>esc(l.ticket)).join(', '):'無'}</b></div>
     ${pp.running.length?'<table style="margin-top:8px"><tr><th>類型</th><th>票號</th><th>已跑</th><th>PID</th><th>附註</th><th></th></tr>'+pp.running.map(r=>`<tr><td>${r.kind}</td><td class="mono">${esc(r.ticket)}</td><td class="mono">${esc(r.etime)}</td><td class="mono">${r.pid}</td><td class="mono" style="white-space:normal">${esc(r.kind==='demand'?r.extra:'')}</td><td>${cancelBtn(r.kind,r.ticket)}</td></tr>`).join('')+'</table>':'<div class="mute" style="margin-top:8px">目前沒有背景 pipeline 在跑</div>'}`
   const sl = await api('/api/status-log')
   $('#status-log').innerHTML = sl.rows.length ? '<table>'+sl.rows.slice(0,30).map(r=>`<tr><td class="mono">${fmt(r.ts)}</td><td>${esc(r.service)}</td><td class="${r.status==='up'?'ok':'err'}">${r.status}</td><td class="mono mute">${esc(r.detail||'')}</td></tr>`).join('')+'</table>' : '<div class="mute">尚無紀錄</div>'
+}
+window.restartService = async (id, name) => {
+  if (!confirm(`確定要重啟「${name}」嗎？\n\n會執行 launchctl kickstart -k 重新拉起該 launchd job，服務會短暫離線幾秒。`)) return
+  const r = await fetch('/api/services/restart', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ id }) }).then(x=>x.json()).catch(e=>({ok:false, result:String(e)}))
+  alert(r.ok ? `已送出重啟：${r.result}` : `重啟失敗：${r.result}`)
+  refresh(true)
 }
 function fillServiceSelects(){
   for (const id of ['#ev-service','#ss-service']) { const sel=$(id); if (sel.options.length>1) continue; services.filter(s=>s.hasAudit).forEach(s=>{ const o=document.createElement('option'); o.value=s.id; o.textContent=`${s.name} :${s.port}`; sel.appendChild(o) }) }
@@ -355,6 +390,49 @@ async function loadLog(){
   }
 }
 window.openLog = async p => { await loadLogList(); $('#lg-file').value=p; showTab('logs') }
+
+// ---- tg-users：已連接 ----
+async function loadTgConnected(){
+  const d = await api('/api/tg-users')
+  $('#tuc-n').textContent = d.connected.length
+  $('#tuc-list').innerHTML = d.connected.length ? '<table><tr><th>姓名</th><th>email</th><th>chat_id</th><th></th></tr>'+d.connected.map(u=>`<tr><td><b style="color:var(--acc)">${esc(u.name)}</b></td><td class="mono">${esc(u.email)}</td><td class="mono">${esc(u.chat_id)}</td><td><button class="btn" onclick="testSendTgUser('${esc(u.email)}')">測試發送</button> <button class="btn danger" onclick="unsetTgUser('${esc(u.email)}','${esc(u.name)}')">取消連接</button></td></tr>`).join('')+'</table>' : '<div class="mute">尚無已連接的同事</div>'
+}
+$('#tuc-reload').onclick = loadTgConnected
+window.testSendTgUser = async (email) => {
+  const text = prompt('要發送的測試訊息：', '這是一則來自 tg-monitor 的測試訊息')
+  if (text === null) return
+  const r = await fetch('/api/tg-users/test', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ email, text }) }).then(x=>x.json()).catch(e=>({ok:false, result:String(e)}))
+  alert(r.ok ? `已送出：${r.result}` : `送出失敗：${r.result}`)
+}
+window.unsetTgUser = async (email, name) => {
+  if (!confirm(`確定要取消 ${name}（${email}）的 Telegram 連接嗎？取消後這個人不會再收到 pipeline 通知，需要重新 DM bot 才能再連上。`)) return
+  const r = await fetch('/api/tg-users/unset', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ email }) }).then(x=>x.json()).catch(e=>({ok:false, result:String(e)}))
+  if (r.ok) { loadTgConnected(); return }
+  alert(`取消失敗：${r.result}`)
+}
+
+// ---- tg-users：待處理（可手動指定技術人員）----
+let techUserOptions = []
+function techUserSelectHtml(chatId){
+  const opts = techUserOptions.map(u=>`<option value="${esc(u.email)}">${esc(u.name)}${u.chat_id?'（現有 chat_id：'+esc(u.chat_id)+'）':''}</option>`).join('')
+  return `<select id="tup-sel-${esc(chatId)}"><option value="">-- 選技術人員 --</option>${opts}</select> <button class="btn" onclick="assignTgUser('${esc(chatId)}')">指定</button>`
+}
+async function loadTgPending(){
+  const d = await api('/api/tg-users')
+  techUserOptions = d.techUsers
+  $('#tup-n').textContent = d.pending.length
+  $('#tup-list').innerHTML = d.pending.length ? '<table><tr><th>chat_id</th><th>first_name</th><th>username</th><th>最後訊息</th><th>指定技術人員</th></tr>'+d.pending.map(p=>`<tr><td class="mono">${esc(p.chat_id)}</td><td>${esc(p.first_name)}${p.last_name?' '+esc(p.last_name):''}</td><td class="mono">${p.username?'@'+esc(p.username):''}</td><td class="mono mute">${fmt(p.last_ts)} <span class="mute">${ago(p.last_ts)}</span></td><td>${techUserSelectHtml(p.chat_id)}</td></tr>`).join('')+'</table>' : '<div class="mute">目前沒有待處理的新 DM</div>'
+}
+$('#tup-reload').onclick = loadTgPending
+window.assignTgUser = async (chatId, force) => {
+  const sel = $(`#tup-sel-${chatId}`)
+  const email = sel ? sel.value : ''
+  if (!email) { alert('請先選一位技術人員'); return }
+  const r = await fetch('/api/tg-users/assign', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ chat_id: chatId, email, force: !!force }) }).then(x=>x.json()).catch(e=>({ok:false, result:String(e)}))
+  if (r.ok) { alert(`指定成功：${r.result}`); loadTgPending(); return }
+  if (String(r.result).startsWith('SET_CONFLICT') && confirm(`${r.result}\n\n這位技術已經有不同的 chat_id，要覆蓋嗎？`)) { await assignTgUser(chatId, true); return }
+  alert(`指定失敗：${r.result}`)
+}
 $('#lg-file').onchange = loadLog; $('#lg-kb').onchange = loadLog; $('#lg-follow').onchange = loadLog; $('#lg-reload').onclick = loadLog
 
 // ---- refresh loop ----
@@ -365,6 +443,8 @@ async function refresh(force){
     else if (tab==='sessions') { if (!services.length) await loadOverview(); if (force) await loadSessions() }
     else if (tab==='stats') { if (force) await loadStats() }
     else if (tab==='pipelines') { if (curRunKey) await loadRunDetail(); else await loadPipelines() }
+    else if (tab==='tg-connected') { if (force) await loadTgConnected() }
+    else if (tab==='tg-pending') { if (force) await loadTgPending() }
     else if (tab==='logs') { if (force) { await loadLogList(); if (!$('#lg-file').value && $('#lg-file').options.length) $('#lg-file').selectedIndex=0; await loadLog() } }
   } catch (e) { console.error(e) }
 }

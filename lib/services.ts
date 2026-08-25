@@ -1,6 +1,8 @@
-// 監控對象登錄表：tg-dispatcher 本體 + 它 proxy 的五支 hosted MCP server + ngrok。
+// 監控對象登錄表：tg-dispatcher 本體 + 它 proxy 的五支 hosted MCP server + Cloudflare tunnel。
 // port / 路徑皆對照 telegram-dispatcher/lib/webhook-server/mcp-proxy.ts 的 PROXY_ROUTES
 // 與各 launchd/run-server*.sh 內的 export 值；改動那邊時這裡要同步。
+
+import { execFileSync } from 'node:child_process'
 
 const ALADDIN = '/Users/user/aladdin'
 const MCPS = `${ALADDIN}/obsidian/mcps`
@@ -12,7 +14,7 @@ export type ServiceDef = {
   port: number
   /** 本機存活探測 URL（一律走 127.0.0.1，不經公網，見 telegram-dispatcher/README.md） */
   healthUrl: string
-  /** proxy 對外前綴（dispatcher 自身 / ngrok 沒有） */
+  /** proxy 對外前綴（dispatcher 自身 / cloudflare-tunnel 沒有） */
   proxyPrefix?: string
   launchdLabel?: string
   /** 稽核 JSONL（H32）；只有 hosted MCP server 有 */
@@ -40,14 +42,18 @@ export const SERVICES: ServiceDef[] = [
     ],
   },
   {
-    id: 'ngrok',
-    name: 'ngrok tunnel',
-    port: 4040,
-    healthUrl: 'http://127.0.0.1:4040/api/tunnels',
-    launchdLabel: 'com.aladdin.tg-dispatch-tunnel',
+    // 2026-08-25：ngrok 已退役（com.aladdin.tg-dispatch-tunnel 已 bootout），
+    // 改監控 Cloudflare Tunnel（aladdin-mcp）本機 connector，查 cloudflared
+    // 自帶的 metrics /ready（見 telegram-dispatcher/lib/webhook-server/
+    // health-monitor.ts 同一套判準）。
+    id: 'cloudflare-tunnel',
+    name: 'Cloudflare tunnel (aladdin-mcp)',
+    port: 20241,
+    healthUrl: 'http://127.0.0.1:20241/ready',
+    launchdLabel: 'com.aladdin.tg-dispatch-tunnel-cloudflare',
     logs: [
-      { label: 'launchd-tunnel.err', path: `${DISPATCHER}/logs/launchd-tunnel.err.log` },
-      { label: 'launchd-tunnel.out', path: `${DISPATCHER}/logs/launchd-tunnel.out.log` },
+      { label: 'launchd-tunnel-cloudflare.err', path: `${DISPATCHER}/logs/launchd-tunnel-cloudflare.err.log` },
+      { label: 'launchd-tunnel-cloudflare.out', path: `${DISPATCHER}/logs/launchd-tunnel-cloudflare.out.log` },
     ],
   },
   {
@@ -137,4 +143,27 @@ export function isAllowedTracePath(p: string): boolean {
   if (p.includes('..')) return false
   if (p.startsWith(`${AGENT_TRACE_DIR}/`) && p.endsWith('.json')) return true
   return p.startsWith(`${DISPATCHER_LOG_DIR}/`) && p.endsWith('.stdout.log')
+}
+
+/**
+ * 重啟登錄表內的服務：只接受登錄表內、有 launchdLabel 的 id（不接受任意字串當
+ * label，避免呼叫端亂傳字串就能重啟這台機器上任何 launchd job）。用
+ * `launchctl kickstart -k` 而不是直接 kill——KeepAlive 的服務其實 kill 掉也會
+ * 自動被拉回來，但 kickstart -k 語意明確（「我要它現在重開」），且對非
+ * KeepAlive 的 job（目前登錄表內沒有，但未來若加）也一樣有效。
+ *
+ * 只接受本機請求（server.ts 只綁 127.0.0.1），呼叫端見 server.ts 的
+ * POST /api/services/restart。
+ */
+export function restartService(id: string): { ok: boolean; result: string } {
+  const svc = SERVICES.find(s => s.id === id)
+  if (!svc) return { ok: false, result: `RESTART_ERR_UNKNOWN_ID: ${id}` }
+  if (!svc.launchdLabel) return { ok: false, result: `RESTART_ERR_NO_LAUNCHD_LABEL: ${id}` }
+  try {
+    const uid = execFileSync('id', ['-u'], { encoding: 'utf8' }).trim()
+    execFileSync('launchctl', ['kickstart', '-k', `gui/${uid}/${svc.launchdLabel}`], { encoding: 'utf8', timeout: 10_000 })
+    return { ok: true, result: `RESTART_OK: ${svc.launchdLabel}` }
+  } catch (err: any) {
+    return { ok: false, result: `RESTART_ERR_EXEC: ${err?.message ?? err}` }
+  }
 }

@@ -1,5 +1,5 @@
 // tg-monitor — 本機監控 UI：tg-dispatcher 與它 proxy 的各 port 目前誰在用、log、
-// 歷史紀錄、請求序列。只綁 127.0.0.1，不經 ngrok、不對外。
+// 歷史紀錄、請求序列。只綁 127.0.0.1，不經 tunnel、不對外。
 //
 //   bun run server.ts          → http://127.0.0.1:8799
 //   TG_MONITOR_PORT=xxxx 可改 port；TG_MONITOR_DB 可改 SQLite 路徑（預設 data/monitor.sqlite）
@@ -7,9 +7,11 @@
 import { Hono } from 'hono'
 import { existsSync, openSync, readSync, closeSync, fstatSync, statSync, readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { SERVICES, DISPATCHER_LOG_DIR, isAllowedLogPath, isAllowedTracePath } from './lib/services.ts'
+import { SERVICES, DISPATCHER_LOG_DIR, isAllowedLogPath, isAllowedTracePath, restartService } from './lib/services.ts'
 import { db } from './lib/db.ts'
 import { startCollectors, getLastProbes, listRunningPipelineProcs, listBugLocks, loadRoster, cancelPipeline, summarizeEvents } from './lib/ingest.ts'
+import { loadConnectedUsers, loadPendingSenders, loadAllTechUsers, assignChatId, unsetChatId, sendTestMessage } from './lib/tg-users.ts'
+import { getWebhookStatus } from './lib/webhook-status.ts'
 
 const PORT = Number(process.env.TG_MONITOR_PORT ?? 8799)
 const ACTIVE_WINDOW_MIN = 5
@@ -35,7 +37,7 @@ const errSinceStmt = db.prepare("SELECT COUNT(*) AS n FROM events WHERE service 
 const lastEventStmt = db.prepare('SELECT ts, identity, tool, path, result FROM events WHERE service = ? ORDER BY ts DESC LIMIT 1')
 const lastStatusChangeStmt = db.prepare('SELECT ts, status FROM status_log WHERE service = ? ORDER BY id DESC LIMIT 1')
 
-app.get('/api/overview', c => {
+app.get('/api/overview', async c => {
   const now = Date.now()
   const activeSince = new Date(now - ACTIVE_WINDOW_MIN * 60_000).toISOString()
   const hourAgo = new Date(now - 3600_000).toISOString()
@@ -58,10 +60,15 @@ app.get('/api/overview', c => {
     rosterSize: loadRoster(s).length,
   }))
   const running = listRunningPipelineProcs()
+  const webhook = await getWebhookStatus()
+  const connected = loadConnectedUsers()
+  const pending = loadPendingSenders()
   return c.json({
     now: new Date(now).toISOString(),
     activeWindowMin: ACTIVE_WINDOW_MIN,
     services,
+    webhook,
+    tgUsers: { connectedCount: connected.length, pendingCount: pending.length },
     pipelines: {
       running,
       bugSlots: { used: running.filter(r => r.kind === 'bug').length, limit: 5 },
@@ -69,6 +76,17 @@ app.get('/api/overview', c => {
       locks: listBugLocks(),
     },
   })
+})
+
+// 重啟登錄表內的服務（只接受本機請求；server 本來就只綁 127.0.0.1）。複用
+// lib/services.ts 的 restartService，id 必須是登錄表內、有 launchdLabel 的
+// 服務，不接受任意字串當 launchd label。
+app.post('/api/services/restart', async c => {
+  const body = (await c.req.json().catch(() => null)) as { id?: string } | null
+  const id = (body?.id ?? '').trim()
+  if (!id) return c.json({ ok: false, result: 'RESTART_ERR_ARGS: missing id' }, 400)
+  const r = restartService(id)
+  return c.json(r, r.ok ? 200 : 409)
 })
 
 // ---------- 事件序列 / 歷史 ----------
@@ -270,6 +288,41 @@ app.post('/api/pipelines/cancel', async c => {
   if ((kind !== 'bug' && kind !== 'demand') || !/^[A-Z]+-\d+$/.test(ticket)) return c.json({ ok: false, reason: 'bad params' }, 400)
   const r = cancelPipeline(kind, ticket)
   console.error(`cancel ${kind} ${ticket}: ${JSON.stringify(r)}`)
+  return c.json(r, r.ok ? 200 : 409)
+})
+
+// ---------- TG 連接同事 ----------
+app.get('/api/tg-users', c => {
+  return c.json({ connected: loadConnectedUsers(), pending: loadPendingSenders(), techUsers: loadAllTechUsers() })
+})
+
+// 待處理列表手動指定技術人員（只接受本機請求；server 本來就只綁 127.0.0.1）。
+// 複用 tg-map-chatids.sh --set，不在這裡重新實作寫 CSV 的邏輯。
+app.post('/api/tg-users/assign', async c => {
+  const body = await c.req.json().catch(() => null) as { chat_id?: string; email?: string; force?: boolean } | null
+  const chatId = (body?.chat_id ?? '').trim()
+  const email = (body?.email ?? '').trim()
+  if (!chatId || !email) return c.json({ ok: false, result: 'SET_ERR_ARGS: missing chat_id/email' }, 400)
+  const r = assignChatId(email, chatId, { force: !!body?.force })
+  return c.json(r, r.ok ? 200 : 409)
+})
+
+// 取消連接（只接受本機請求）：複用 tg-map-chatids.sh --unset。
+app.post('/api/tg-users/unset', async c => {
+  const body = await c.req.json().catch(() => null) as { email?: string } | null
+  const email = (body?.email ?? '').trim()
+  if (!email) return c.json({ ok: false, result: 'UNSET_ERR_ARGS: missing email' }, 400)
+  const r = unsetChatId(email)
+  return c.json(r, r.ok ? 200 : 409)
+})
+
+// 測試發送（只接受本機請求）：複用 tg-notify.sh --email。
+app.post('/api/tg-users/test', async c => {
+  const body = await c.req.json().catch(() => null) as { email?: string; text?: string } | null
+  const email = (body?.email ?? '').trim()
+  const text = (body?.text ?? '').trim() || '這是一則來自 tg-monitor 的測試訊息'
+  if (!email) return c.json({ ok: false, result: 'TG_ERR_ARGS: missing email' }, 400)
+  const r = sendTestMessage(email, text)
   return c.json(r, r.ok ? 200 : 409)
 })
 

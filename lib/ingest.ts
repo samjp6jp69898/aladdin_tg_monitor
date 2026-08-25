@@ -399,10 +399,13 @@ async function probeOne(s: ServiceDef, pid: number | null): Promise<ProbeResult>
       status = 'up'
       const j: any = await r.json().catch(() => null)
       if (j && typeof j.uptime_seconds === 'number') uptime = j.uptime_seconds
-      if (s.id === 'ngrok' && j?.tunnels) {
-        const t = j.tunnels[0]
-        detail = t ? `${t.public_url} → ${t.config?.addr}` : 'no tunnel'
-        if (!t) status = 'down'
+      // cloudflared metrics /ready：{"status":200,"readyConnections":N,"connectorId":"..."}
+      // readyConnections=0 代表行程活著但完全連不上 Cloudflare 邊緣，算 down
+      // （見 telegram-dispatcher/lib/webhook-server/health-monitor.ts 同一套判準）。
+      if (s.id === 'cloudflare-tunnel' && j) {
+        const rc = j.readyConnections
+        detail = `readyConnections=${rc ?? '?'}${j.connectorId ? ' · connector ' + String(j.connectorId).slice(0, 8) : ''}`
+        if (typeof rc !== 'number' || rc <= 0) status = 'down'
       }
     } else detail = `HTTP ${r.status}`
   } catch (err: any) {
