@@ -6,12 +6,24 @@
 
 import { Hono } from 'hono'
 import { existsSync, openSync, readSync, closeSync, fstatSync, statSync, readdirSync, readFileSync } from 'node:fs'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
 import { join } from 'node:path'
 import { SERVICES, DISPATCHER_LOG_DIR, isAllowedLogPath, isAllowedTracePath, restartService } from './lib/services.ts'
 import { db } from './lib/db.ts'
-import { startCollectors, getLastProbes, listRunningPipelineProcs, listBugLocks, loadRoster, cancelPipeline, summarizeEvents } from './lib/ingest.ts'
+import { startCollectors, getLastProbes, listRunningPipelineProcs, listBugLocks, loadRoster, cancelPipeline, summarizeEvents, computeBugStages, readTrackerStatusAsync, isBugOutcomeRetryable, parseClaudeEvents } from './lib/ingest.ts'
+import { getCachedAssignee } from './lib/notion-assignee.ts'
 import { loadConnectedUsers, loadPendingSenders, loadAllTechUsers, assignChatId, unsetChatId, sendTestMessage } from './lib/tg-users.ts'
 import { getWebhookStatus } from './lib/webhook-status.ts'
+
+const execFileAsync = promisify(execFile)
+// telegram-dispatcher 是另一個獨立 repo，跟 tg-monitor 沒有 package.json 依賴
+// 關係——刻意不 import 它的 spawn-create-mr.ts（review 2026-08-25 發現：那樣
+// import 端會耦合到對方的內部型別/傳遞依賴/model-level singleton 狀態，且
+// 兩邊各自獨立的 git 生命週期下互相看不到對方壞掉），改用行程邊界呼叫它新增
+// 的 CLI 入口（`if (import.meta.main)` 那段）：介面只有「argv + stdout JSON +
+// exit code」，兩邊各自的改動不會在編譯期互相牽動。
+const SPAWN_CREATE_MR_SCRIPT = '/Users/user/aladdin/telegram-dispatcher/lib/pipeline-runner/spawn-create-mr.ts'
 
 const PORT = Number(process.env.TG_MONITOR_PORT ?? 8799)
 const ACTIVE_WINDOW_MIN = 5
@@ -203,12 +215,19 @@ app.get('/api/pipelines', c => {
     const k = `${r.kind}:${r.ticket}`
     r.running = !seen.has(k) && r.finished_at === null && running.has(k)
     seen.add(k)
+    r.assignee = getCachedAssignee(r.ticket) ?? null
+    // 前端「重試」按鈕的顯示依據——跟 /api/pipelines/retry 的真正權限判斷共用
+    // 同一個 isBugOutcomeRetryable()，不再各自維護一份判斷式（review 2026-08-25
+    // 發現的前後端不同步問題）。這裡只看已存的 outcome 字串，不額外查一次
+    // tracker（避免對列表裡最多 300 列都同步呼叫 shell）；真正能不能重試以
+    // retry 端點送出當下的即時檢查為準，這裡只保證「大致準、失敗會有清楚錯誤訊息」。
+    r.retryable = r.kind === 'bug' && !r.running && isBugOutcomeRetryable(r.outcome)
   }
   return c.json({ rows })
 })
 
 // 單一 run 詳情：run 本身 + 每個 agent 的摘要
-app.get('/api/pipelines/run', c => {
+app.get('/api/pipelines/run', async c => {
   const key = c.req.query('key') ?? ''
   const run = db.prepare('SELECT * FROM pipeline_runs WHERE key = ?').get(key) as any
   if (!run) return c.json({ error: 'not found' }, 404)
@@ -231,7 +250,18 @@ app.get('/api/pipelines/run', c => {
       }
     }
   }
-  return c.json({ run: me, progress })
+  // Bug pipeline：Debug/{ticket}/{ticket}-*.md 存在與否即階段檢核表，見
+  // computeBugStages 註解——同一張票的多次執行（例如失敗後 rerun）共用同一份
+  // Debug 產物，檢核表用「最新一次」的 run 顯示即可，不逐次分別重算。
+  let stages: ReturnType<typeof computeBugStages> = []
+  if (run.kind === 'bug' && latest.key === me.key) {
+    // 非同步版本（execFile 非 execFileSync）——這個 endpoint 是票詳情頁開著時
+    // 定期輪詢的，用 *Sync 版本會撞 lib/ingest.ts 檔頭記載的「handler 內同步
+    // spawn 遇客戶端中斷會 segfault」既有踩坑（見 listRunningPipelineProcs 旁
+    // 的註解）。
+    stages = computeBugStages(run.ticket, run.started_at, await readTrackerStatusAsync(run.ticket), me.running)
+  }
+  return c.json({ run: me, progress, stages })
 })
 
 // 單一 agent 的完整對話：現讀 trace JSON（或 bug pipeline 的 stdout.log），整理成 turns
@@ -240,10 +270,15 @@ app.get('/api/agent-trace', c => {
   if (!isAllowedTracePath(path)) return c.text('path not allowed', 403)
   if (!existsSync(path)) return c.json({ error: 'missing' }, 404)
   let raw: any
+  const rawText = readFileSync(path, 'utf8')
   try {
-    raw = JSON.parse(readFileSync(path, 'utf8'))
+    raw = JSON.parse(rawText)
   } catch (err) {
-    return c.json({ error: `parse failed: ${err}` }, 500)
+    // 2026-08-26 起 bug pipeline stdout 是 stream-json 的 JSONL（執行中逐行
+    // 落盤，尾行可能寫到一半）——整檔 parse 失敗時改逐行解析成事件陣列，
+    // 跟舊格式（單一 JSON 陣列）走同一條 isTrace=false 路徑。
+    raw = parseClaudeEvents(rawText)
+    if (!raw) return c.json({ error: `parse failed: ${err}` }, 500)
   }
   const isTrace = !Array.isArray(raw)
   const events: any[] = isTrace ? (raw.events ?? []) : raw
@@ -291,6 +326,64 @@ app.post('/api/pipelines/cancel', async c => {
   return c.json(r, r.ok ? 200 : 409)
 })
 
+// 重試（只接受本機請求；server 本來就只綁 127.0.0.1）：2026-08-26 起改為
+// 「續跑」語意（使用者核准的紅區變更）——spawn 時帶 --resume，/create-mr 的
+// Step 0.2 會跑 scripts/resume-inventory.sh 盤點既有 Debug 產物、review 結論
+// 與 mr/ 分支 commit，從最後完成的階段接續（例如三審皆 PASSED → 直接
+// Solution 彙整起；審查有 FAILED → fixer 帶回饋重做）。盤點失敗時 pipeline
+// 自動退回整張全跑，不會卡死。
+//
+// 沿用既有、已合法的機制：tracker.sh 的 rerun 狀態本來就存在（`next` 子指令
+// 本就優先撿 rerun），create-mr.md Step 0.1 claim 本就接受 pending/rerun——
+// 這裡只是新增一個觸發入口，不是新語意。
+//
+// 併發上限用 ps 現場真實計數（listRunningPipelineProcs），不是
+// spawn-create-mr.ts 裡的 in-memory GLOBAL_CONCURRENCY_LIMIT 計數器：那個
+// 計數器只活在 telegram-dispatcher webhook server 自己的 process 記憶體裡
+// （這裡改用 CLI 呼叫，見上面 import 區塊註解，連讀到那個計數器的機會都沒
+// 有），就算讀得到也是另一份從 0 開始、彼此不同步的計數器，用它判斷會允許
+// 超過真正上限。ps 快照不管由哪個 process 觸發都反映同一個事實，天生不會有
+// 這個問題。
+const RETRY_CONCURRENCY_LIMIT = 5 // 跟 telegram-dispatcher/lib/pipeline-runner/concurrency-limiter.ts 的 GLOBAL_CONCURRENCY_LIMIT 同步，兩個 repo 無 import 關係，改動要同步調整
+app.post('/api/pipelines/retry', async c => {
+  const body = await c.req.json().catch(() => null) as { ticket?: string } | null
+  const ticket = body?.ticket ?? ''
+  if (!/^FAQ-\d+$/.test(ticket)) return c.json({ ok: false, reason: 'ticket 格式錯誤（僅支援 FAQ-數字，需求單 ALDREQ 目前不提供這個按鈕）' }, 400)
+
+  const running = listRunningPipelineProcs()
+  if (running.some(p => p.kind === 'bug' && p.ticket === ticket)) return c.json({ ok: false, reason: '這張票目前還在跑，不能重複觸發' }, 409)
+  if (running.filter(p => p.kind === 'bug').length >= RETRY_CONCURRENCY_LIMIT) return c.json({ ok: false, reason: `背景 pipeline 併發已達上限（${RETRY_CONCURRENCY_LIMIT}），稍後再試` }, 429)
+
+  // 即時查一次（非快取、非同步版本），這裡是唯一的權限判斷——上面 /api/pipelines
+  // 回傳的 retryable 只是給前端顯示按鈕用的粗略提示（見 isBugOutcomeRetryable
+  // 註解），送出當下一律以這裡查到的最新狀態為準。'rerun' 也放行：
+  // tracker.sh set ... rerun 成功、但下面 spawn 失敗（或 spawn 成功但新的一次
+  // 執行來不及 claim 就 skipped/crash）時，票會被留在 rerun 狀態——若這裡不放行
+  // rerun，使用者會撞進一個按鈕自己造成、又自己拒絕重試的死路（review 2026-08-25
+  // 發現）。
+  const tracker = await readTrackerStatusAsync(ticket)
+  if (!tracker) return c.json({ ok: false, reason: 'tracker 查無這張票' }, 404)
+  if (tracker.status !== 'failed' && tracker.status !== 'in_progress' && tracker.status !== 'rerun') {
+    return c.json({ ok: false, reason: `目前 tracker 狀態是「${tracker.status}」，只有 failed / in_progress（卡住）/ rerun 才能用這個按鈕重試` }, 409)
+  }
+
+  try {
+    await execFileAsync('bash', ['/Users/user/aladdin/scripts/tracker.sh', 'set', ticket, 'rerun'], { encoding: 'utf8', timeout: 10_000 })
+  } catch (err) {
+    return c.json({ ok: false, reason: `tracker.sh set 失敗：${err}` }, 500)
+  }
+  // CLI 邊界呼叫 telegram-dispatcher 的 spawn-create-mr.ts（見檔頭 import 註解），
+  // 不是直接 import spawnCreateMr——結果走 stdout 一行 JSON + exit code。
+  try {
+    const { stdout } = await execFileAsync('bun', [SPAWN_CREATE_MR_SCRIPT, ticket, '--resume'], { encoding: 'utf8', timeout: 10_000 })
+    const spawned = JSON.parse(stdout.trim()) as { ok: true; pid: number | undefined } | { ok: false; reason: string }
+    if (!spawned.ok) return c.json({ ok: false, reason: `spawn 失敗：${spawned.reason}` }, 500)
+    return c.json({ ok: true, pid: spawned.pid })
+  } catch (err) {
+    return c.json({ ok: false, reason: `spawn 呼叫失敗（票已設回 rerun，可再按一次重試）：${err}` }, 500)
+  }
+})
+
 // ---------- TG 連接同事 ----------
 app.get('/api/tg-users', c => {
   return c.json({ connected: loadConnectedUsers(), pending: loadPendingSenders(), techUsers: loadAllTechUsers() })
@@ -328,6 +421,199 @@ app.post('/api/tg-users/test', async c => {
 
 app.get('/api/rosters', c => {
   return c.json(SERVICES.filter(s => s.tokensPath).map(s => ({ service: s.id, roster: loadRoster(s) })))
+})
+
+// Token 權限總覽：把各名冊以「人」為主鍵樞紐——每人一列、每個 hosted server（環境）
+// 一欄，附核發時間與稽核事件推出的最後使用時間/累計請求數。只讀 id / display_name /
+// issued_at，絕不讀或回傳 token 值（同 loadRoster 的既有紀律）。
+app.get('/api/token-grants', c => {
+  const svcs = SERVICES.filter(s => s.tokensPath)
+  const usage = db.prepare(`SELECT identity, service, MAX(ts) AS last_ts, COUNT(*) AS n FROM events WHERE identity IS NOT NULL AND event = 'request' GROUP BY identity, service`).all() as { identity: string; service: string; last_ts: string; n: number }[]
+  const usageMap = new Map(usage.map(u => [`${u.identity}\u0000${u.service}`, u]))
+  const people = new Map<string, { id: string; display_name: string; grants: Record<string, { issued_at: string; last_ts: string | null; n: number }> }>()
+  for (const s of svcs) {
+    for (const t of loadRoster(s)) {
+      const p = people.get(t.id) ?? { id: t.id, display_name: t.display_name, grants: {} }
+      // 稽核 log 的 identity 有兩種歷史格式：舊事件（含目前線上版本）寫
+      // display_name、audit_log.ts H28 之後寫名冊唯一 id——兩種都比對並合計。
+      // 已知侷限：兩個 id 共用同一個 display_name 時（如打錯字重發的舊 id），
+      // display_name 那份用量會同時算在兩個人頭上，稽核 log 本身無從區分。
+      const byId = usageMap.get(`${t.id}\u0000${s.id}`)
+      const byName = t.display_name && t.display_name !== t.id ? usageMap.get(`${t.display_name}\u0000${s.id}`) : undefined
+      const lastTs = [byId?.last_ts, byName?.last_ts].filter(Boolean).sort().pop() ?? null
+      p.grants[s.id] = { issued_at: t.issued_at, last_ts: lastTs, n: (byId?.n ?? 0) + (byName?.n ?? 0) }
+      people.set(t.id, p)
+    }
+  }
+  return c.json({ services: svcs.map(s => ({ id: s.id, name: s.name })), people: [...people.values()].sort((a, b) => a.id.localeCompare(b.id)) })
+})
+
+// ---------- Token 權限管理（撤銷 / 補簽 / 改名 / 重發 / 新增）----------
+// kit 四環境一律 spawn make-starter-kit.ts、toolsmith 一律 spawn 它自己的
+// manage-tokens.ts（各自都是該名冊的唯一寫入者），monitor 絕不自己改名冊
+// JSON。toolsmith 不屬於企劃 kit（工程師名冊）：token 不進 kit zip，簽發/重簽
+// 時由 manage-tokens.ts 直接把 .mcp.json 片段發到 kit 管理者 TG。
+const MAKE_KIT_SCRIPT = '/Users/user/aladdin/obsidian/mcps/aladdin-ai-assistant-kit/make-starter-kit.ts'
+const TOOLSMITH_TOKENS_SCRIPT = '/Users/user/aladdin/obsidian/mcps/aladdin-toolsmith/manage-tokens.ts'
+const KIT_RESEND_SCRIPT = '/Users/user/aladdin/telegram-dispatcher/lib/webhook-server/kit-resend.ts'
+const KIT_GRANT_BY_SERVICE: Record<string, string> = { 'admin-dev': 'admin-dev', 'admin-pre': 'admin-pre', 'admin-evi': 'admin-evi', 'platform': 'platform-dev-pk' }
+const KIT_ID_PATTERN = /^[a-z][a-z0-9_-]{1,31}$/
+
+async function runTokenScript(script: string, args: string[], timeoutMs: number): Promise<{ ok: boolean; result: string }> {
+  try {
+    const { stdout } = await execFileAsync('bun', [script, ...args], { timeout: timeoutMs })
+    return { ok: true, result: stdout.trim() }
+  } catch (err: any) {
+    return { ok: false, result: String(err?.stderr || err?.stdout || err?.message || err).trim() }
+  }
+}
+const runMakeKit = (args: string[]) => runTokenScript(MAKE_KIT_SCRIPT, args, 30_000)
+const runToolsmithTokens = (args: string[]) => runTokenScript(TOOLSMITH_TOKENS_SCRIPT, args, 90_000) // 含 TG 發送
+const runKitResend = (args: string[]) => runTokenScript(KIT_RESEND_SCRIPT, args, 120_000) // rotate + zip + TG 發送
+
+const rosterHas = (serviceId: string, id: string): boolean => {
+  const s = SERVICES.find(x => x.id === serviceId)
+  return !!s && loadRoster(s).some(t => t.id === id)
+}
+const findDisplayName = (id: string): string => {
+  for (const s of SERVICES.filter(s => s.tokensPath)) {
+    const e = loadRoster(s).find(t => t.id === id)
+    if (e?.display_name) return e.display_name
+  }
+  return ''
+}
+/** 多個底層腳本呼叫的結果彙整：全部成功才算成功，輸出串接。 */
+const combine = (parts: { ok: boolean; result: string }[]) => ({
+  ok: parts.every(p => p.ok),
+  result: parts.map(p => p.result).filter(Boolean).join('\n\n'),
+})
+
+/**
+ * 依 services 清單（畫面勾選狀態）核發/重簽 kit 與 toolsmith 權限，供「新增
+ * token」與「重發 token」共用：清單裡沒有的環境一律不動（不會自動撤銷，撤權
+ * 走既有的「移除」）；有列進來的環境，沒有舊 token 就核發、有舊 token 就重簽。
+ * kit 環境靠 make-starter-kit.ts 的 --rotate 語意本來就同時處理這兩種情況
+ * （見該檔 --rotate 說明）；toolsmith 的 manage-tokens.ts --rotate 要求 id
+ * 已存在於它自己的名冊，所以這裡先查有沒有、沒有就改叫 --issue。
+ *
+ * toolsmith 與 kit 的交付管道整合（2026-08-26）：make-starter-kit.ts 現在會
+ * 唯讀併入 toolsmith 名冊的條目到輸出的 .mcp.json（見該檔 mergeToolsmithGrant）。
+ * 所以這裡固定先跑 toolsmith 動作、再跑 kit 這邊，讓 kit 重建時撈到的是剛
+ * 核發/重簽的新 token；此人只要「有 kit 環境（這次勾的或原本就有的都算）」，
+ * toolsmith 那次呼叫就加 --quiet，改由隨後的 kit zip 把新設定一起帶走，
+ * 不重複發「請手動貼進 .mcp.json」那則訊息。只勾 toolsmith、但此人原本就有
+ * kit 環境時，改叫 make-starter-kit.ts 的 --rebuild（不重簽任何 kit 環境，
+ * 只重新組一次 .mcp.json 把新 toolsmith token 併進去）。
+ */
+async function reconcileGrants(id: string, name: string, services: string[]): Promise<{ ok: boolean; result: string }> {
+  const kitGrants = services.filter(s => s !== 'toolsmith').map(s => KIT_GRANT_BY_SERVICE[s]).filter(Boolean)
+  const wantToolsmith = services.includes('toolsmith')
+  const hasExistingKit = Object.keys(KIT_GRANT_BY_SERVICE).some(svc => rosterHas(svc, id))
+  const willHaveKit = hasExistingKit || kitGrants.length > 0
+  const parts: { ok: boolean; result: string }[] = []
+  if (wantToolsmith) {
+    const hasToolsmith = rosterHas('toolsmith', id)
+    const args = [hasToolsmith ? '--rotate' : '--issue', '--id', id, '--name', name]
+    if (willHaveKit) args.push('--quiet') // 交給 kit zip 一併帶走，不重複發 TG
+    parts.push(await runToolsmithTokens(args))
+  }
+  if (kitGrants.length) {
+    parts.push(await runKitResend(['--id', id, '--name', name, '--grants', kitGrants.join(',')]))
+  } else if (wantToolsmith && hasExistingKit) {
+    // 只勾 toolsmith、但此人已有 kit：不重簽任何 kit 環境，純重建 .mcp.json
+    // 把剛核發/重簽的 toolsmith token 併進去，一樣走 zip+TG 交付（不能只呼叫
+    // runMakeKit 的 --rebuild——那只會落地寫 dist/，不會打包送出去）。
+    parts.push(await runKitResend(['--rebuild', '--id', id, '--name', name]))
+  }
+  return combine(parts)
+}
+
+app.post('/api/token-grants/revoke', async c => {
+  const body = await c.req.json().catch(() => null) as { id?: string; services?: string[] } | null
+  const id = (body?.id ?? '').trim()
+  const services = Array.isArray(body?.services) ? body.services : []
+  if (!KIT_ID_PATTERN.test(id)) return c.json({ ok: false, result: 'REVOKE_ERR_ARGS: id 格式不合法' }, 400)
+  const wantToolsmith = services.includes('toolsmith')
+  const kitGrants = services.filter(s => s !== 'toolsmith').map(s => KIT_GRANT_BY_SERVICE[s])
+  if (!services.length || kitGrants.some(g => !g)) return c.json({ ok: false, result: 'REVOKE_ERR_ARGS: services 只能是 admin-dev / admin-pre / admin-evi / platform / toolsmith' }, 400)
+  const parts: { ok: boolean; result: string }[] = []
+  if (kitGrants.length) parts.push(await runMakeKit(['--revoke', '--id', id, '--grants', kitGrants.join(',')]))
+  if (wantToolsmith) parts.push(await runToolsmithTokens(['--revoke', '--id', id]))
+  const r = combine(parts)
+  return c.json(r, r.ok ? 200 : 409)
+})
+
+app.post('/api/token-grants/add', async c => {
+  const body = await c.req.json().catch(() => null) as { id?: string; service?: string } | null
+  const id = (body?.id ?? '').trim()
+  const service = (body?.service ?? '').trim()
+  if (!KIT_ID_PATTERN.test(id)) return c.json({ ok: false, result: 'ADD_ERR_ARGS: id 格式不合法' }, 400)
+  if (service !== 'toolsmith' && !KIT_GRANT_BY_SERVICE[service]) return c.json({ ok: false, result: 'ADD_ERR_ARGS: service 只能是 admin-dev / admin-pre / admin-evi / platform / toolsmith' }, 400)
+  // 只允許「補簽還沒有的環境」：該環境名冊已有這個 id 時，底層會走 rotate 換掉
+  // 現役 token——那是「重簽」，不該由「簽發」按鈕誤觸。
+  if (rosterHas(service, id)) return c.json({ ok: false, result: 'ADD_ERR_EXISTS: 此環境已有這個 id 的 token（要換新 token 請用「重發 token」）' }, 409)
+  // display_name 從既有任一名冊條目取——能走到「補簽」的人必然已存在於某環境；
+  // 全新的人請走「新增 token」表單。
+  const displayName = findDisplayName(id)
+  if (!displayName) return c.json({ ok: false, result: 'ADD_ERR_NOT_FOUND: 名冊裡找不到這個 id（全新的人請用「新增 token」表單）' }, 404)
+  const r = service === 'toolsmith'
+    ? await runToolsmithTokens(['--issue', '--id', id, '--name', displayName])
+    : await runMakeKit(['--id', id, '--name', displayName, '--grants', KIT_GRANT_BY_SERVICE[service], '--rotate'])
+  return c.json(r, r.ok ? 200 : 409)
+})
+
+// 改顯示名：只動各名冊的 display_name（token 與核發時間不變，不需重新交付）。
+// kit 名冊與 toolsmith 名冊各自有條目才各自改。
+app.post('/api/token-grants/rename', async c => {
+  const body = await c.req.json().catch(() => null) as { id?: string; name?: string } | null
+  const id = (body?.id ?? '').trim()
+  const name = (body?.name ?? '').trim()
+  if (!KIT_ID_PATTERN.test(id)) return c.json({ ok: false, result: 'RENAME_ERR_ARGS: id 格式不合法' }, 400)
+  if (!name || name.length > 64) return c.json({ ok: false, result: 'RENAME_ERR_ARGS: display_name 不能為空且不超過 64 字' }, 400)
+  const inKit = Object.keys(KIT_GRANT_BY_SERVICE).some(s => rosterHas(s, id))
+  const inToolsmith = rosterHas('toolsmith', id)
+  if (!inKit && !inToolsmith) return c.json({ ok: false, result: 'RENAME_ERR_NOT_FOUND: 名冊裡找不到這個 id' }, 404)
+  const parts: { ok: boolean; result: string }[] = []
+  if (inKit) parts.push(await runMakeKit(['--rename', '--id', id, '--name', name]))
+  if (inToolsmith) parts.push(await runToolsmithTokens(['--rename', '--id', id, '--name', name]))
+  const r = combine(parts)
+  return c.json(r, r.ok ? 200 : 409)
+})
+
+// 新增／補齊 token：依勾選的 services 核發或重簽——沒有的環境核發、已有的環境
+// 重簽（見 reconcileGrants）。id 全新或已存在都可以用同一個表單，已存在時等於
+// 「補齊這次勾選但原本沒有的環境」而不會誤觸未勾選的既有環境。
+app.post('/api/token-grants/create', async c => {
+  const body = await c.req.json().catch(() => null) as { id?: string; name?: string; services?: string[] } | null
+  const id = (body?.id ?? '').trim()
+  const name = (body?.name ?? '').trim()
+  const services = Array.isArray(body?.services) ? body.services : []
+  if (!KIT_ID_PATTERN.test(id)) return c.json({ ok: false, result: 'CREATE_ERR_ARGS: id 格式不合法（小寫英數/連字號/底線，2-32 字，小寫字母開頭）' }, 400)
+  if (!name || name.length > 64) return c.json({ ok: false, result: 'CREATE_ERR_ARGS: display_name 不能為空且不超過 64 字' }, 400)
+  const kitGrants = services.filter(s => s !== 'toolsmith').map(s => KIT_GRANT_BY_SERVICE[s])
+  if (!services.length || kitGrants.some(g => !g)) return c.json({ ok: false, result: 'CREATE_ERR_ARGS: services 至少一個，且只能是 admin-dev / admin-pre / admin-evi / platform / toolsmith' }, 400)
+  const r = await reconcileGrants(id, name, services)
+  return c.json(r, r.ok ? 200 : 409)
+})
+
+// 重發：依勾選的 services 核發/重簽並重新交付（見 reconcileGrants）——沒勾的
+// 環境不動、不會自動撤銷。body 沒帶 services 時（例如列表頁的快速「重發
+// token」按鈕，畫面上沒有勾選框）沿用舊行為：對此人名冊裡現有的全部環境重簽。
+app.post('/api/token-grants/resend', async c => {
+  const body = await c.req.json().catch(() => null) as { id?: string; services?: string[] } | null
+  const id = (body?.id ?? '').trim()
+  if (!KIT_ID_PATTERN.test(id)) return c.json({ ok: false, result: 'RESEND_ERR_ARGS: id 格式不合法' }, 400)
+  const existingServices = [
+    ...Object.keys(KIT_GRANT_BY_SERVICE).filter(svc => rosterHas(svc, id)),
+    ...(rosterHas('toolsmith', id) ? ['toolsmith'] : []),
+  ]
+  if (!existingServices.length) return c.json({ ok: false, result: 'RESEND_ERR_NOT_FOUND: 此 id 沒有任何環境的 token' }, 404)
+  const services = Array.isArray(body?.services) ? body.services : existingServices
+  const invalidService = services.some(s => s !== 'toolsmith' && !KIT_GRANT_BY_SERVICE[s])
+  if (!services.length || invalidService) return c.json({ ok: false, result: 'RESEND_ERR_ARGS: services 至少勾選一個，且只能是 admin-dev / admin-pre / admin-evi / platform / toolsmith' }, 400)
+  const displayName = findDisplayName(id) || id
+  const r = await reconcileGrants(id, displayName, services)
+  return c.json(r, r.ok ? 200 : 409)
 })
 
 // ---------- Logs ----------

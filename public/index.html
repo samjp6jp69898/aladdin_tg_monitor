@@ -11,7 +11,6 @@
   header h1{font-size:20px;margin:0}
   nav button{background:none;border:1px solid transparent;color:var(--mute);padding:8px 14px;border-radius:6px;cursor:pointer;font-size:18px}
   nav button.on{color:var(--fg);border-color:var(--line);background:var(--bg)}
-  #clock{margin-left:auto;color:var(--mute);font-family:var(--mono);font-size:16px}
   main{padding:20px 22px;max-width:1700px;margin:0 auto}
   .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(440px,1fr));gap:16px}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 18px;min-width:0}
@@ -27,6 +26,7 @@
   .user .who{color:var(--acc);font-weight:600}.user .meta{color:var(--mute);font-family:var(--mono);font-size:15.5px}
   .pill{display:inline-block;padding:2px 9px;border-radius:10px;font-size:15px;border:1px solid var(--line);color:var(--mute);font-family:var(--mono)}
   .pill.ok{color:var(--ok);border-color:var(--ok)}.pill.bad{color:var(--bad);border-color:var(--bad)}.pill.warn{color:var(--warn);border-color:var(--warn)}
+  tr.stage-running td{color:var(--warn);border-top:1px solid var(--warn);border-bottom:1px solid var(--warn)}
   table{width:100%;border-collapse:collapse;font-size:16.5px}
   th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top;white-space:nowrap}
   th{color:var(--mute);font-weight:500;position:sticky;top:0;background:var(--panel)}
@@ -38,6 +38,8 @@
   button.btn{background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:8px 14px;cursor:pointer}
   button.btn:hover{border-color:var(--acc)}
   button.btn.danger{color:var(--bad);border-color:var(--bad);padding:4px 10px;font-size:15px}button.btn.danger:hover{background:var(--bad);color:#fff}
+  button.btn.warn{color:var(--warn);border-color:var(--warn);padding:4px 10px;font-size:15px}button.btn.warn:hover{background:var(--warn);color:#fff}
+  #pl-list.hide-outcome .col-outcome{display:none}
   pre.log{background:#0a0c10;border:1px solid var(--line);border-radius:10px;padding:14px;font-family:var(--mono);font-size:16px;height:70vh;overflow:auto;white-space:pre-wrap;word-break:break-all;margin:0}
   .section{margin-bottom:24px}.section h2{font-size:18px;color:var(--mute);margin:0 0 8px;font-weight:500}
   .err{color:var(--bad)}.ok{color:var(--ok)}.mute{color:var(--mute)}
@@ -67,12 +69,13 @@
     <button data-tab="events">即時序列</button>
     <button data-tab="sessions">使用 Session</button>
     <button data-tab="stats">歷史統計</button>
+    <button data-tab="tokens">Token 權限</button>
     <button data-tab="pipelines">Pipelines</button>
     <button data-tab="tg-connected">TG 已連接</button>
     <button data-tab="tg-pending">TG 待處理</button>
     <button data-tab="logs">Logs</button>
   </nav>
-  <span id="clock"></span>
+  <button class="btn" id="global-reload" title="立即刷新當前分頁的資料" style="margin-left:auto">↻ 刷新</button>
 </header>
 <main>
   <section id="tab-overview">
@@ -124,15 +127,57 @@
     <div class="card" style="margin-top:12px"><h3>Token 名冊（不含 token 值）</h3><div class="scroll" id="st-roster"></div></div>
   </section>
 
+  <section id="tab-tokens" hidden>
+    <div class="bar"><button class="btn" id="tk-reload">重新整理</button><span class="mute">名冊來源：各 hosted MCP server 的 tokens*.json（只讀 id / display_name / 核發時間，絕不顯示 token 值）。</span></div>
+    <div id="tk-list-view">
+      <div class="card"><h3>Token 持有人（<span id="tk-n">0</span> 人）</h3><div class="scroll" id="tk-table"></div></div>
+      <div class="card" style="margin-top:12px"><h3>新增 token（核發新 kit）</h3>
+        <div class="bar">
+          <input id="tkc-id" placeholder="id（小寫英數/連字號/底線）" style="width:230px">
+          <input id="tkc-name" placeholder="display_name（顯示名）" style="width:190px">
+          <label><input type="checkbox" class="tkc-env" value="admin-dev" checked> admin-dev</label>
+          <label><input type="checkbox" class="tkc-env" value="platform" checked> platform</label>
+          <label><input type="checkbox" class="tkc-env" value="admin-pre"> admin-pre</label>
+          <label><input type="checkbox" class="tkc-env" value="admin-evi"> admin-evi</label>
+          <label><input type="checkbox" class="tkc-env" value="toolsmith"> toolsmith（工程師）</label>
+          <button class="btn" id="tkc-create">核發並發送到 Landon TG</button>
+        </div>
+        <div class="mute" style="font-size:15px">依勾選環境核發：沒有的環境會新核發、已有的環境會重簽（舊 token 立即失效）。id 已存在時也能用，等同補齊/重簽這次勾選的環境，不會動到沒勾的既有環境。設定會發到 Landon 的 TG，由他轉交對方。</div>
+      </div>
+    </div>
+    <div id="tk-detail" hidden>
+      <div class="bar"><button class="btn" onclick="closeTokenDetail()">← 返回列表</button><span id="tkd-title" style="font-size:20px;font-weight:600"></span><span id="tkd-sub" class="mute"></span><button class="btn" id="tkd-rename">改名</button></div>
+      <div class="card"><h3>環境權限</h3><div class="scroll" id="tkd-grants"></div>
+        <div class="mute" style="margin-top:10px;font-size:15px">「移除」與「刪除全部」立即生效（名冊 fail-closed、每個 request 現讀檔案）。「簽發」kit 環境會產生新 token 並重建 dist/&lt;id&gt;/（既有環境的 token 不動，對方要拿到更新後的 kit 才用得到）；toolsmith 的簽發/重簽則是把設定片段（含 token）以 TG 訊息發到 Landon 轉交。</div>
+        <div class="bar" style="margin-top:12px">
+          <span class="mute" style="font-size:15px">依勾選重發：</span>
+          <label><input type="checkbox" class="tkd-env" value="admin-dev"> admin-dev</label>
+          <label><input type="checkbox" class="tkd-env" value="admin-pre"> admin-pre</label>
+          <label><input type="checkbox" class="tkd-env" value="admin-evi"> admin-evi</label>
+          <label><input type="checkbox" class="tkd-env" value="platform"> platform</label>
+          <label><input type="checkbox" class="tkd-env" value="toolsmith"> toolsmith（工程師）</label>
+        </div>
+        <div class="mute" style="font-size:15px">勾選的環境：沒有的會新核發、已有的會重簽（舊 token 立即失效）；沒勾的環境不動、不會自動撤銷。</div>
+        <div class="bar" style="margin-top:12px"><button class="btn warn" id="tkd-resend">依勾選重發 token（新 kit 發到 Landon TG）</button><button class="btn danger" id="tkd-delete">刪除此人全部 token</button></div>
+      </div>
+    </div>
+  </section>
+
   <section id="tab-pipelines" hidden>
-    <div class="bar"><button class="btn" id="pl-reload">重新整理</button><span class="mute">資料來源：telegram-dispatcher/logs 逐票 log 檔名 + ps 行程表。需求單（demand）的進度在共用的 demand-pipeline.log，逐票 stdout 為空是正常的。</span></div>
+    <div class="bar"><button class="btn" id="pl-reload">重新整理</button><button class="btn" id="pl-outcome-toggle" onclick="toggleOutcomeCol()">隱藏結果欄</button><span class="mute">資料來源：telegram-dispatcher/logs 逐票 log 檔名 + ps 行程表。需求單（demand）的進度在共用的 demand-pipeline.log，逐票 stdout 為空是正常的。</span></div>
     <div id="pl-list">
-    <div class="scroll" style="max-height:80vh"><table><thead><tr><th>狀態</th><th>類型</th><th>票號</th><th>開始</th><th>結束</th><th>耗時</th><th>agents</th><th>tokens in / out</th><th>費用</th><th>結果</th><th>log</th><th></th></tr></thead><tbody id="pl-body"></tbody></table></div>
+    <div class="scroll" style="max-height:80vh"><table><thead><tr><th>狀態</th><th>類型</th><th>票號</th><th>發起人</th><th>開始</th><th>結束</th><th>耗時</th><th>agents</th><th>tokens in / out</th><th class="col-outcome">結果</th><th>log</th><th></th></tr></thead><tbody id="pl-body"></tbody></table></div>
     </div>
     <div id="pl-detail" hidden>
       <div class="bar"><button class="btn" onclick="closeRun()">← 返回列表</button><span id="pd-title" style="font-size:20px;font-weight:600"></span><span id="pd-sub" class="mute"></span></div>
       <div class="stack">
-        <div class="card"><h3>Agent 流程（依開始時間）</h3><div class="scroll"><table><thead><tr><th>#</th><th>stage</th><th>開始</th><th>耗時</th><th>model</th><th>turns</th><th>tools</th><th>in (fresh/cache)</th><th>out</th><th>費用</th><th>狀態</th></tr></thead><tbody id="pd-agents"></tbody></table></div><div id="pd-total" class="mute" style="margin-top:8px"></div></div>
+        <div class="card" id="pd-stages-card" hidden>
+          <h3>Pipeline 階段檢核表</h3>
+          <div class="scroll"><table><thead><tr><th>階段</th><th>狀態</th><th>開始</th><th>結束</th><th>耗時</th></tr></thead><tbody id="pd-stages"></tbody></table></div>
+          <div id="pd-stages-note" class="mute" style="margin-top:8px" hidden></div>
+          <div class="mute" style="margin-top:8px">單一 claude -p session 內部各階段用 Task 呼叫子 agent，非獨立 process，拿不到每階段各自的 token 用量——input/output token 只有整次執行的合計，見下方「Agent 流程」表。開始/結束時間根據 Debug 產物檔案存在與 mtime 推算，「開始」= 前一個已完成階段的結束時間，非精確量測。</div>
+        </div>
+        <div class="card"><h3>Agent 流程（依開始時間）</h3><div class="scroll"><table><thead><tr><th>#</th><th>stage</th><th>開始</th><th>耗時</th><th>model</th><th>turns</th><th>tools</th><th>in (fresh/cache)</th><th>out</th><th>狀態</th></tr></thead><tbody id="pd-agents"></tbody></table></div><div id="pd-total" class="mute" style="margin-top:8px"></div></div>
         <div class="card"><h3>進度 log</h3><div class="scroll" id="pd-progress"></div></div>
       </div>
       <div class="card" style="margin-top:16px" id="pd-conv-card" hidden>
@@ -174,7 +219,7 @@ const fmt = ts => ts ? new Date(ts).toLocaleString('zh-TW', {hour12:false}) : '-
 const ago = ts => { if(!ts) return '-'; const s=Math.max(0,(Date.now()-Date.parse(ts))/1000); return s<60?`${s|0}s前`:s<3600?`${(s/60)|0}m前`:s<86400?`${(s/3600)|0}h前`:`${(s/86400)|0}d前` }
 const dur = (a,b) => { if(!a) return '-'; const s=((b?Date.parse(b):Date.now())-Date.parse(a))/1000; return s<60?`${s|0}s`:s<3600?`${(s/60)|0}m${(s%60)|0}s`:`${(s/3600)|0}h${((s%3600)/60)|0}m` }
 const upt = s => s==null?'-':s<3600?`${(s/60)|0}m`:s<86400?`${(s/3600)|0}h${((s%3600)/60)|0}m`:`${(s/86400)|0}d${((s%86400)/3600)|0}h`
-const resPill = r => { if(!r||r==='unknown') return '<span class="pill">'+esc(r||'-')+'</span>'; if(r==='success') return '<span class="pill ok">success</span>'; return '<span class="pill bad">'+esc(r)+'</span>' }
+const resPill = r => { if(!r||r==='unknown') return '<span class="pill">'+esc(r||'-')+'</span>'; if(r==='success'||r==='recovered') return '<span class="pill ok">'+esc(r)+'</span>'; return '<span class="pill bad">'+esc(r)+'</span>' }
 const api = (p) => fetch(p).then(r => r.json())
 let services = []
 
@@ -182,7 +227,7 @@ let services = []
 let tab = location.hash.slice(1) || 'overview'
 document.querySelectorAll('nav button').forEach(b => b.onclick = () => showTab(b.dataset.tab))
 function showTab(t){ tab=t; location.hash=t; document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('on',b.dataset.tab===t)); document.querySelectorAll('main > section').forEach(s=>s.hidden = s.id!=='tab-'+t); refresh(true) }
-setInterval(()=>{ $('#clock').textContent = new Date().toLocaleString('zh-TW',{hour12:false}) },1000)
+$('#global-reload').onclick = () => refresh(true)
 
 // ---- overview ----
 async function loadOverview(){
@@ -295,6 +340,112 @@ async function loadStats(){
 }
 $('#st-reload').onclick = loadStats; $('#st-days').onchange = loadStats
 
+// ---- token 權限 ----
+let tkData = null, curTokenId = null
+// 此頁可管理的環境：kit 四環境（server 端走 make-starter-kit.ts）+ toolsmith
+// （server 端走 manage-tokens.ts；工程師名冊，token 以 TG 訊息交付、不進 kit zip）。
+const TK_MANAGED = ['admin-dev','admin-pre','admin-evi','platform','toolsmith']
+async function loadTokenGrants(){
+  tkData = await api('/api/token-grants')
+  $('#tk-n').textContent = tkData.people.length
+  $('#tk-table').innerHTML = tkData.people.length
+    ? '<table><tr><th>id</th><th>display_name</th><th>操作</th></tr>'
+      + tkData.people.map(p=>`<tr><td class="mono"><b style="color:var(--acc)">${esc(p.id)}</b></td><td>${esc(p.display_name)}</td><td><button class="btn" onclick="openTokenDetail('${esc(p.id)}')">詳情</button> <button class="btn warn" onclick="resendKit('${esc(p.id)}')">重發 token</button> <button class="btn danger" onclick="removeAllTokens('${esc(p.id)}')">移除 token</button></td></tr>`).join('')+'</table>'
+    : '<div class="mute">名冊為空</div>'
+}
+$('#tk-reload').onclick = () => refresh(true)
+window.openTokenDetail = async id => { curTokenId = id; $('#tk-list-view').hidden = true; $('#tk-detail').hidden = false; await loadTokenDetail() }
+window.closeTokenDetail = () => { curTokenId = null; $('#tk-detail').hidden = true; $('#tk-list-view').hidden = false; loadTokenGrants() }
+async function loadTokenDetail(){
+  if (!curTokenId) return
+  tkData = await api('/api/token-grants')
+  const p = tkData.people.find(x=>x.id===curTokenId)
+  if (!p) { closeTokenDetail(); return } // 已被刪光 → 回列表
+  $('#tkd-title').textContent = `${p.id}（${p.display_name}）`
+  $('#tkd-sub').textContent = `${Object.keys(p.grants).length} 個環境`
+  $('#tkd-grants').innerHTML = '<table><tr><th>環境</th><th>狀態</th><th>核發時間</th><th>使用</th><th>操作</th></tr>'
+    + tkData.services.map(s=>{
+      const g = p.grants[s.id]
+      return `<tr><td>${esc(s.name)}</td>
+        <td>${g?'<span class="pill ok">有權限</span>':'<span class="mute">—</span>'}</td>
+        <td class="mono mute">${g?fmt(g.issued_at):''}</td>
+        <td class="mono mute">${g?(g.n?`${g.n} 次 · ${ago(g.last_ts)}`:'未使用過'):''}</td>
+        <td>${g?`<button class="btn danger" onclick="revokeGrant('${esc(p.id)}','${esc(s.id)}')">移除</button>`:`<button class="btn" onclick="addGrant('${esc(p.id)}','${esc(s.id)}')">簽發</button>`}</td></tr>`
+    }).join('')+'</table>'
+  document.querySelectorAll('.tkd-env').forEach(cb => { cb.checked = !!p.grants[cb.value] })
+}
+window.revokeGrant = async (id, service) => {
+  if (!confirm(`確定要移除 ${id} 在「${service}」的 token？\n\n立即生效，對方這個環境下一個 request 起 401。`)) return
+  const r = await fetch('/api/token-grants/revoke',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,services:[service]})}).then(x=>x.json()).catch(e=>({ok:false,result:String(e)}))
+  alert(r.ok?`已移除。\n\n${r.result}`:`移除失敗：${r.result}`)
+  await loadTokenDetail()
+}
+window.addGrant = async (id, service) => {
+  const note = service==='toolsmith'
+    ? '設定片段（含 token）會以 TG 訊息發到 Landon，由他一對一轉交本人。'
+    : `會重建 dist/${id}/（既有環境的 token 不變）。對方要拿到更新後的 kit 才用得到，可用「重發 token」或 TG /kit 重發 zip。`
+  if (!confirm(`確定要為 ${id} 簽發「${service}」的新 token？\n\n${note}`)) return
+  const r = await fetch('/api/token-grants/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,service})}).then(x=>x.json()).catch(e=>({ok:false,result:String(e)}))
+  alert(r.ok?`已簽發。\n\n${r.result}`:`簽發失敗：${r.result}`)
+  await loadTokenDetail()
+}
+window.createToken = async () => {
+  const id = $('#tkc-id').value.trim(), name = $('#tkc-name').value.trim()
+  const services = [...document.querySelectorAll('.tkc-env:checked')].map(x=>x.value)
+  if (!/^[a-z][a-z0-9_-]{1,31}$/.test(id)) { alert('id 格式不合法：小寫英數/連字號/底線，2-32 字，且以小寫字母開頭。'); return }
+  if (!name) { alert('請填 display_name。'); return }
+  if (!services.length) { alert('至少勾一個環境。'); return }
+  if (!confirm(`確定要核發 ${id}（${name}）的新 kit？\n\n環境：${services.join(', ')}\nkit zip + 使用說明會發到 Landon 的 TG。`)) return
+  const r = await fetch('/api/token-grants/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,name,services})}).then(x=>x.json()).catch(e=>({ok:false,result:String(e)}))
+  alert(r.ok?`已核發並發送。\n\n${r.result}`:`核發失敗：${r.result}`)
+  if (r.ok) { $('#tkc-id').value=''; $('#tkc-name').value=''; await loadTokenGrants() }
+}
+$('#tkc-create').onclick = () => createToken()
+window.renameToken = async () => {
+  const p = tkData && tkData.people.find(x=>x.id===curTokenId)
+  if (!p) return
+  const input = prompt(`${p.id} 的新 display_name：`, p.display_name)
+  if (input === null) return
+  const name = input.trim()
+  if (!name) { alert('display_name 不能為空。'); return }
+  if (name === p.display_name) return
+  const r = await fetch('/api/token-grants/rename',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:p.id,name})}).then(x=>x.json()).catch(e=>({ok:false,result:String(e)}))
+  alert(r.ok?`已改名。\n\n${r.result}`:`改名失敗：${r.result}`)
+  await loadTokenDetail()
+}
+$('#tkd-rename').onclick = () => renameToken()
+// services 省略時（例如列表頁的快速「重發 token」按鈕，畫面上沒有勾選框）：
+// 重簽此人名冊裡現有的全部環境。有給 services 時（詳情頁「依勾選重發」）：
+// 依勾選內容核發/重簽，沒勾的環境不動。
+window.resendKit = async (id, services) => {
+  const p = tkData && tkData.people.find(x=>x.id===id)
+  const managed = p ? Object.keys(p.grants).filter(s=>TK_MANAGED.includes(s)) : []
+  if (!managed.length && !services) return
+  const desc = services
+    ? `依勾選的環境（${services.join(', ')}）核發/重簽——沒有的環境會新核發，已有的環境會重簽（舊 token 立即失效），沒勾的環境不動。`
+    : `會重簽全部現有環境（${managed.join(', ')}）的 token——舊 token 立即失效，對方換到新 kit 前完全無法使用。`
+  if (!confirm(`確定要重發 ${id}（${p?p.display_name:id}）的 kit？\n\n${desc}\n新設定會發到 Landon 的 TG，由他轉交對方。`)) return
+  const body = services ? {id,services} : {id}
+  const r = await fetch('/api/token-grants/resend',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(x=>x.json()).catch(e=>({ok:false,result:String(e)}))
+  alert(r.ok?`已重發。\n\n${r.result}`:`重發失敗：${r.result}`)
+  if (curTokenId===id) await loadTokenDetail(); else await loadTokenGrants()
+}
+window.removeAllTokens = async id => {
+  const p = tkData && tkData.people.find(x=>x.id===id)
+  const managed = p ? Object.keys(p.grants).filter(s=>TK_MANAGED.includes(s)) : []
+  if (!managed.length) return
+  if (!confirm(`確定要刪除 ${id}（${p.display_name}）的全部 token？\n\n環境：${managed.join(', ')}\n立即生效、dist/${id}/ 會一併移除，此人將完全無法使用後台工具。`)) return
+  const r = await fetch('/api/token-grants/revoke',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,services:managed})}).then(x=>x.json()).catch(e=>({ok:false,result:String(e)}))
+  alert(r.ok?`已刪除。\n\n${r.result}`:`刪除失敗：${r.result}`)
+  if (curTokenId===id) await loadTokenDetail(); else await loadTokenGrants()
+}
+$('#tkd-resend').onclick = () => {
+  const services = [...document.querySelectorAll('.tkd-env:checked')].map(x=>x.value)
+  if (!services.length) { alert('至少勾一個環境。'); return }
+  resendKit(curTokenId, services)
+}
+$('#tkd-delete').onclick = () => removeAllTokens(curTokenId)
+
 // ---- cancel ----
 const cancelBtn = (kind, ticket) => `<button class="btn danger" onclick="cancelPipeline('${kind}','${esc(ticket)}')">取消</button>`
 window.cancelPipeline = async (kind, ticket) => {
@@ -302,6 +453,27 @@ window.cancelPipeline = async (kind, ticket) => {
   const r = await fetch('/api/pipelines/cancel', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ kind, ticket }) }).then(x=>x.json()).catch(e=>({ok:false, reason:String(e)}))
   alert(r.ok ? `已送出取消：對 ${r.killed.length} 個子行程送出 SIGTERM（${r.killed.join(', ')}），wrapper ${r.wrapperPid} 會自行收尾。幾秒後列表會更新。` : `取消失敗：${r.reason||'unknown'}`)
   refresh(true)
+}
+
+// ---- retry ----
+// 只支援 bug pipeline（FAQ-*），且只在「非 running」且 outcome 落在失敗/逾時
+// 這組時才顯示按鈕（見下方 pl-body 呼叫端的判斷）。目前是整張從 Step 1 重跑
+// （tracker 設回 rerun + 重新 spawn），不是接續上次成功階段——見
+// server.ts /api/pipelines/retry 註解。
+const retryBtn = ticket => `<button class="btn warn" onclick="retryPipeline('${esc(ticket)}')">重試</button>`
+window.retryPipeline = async ticket => {
+  if (!confirm(`確定要重試 ${ticket}？\n\n會從上一輪最後完成的階段接續（沿用既有分析產物與 mr/ 分支的 commit；審查有 FAILED 時從 fixer 重做、三審皆過時直接 Solution 彙整起）。盤點失敗會自動退回整張全跑。`)) return
+  const r = await fetch('/api/pipelines/retry', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ ticket }) }).then(x=>x.json()).catch(e=>({ok:false, reason:String(e)}))
+  alert(r.ok ? `已觸發續跑（pid ${r.pid}），列表會在下個 tick 顯示新的一次執行。` : `重試失敗：${r.reason||'unknown'}`)
+  refresh(true)
+}
+
+// ---- 結果欄顯示/隱藏 ----
+let hideOutcomeCol = false
+window.toggleOutcomeCol = () => {
+  hideOutcomeCol = !hideOutcomeCol
+  $('#pl-list').classList.toggle('hide-outcome', hideOutcomeCol)
+  $('#pl-outcome-toggle').textContent = hideOutcomeCol ? '顯示結果欄' : '隱藏結果欄'
 }
 
 // ---- pipeline 詳情 ----
@@ -320,10 +492,17 @@ async function loadRunDetail(){
     <td class="mono mute">${i+1}</td><td class="mono"><b>${esc(a.stage)}</b></td><td class="mono">${fmt(a.started_at).slice(-8)}</td><td class="mono">${a.ended_at?dur(a.started_at,a.ended_at):'<span class="warn">進行中</span>'}</td>
     <td class="mono" style="font-size:14px">${esc(a.model||'')}</td><td class="mono">${a.num_turns??''}</td><td class="mono">${a.tool_calls}</td>
     <td class="mono">${fmtTok(a.input_tokens)} / ${fmtTok((a.cache_read_tokens||0)+(a.cache_create_tokens||0))}</td><td class="mono">${fmtTok(a.output_tokens)}</td>
-    <td class="mono">${a.cost_usd!=null?'$'+a.cost_usd.toFixed(3):''}</td><td>${a.is_error?'<span class="pill bad">error</span>':(a.ended_at?'<span class="pill ok">ok</span>':'<span class="pill warn">running</span>')}</td></tr>`).join('')
-    : `<tr><td colspan="11" class="mute">${r.kind==='demand'?'尚無 agent trace（只有 2026-08-21 12:30 之後觸發的需求單才有；更早的執行 dispatcher 沒有保存 agent 輸出）':'Bug pipeline 結束後才會解析 stdout 的用量'}</td></tr>`
-  $('#pd-total').textContent = r.agents.length ? `合計 ${r.agents.length} 個 agent · input ${fmtTok(r.total_input)}（含 cache）· output ${fmtTok(r.total_output)} · 費用 $${r.total_cost.toFixed(4)}` : ''
+    <td>${a.is_error?'<span class="pill bad">error</span>':(a.ended_at?'<span class="pill ok">ok</span>':'<span class="pill warn">running</span>')}</td></tr>`).join('')
+    : `<tr><td colspan="10" class="mute">${r.kind==='demand'?'尚無 agent trace（只有 2026-08-21 12:30 之後觸發的需求單才有；更早的執行 dispatcher 沒有保存 agent 輸出）':'Bug pipeline 結束後才會解析 stdout 的用量'}</td></tr>`
+  $('#pd-total').textContent = r.agents.length ? `合計 ${r.agents.length} 個 agent · input ${fmtTok(r.total_input)}（含 cache）· output ${fmtTok(r.total_output)}` : ''
   $('#pd-progress').innerHTML = d.progress.length ? '<table>'+d.progress.map(p=>`<tr><td class="mono mute">${fmt(p.ts).slice(-8)}</td><td style="white-space:normal">${esc(p.msg)}</td></tr>`).join('')+'</table>' : (r.kind==='demand'?'<div class="mute">此區間 demand-pipeline.log 沒有紀錄</div>':'<div class="mute">（Bug pipeline 的進度請看 stdout log）</div>')
+  const stages = d.stages || []
+  $('#pd-stages-card').hidden = stages.length === 0
+  $('#pd-stages-note').hidden = !(stages.length && d.run.running)
+  $('#pd-stages-note').textContent = 'run 執行中：本表只反映各階段產物「檔案落地」的狀態，標不出此刻正在跑哪一步——Step 5（fixer TDD 修復）不產出獨立文件所以沒有列；審查被否決後重做時，Step 6 在新報告落地前仍顯示「沿用上輪」；Step 2b 的 done 也可能是 fixer 往 analysis-notes 追加 TDD 紀錄（同一份文件）。'
+  if (stages.length) {
+    $('#pd-stages').innerHTML = stages.map(s=>`<tr${s.status==='running'?' class="stage-running"':''}><td>${esc(s.label)}${s.detail?` <span class="mute">(${esc(s.detail)})</span>`:''}</td><td>${s.status==='done'?'<span class="pill ok">done</span>':s.status==='running'?'<span class="pill warn">running</span>':s.status==='reused'?'<span class="pill" title="產物檔存在但非本輪產出：resume 續跑沿用上一輪，或全跑尚未重做到這步">沿用上輪</span>':'<span class="pill">pending</span>'}</td><td class="mono">${(s.status==='done'||s.status==='running')&&s.started_at?fmt(s.started_at):'-'}</td><td class="mono">${s.finished_at?fmt(s.finished_at):'-'}</td><td class="mono">${s.status==='done'&&s.started_at?dur(s.started_at,s.finished_at):s.status==='running'&&s.started_at?dur(s.started_at,null)+'…':'-'}</td></tr>`).join('')
+  }
 }
 const blockHtml = b => {
   if (b.type==='text') return `<pre>${esc(b.text)}</pre>`
@@ -345,7 +524,6 @@ window.openAgent = async path => {
     sm.model?`<span class="pill">${esc(sm.model)}</span>`:'',
     `<span class="pill">turns ${sm.num_turns??'-'}</span><span class="pill">tool calls ${sm.tool_calls}</span>`,
     `<span class="pill">in ${fmtTok(sm.input_tokens)} + cache ${fmtTok((sm.cache_read_tokens||0)+(sm.cache_create_tokens||0))}</span><span class="pill">out ${fmtTok(sm.output_tokens)}</span>`,
-    sm.cost_usd!=null?`<span class="pill ok">$${sm.cost_usd.toFixed(4)}</span>`:'',
     m.cwd?`<span class="pill" title="cwd">${esc(m.cwd)}</span>`:'',
     m.error?`<span class="pill bad">${esc(m.error.message||'error')}</span>`:'',
   ].join('')
@@ -358,7 +536,7 @@ window.openAgent = async path => {
 // ---- pipelines ----
 async function loadPipelines(){
   const d = await api('/api/pipelines')
-  $('#pl-body').innerHTML = d.rows.map(r=>`<tr><td>${r.running?'<span class="pill warn">running</span>':(r.finished_at?'<span class="pill">done</span>':'<span class="pill bad">unknown</span>')}</td><td>${r.kind}</td><td class="mono"><a href="#pipelines" onclick="openRun('${esc(r.key)}');return false">${esc(r.ticket)}</a></td><td class="mono">${fmt(r.started_at)}</td><td class="mono">${fmt(r.finished_at)}</td><td class="mono">${dur(r.started_at,r.finished_at)}</td><td class="mono">${r.agent_count||''}</td><td class="mono">${r.agent_count?fmtTok(r.total_input)+' / '+fmtTok(r.total_output):''}</td><td class="mono">${r.agent_count?'$'+r.total_cost.toFixed(3):''}</td><td>${r.outcome==='cancelled'?'<span class="pill warn">cancelled</span>':(r.outcome?resPill(r.outcome==='success'?'success':r.outcome.split(' ')[0]):'')}</td><td>${r.kind==='demand'?`<a href="#logs" onclick="openLog('/Users/user/aladdin/telegram-dispatcher/logs/demand-pipeline.log')" title="需求 pipeline 的進度全部寫在共用的 demand-pipeline.log，逐票 stdout 固定是空的">進度 log</a> · `:`<a href="#logs" onclick="openLog('${esc(r.stdout_path)}')">stdout</a> · `}<a href="#logs" onclick="openLog('${esc(r.stderr_path)}')">stderr</a></td><td>${r.running?cancelBtn(r.kind,r.ticket):''}</td></tr>`).join('') || '<tr><td colspan="12" class="mute">無資料</td></tr>'
+  $('#pl-body').innerHTML = d.rows.map(r=>`<tr><td>${r.running?'<span class="pill warn">running</span>':(r.finished_at?'<span class="pill">done</span>':'<span class="pill bad">unknown</span>')}</td><td>${r.kind}</td><td class="mono"><a href="#pipelines" onclick="openRun('${esc(r.key)}');return false">${esc(r.ticket)}</a></td><td>${esc(r.assignee||'')}</td><td class="mono">${fmt(r.started_at)}</td><td class="mono">${fmt(r.finished_at)}</td><td class="mono">${dur(r.started_at,r.finished_at)}</td><td class="mono">${r.agent_count||''}</td><td class="mono">${r.agent_count?fmtTok(r.total_input)+' / '+fmtTok(r.total_output):''}</td><td class="col-outcome">${r.outcome==='cancelled'?'<span class="pill warn">cancelled</span>':(r.outcome?resPill(r.outcome==='success'?'success':r.outcome.split(' ')[0]):'')}</td><td>${r.kind==='demand'?`<a href="#logs" onclick="openLog('/Users/user/aladdin/telegram-dispatcher/logs/demand-pipeline.log')" title="需求 pipeline 的進度全部寫在共用的 demand-pipeline.log，逐票 stdout 固定是空的">進度 log</a> · `:`<a href="#logs" onclick="openLog('${esc(r.stdout_path)}')">stdout</a> · `}<a href="#logs" onclick="openLog('${esc(r.stderr_path)}')">stderr</a></td><td>${r.running?cancelBtn(r.kind,r.ticket):(r.retryable?retryBtn(r.ticket):'')}</td></tr>`).join('') || '<tr><td colspan="12" class="mute">無資料</td></tr>'
 }
 $('#pl-reload').onclick = loadPipelines
 
@@ -417,11 +595,17 @@ function techUserSelectHtml(chatId){
   const opts = techUserOptions.map(u=>`<option value="${esc(u.email)}">${esc(u.name)}${u.chat_id?'（現有 chat_id：'+esc(u.chat_id)+'）':''}</option>`).join('')
   return `<select id="tup-sel-${esc(chatId)}"><option value="">-- 選技術人員 --</option>${opts}</select> <button class="btn" onclick="assignTgUser('${esc(chatId)}')">指定</button>`
 }
+// 輪詢重繪會清掉選到一半的下拉值：重繪前記下各列已選的值、重繪後還原；
+// 下拉正在操作（focus）時由 refresh loop 跳過該次刷新。
+const isPickingTechUser = () => !!(document.activeElement && String(document.activeElement.id).startsWith('tup-sel-'))
 async function loadTgPending(){
   const d = await api('/api/tg-users')
   techUserOptions = d.techUsers
   $('#tup-n').textContent = d.pending.length
-  $('#tup-list').innerHTML = d.pending.length ? '<table><tr><th>chat_id</th><th>first_name</th><th>username</th><th>最後訊息</th><th>指定技術人員</th></tr>'+d.pending.map(p=>`<tr><td class="mono">${esc(p.chat_id)}</td><td>${esc(p.first_name)}${p.last_name?' '+esc(p.last_name):''}</td><td class="mono">${p.username?'@'+esc(p.username):''}</td><td class="mono mute">${fmt(p.last_ts)} <span class="mute">${ago(p.last_ts)}</span></td><td>${techUserSelectHtml(p.chat_id)}</td></tr>`).join('')+'</table>' : '<div class="mute">目前沒有待處理的新 DM</div>'
+  const prevSel = {}
+  document.querySelectorAll('[id^="tup-sel-"]').forEach(s => { if (s.value) prevSel[s.id] = s.value })
+  $('#tup-list').innerHTML = d.pending.length ?'<table><tr><th>chat_id</th><th>first_name</th><th>username</th><th>最後訊息</th><th>指定技術人員</th></tr>'+d.pending.map(p=>`<tr><td class="mono">${esc(p.chat_id)}</td><td>${esc(p.first_name)}${p.last_name?' '+esc(p.last_name):''}</td><td class="mono">${p.username?'@'+esc(p.username):''}</td><td class="mono mute">${fmt(p.last_ts)} <span class="mute">${ago(p.last_ts)}</span></td><td>${techUserSelectHtml(p.chat_id)}</td></tr>`).join('')+'</table>' : '<div class="mute">目前沒有待處理的新 DM</div>'
+  Object.entries(prevSel).forEach(([id, v]) => { const s = document.getElementById(id); if (s) s.value = v })
 }
 $('#tup-reload').onclick = loadTgPending
 window.assignTgUser = async (chatId, force) => {
@@ -440,12 +624,13 @@ async function refresh(force){
   try {
     if (tab==='overview') await loadOverview()
     else if (tab==='events') { if (!services.length) await loadOverview(); if (force || $('#ev-live').checked) await loadEvents(false) }
-    else if (tab==='sessions') { if (!services.length) await loadOverview(); if (force) await loadSessions() }
-    else if (tab==='stats') { if (force) await loadStats() }
+    else if (tab==='sessions') { if (!services.length) await loadOverview(); await loadSessions() }
+    else if (tab==='stats') await loadStats()
+    else if (tab==='tokens') { if (curTokenId) await loadTokenDetail(); else await loadTokenGrants() }
     else if (tab==='pipelines') { if (curRunKey) await loadRunDetail(); else await loadPipelines() }
-    else if (tab==='tg-connected') { if (force) await loadTgConnected() }
-    else if (tab==='tg-pending') { if (force) await loadTgPending() }
-    else if (tab==='logs') { if (force) { await loadLogList(); if (!$('#lg-file').value && $('#lg-file').options.length) $('#lg-file').selectedIndex=0; await loadLog() } }
+    else if (tab==='tg-connected') await loadTgConnected()
+    else if (tab==='tg-pending') { if (force || !isPickingTechUser()) await loadTgPending() }
+    else if (tab==='logs') { if (force) { await loadLogList(); if (!$('#lg-file').value && $('#lg-file').options.length) $('#lg-file').selectedIndex=0; await loadLog() } else if (document.activeElement !== $('#lg-file')) await loadLogList() }
   } catch (e) { console.error(e) }
 }
 showTab(tab)
