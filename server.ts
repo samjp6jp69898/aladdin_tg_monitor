@@ -12,7 +12,6 @@ import { join } from 'node:path'
 import { SERVICES, DISPATCHER_LOG_DIR, isAllowedLogPath, isAllowedTracePath, restartService } from './lib/services.ts'
 import { db } from './lib/db.ts'
 import { startCollectors, getLastProbes, listRunningPipelineProcs, listBugLocks, loadRoster, cancelPipeline, summarizeEvents, computeBugStages, readTrackerStatusAsync, isBugOutcomeRetryable, parseClaudeEvents } from './lib/ingest.ts'
-import { getCachedAssignee } from './lib/notion-assignee.ts'
 import { loadConnectedUsers, loadPendingSenders, loadAllTechUsers, assignChatId, unsetChatId, sendTestMessage } from './lib/tg-users.ts'
 import { getWebhookStatus } from './lib/webhook-status.ts'
 
@@ -112,6 +111,11 @@ app.get('/api/events', c => {
   if (q.to) { where.push('ts <= ?'); params.push(q.to) }
   if (q.event) { where.push('event = ?'); params.push(q.event) }
   if (q.errors === '1') where.push("(event = 'auth_failure' OR result LIKE 'error:%')")
+  // 只看真正呼叫了 tool 的請求（隱藏 initialize / tools-list / notifications 等
+  // MCP 握手雜訊——server 對每個 HTTP request 都建立全新 stateless McpServer，
+  // 一次企劃端的 tool 呼叫實際上會產生好幾個握手 request，這些依 audit_log.ts
+  // 設計 tool 欄固定 null，屬預期行為而非漏記，這裡只是給前端一個濾掉它們的開關）
+  if (q.toolOnly === '1') where.push('tool IS NOT NULL')
   if (q.q) {
     where.push('(tool LIKE ? OR path LIKE ? OR result LIKE ? OR source_ip LIKE ? OR agrabah_identifier LIKE ?)')
     const like = `%${q.q}%`
@@ -166,7 +170,7 @@ app.get('/api/stats', c => {
   const since = new Date(Date.now() - days * 86400_000).toISOString()
   const perDay = db.prepare(`SELECT substr(ts, 1, 10) AS day, service, COUNT(*) AS n FROM events WHERE ts >= ? GROUP BY day, service ORDER BY day`).all(since)
   const perHour = db.prepare(`SELECT substr(ts, 1, 13) AS hour, COUNT(*) AS n FROM events WHERE ts >= ? GROUP BY hour ORDER BY hour`).all(new Date(Date.now() - 86400_000).toISOString())
-  const topIdentities = db.prepare(`SELECT identity, service, COUNT(*) AS n, MAX(ts) AS last_ts FROM events WHERE ts >= ? AND identity IS NOT NULL GROUP BY identity, service ORDER BY n DESC LIMIT 50`).all(since)
+  const topIdentities = db.prepare(`SELECT identity, service, COUNT(*) AS n, MAX(ts) AS last_ts FROM events WHERE ts >= ? AND identity IS NOT NULL GROUP BY identity, service ORDER BY last_ts DESC LIMIT 50`).all(since)
   const topTools = db.prepare(`SELECT tool, service, COUNT(*) AS n, SUM(CASE WHEN result LIKE 'error:%' THEN 1 ELSE 0 END) AS errors, ROUND(AVG(duration_ms)) AS avg_ms FROM events WHERE ts >= ? AND tool IS NOT NULL GROUP BY tool, service ORDER BY n DESC LIMIT 50`).all(since)
   const authFailures = db.prepare(`SELECT service, source_ip, reason, COUNT(*) AS n, MAX(ts) AS last_ts FROM events WHERE ts >= ? AND event = 'auth_failure' GROUP BY service, source_ip, reason ORDER BY n DESC LIMIT 50`).all(since)
   const total = db.prepare('SELECT COUNT(*) AS n FROM events').get() as any
@@ -215,7 +219,11 @@ app.get('/api/pipelines', c => {
     const k = `${r.kind}:${r.ticket}`
     r.running = !seen.has(k) && r.finished_at === null && running.has(k)
     seen.add(k)
-    r.assignee = getCachedAssignee(r.ticket) ?? null
+    // 2026-08-27 使用者釐清：這欄要顯示「當時觸發這次 run 的人」，不是 Notion
+    // 當前指派（那欄事後會被轉派給別人，例如轉測試給非技術人員，兩者是不同
+    // 概念，混用會誤導）。triggered_by 是 telegram-dispatcher 在認領當下寫的
+    // sidecar，沒有就留空——不再退回 Notion 當前指派頂替，那正是要修掉的來源。
+    r.assignee = r.triggered_by ?? null
     // 前端「重試」按鈕的顯示依據——跟 /api/pipelines/retry 的真正權限判斷共用
     // 同一個 isBugOutcomeRetryable()，不再各自維護一份判斷式（review 2026-08-25
     // 發現的前後端不同步問題）。這裡只看已存的 outcome 字串，不額外查一次

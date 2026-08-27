@@ -83,6 +83,13 @@ CREATE INDEX IF NOT EXISTS idx_agent_runs_ticket ON agent_runs(ticket, started_a
 `)
 // 既有 DB 補欄位（ALTER 失敗 = 已存在）
 try { db.exec('ALTER TABLE pipeline_runs ADD COLUMN cancelled_at TEXT') } catch {}
+// 「發起人」欄位：當時透過 Telegram 認領觸發這次 run 的人，讀 telegram-dispatcher
+// 寫的 <key>.triggered-by.json sidecar（見 ingest.ts scanPipelineRuns）——跟
+// Notion「當前指派」是兩件事，指派會在流程跑完後轉派給別人（見 2026-08-27
+// 使用者釐清），不能拿來當「誰觸發」的代理值。沒有 sidecar（人工終端機跑
+// /create-mr、自動重試、tg-monitor 手動重試按鈕）就留空，不用 Notion 當前指派
+// 頂替——那正是要修掉的誤導來源。
+try { db.exec('ALTER TABLE pipeline_runs ADD COLUMN triggered_by TEXT') } catch {}
 
 export type EventRow = {
   id: number
@@ -160,8 +167,8 @@ export function recordStatusIfChanged(service: string, status: 'up' | 'down', pi
 }
 
 const upsertRunStmt = db.prepare(`
-  INSERT INTO pipeline_runs (key, kind, ticket, started_at, stdout_path, stderr_path)
-  VALUES (?, ?, ?, ?, ?, ?)
+  INSERT INTO pipeline_runs (key, kind, ticket, started_at, stdout_path, stderr_path, triggered_by)
+  VALUES (?, ?, ?, ?, ?, ?, ?)
   ON CONFLICT(key) DO NOTHING
 `)
 const finishRunStmt = db.prepare("UPDATE pipeline_runs SET finished_at = ?, outcome = CASE WHEN cancelled_at IS NOT NULL THEN 'cancelled' ELSE ? END WHERE key = ? AND finished_at IS NULL")
@@ -169,8 +176,8 @@ const markCancelledStmt = db.prepare('UPDATE pipeline_runs SET cancelled_at = ? 
 export function markCancelled(kind: string, ticket: string) {
   markCancelledStmt.run(new Date().toISOString(), kind, ticket)
 }
-export function upsertRun(key: string, kind: string, ticket: string, startedAt: string, stdoutPath: string, stderrPath: string) {
-  upsertRunStmt.run(key, kind, ticket, startedAt, stdoutPath, stderrPath)
+export function upsertRun(key: string, kind: string, ticket: string, startedAt: string, stdoutPath: string, stderrPath: string, triggeredBy: string | null = null) {
+  upsertRunStmt.run(key, kind, ticket, startedAt, stdoutPath, stderrPath, triggeredBy)
 }
 export function finishRun(key: string, finishedAt: string, outcome: string) {
   finishRunStmt.run(finishedAt, outcome, key)

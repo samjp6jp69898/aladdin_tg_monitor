@@ -17,7 +17,6 @@ import { join } from 'node:path'
 const execFileAsync = promisify(execFile)
 import { SERVICES, DISPATCHER_LOG_DIR, AGENT_TRACE_DIR, BUG_LOCK_DIR, type ServiceDef } from './services.ts'
 import { db, insertMany, getOffset, setOffset, recordStatusIfChanged, upsertRun, finishRun, markCancelled, agentRunMtime, upsertAgentRun } from './db.ts'
-import { refreshAssignees } from './notion-assignee.ts'
 
 // ---------- 1) audit.jsonl tail ----------
 
@@ -73,6 +72,22 @@ export function ingestAuditLogs(): number {
 
 const BUG_RE = /^([A-Z]+-\d+)\.(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z)\.stdout\.log$/
 const DEMAND_RE = /^([A-Z]+-\d+)\.(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z)\.demand-pipeline\.stdout\.log$/
+
+/**
+ * 讀 <key>.triggered-by.json sidecar（見 spawn-create-mr.ts / spawn-demand-
+ * pipeline.ts 寫入處）——只在 Telegram 認領觸發時存在，人工終端機跑
+ * /create-mr、自動重試、tg-monitor 手動重試按鈕都不會有這份檔案，回傳 null
+ * 是預期情況、不是錯誤。
+ */
+function readTriggeredBy(key: string): string | null {
+  try {
+    const raw = readFileSync(join(DISPATCHER_LOG_DIR, `${key}.triggered-by.json`), 'utf8')
+    const parsed = JSON.parse(raw) as { name?: string }
+    return parsed.name || null
+  } catch {
+    return null
+  }
+}
 
 function fileTsToIso(t: string): string {
   // 2026-08-21T01-23-16-901Z → 2026-08-21T01:23:16.901Z
@@ -335,7 +350,7 @@ export function scanPipelineRuns() {
     const stdoutPath = join(DISPATCHER_LOG_DIR, f)
     const stderrPath = stdoutPath.replace(/\.stdout\.log$/, '.stderr.log')
     const startedAt = fileTsToIso(ts)
-    upsertRun(key, kind, ticket, startedAt, stdoutPath, stderrPath)
+    upsertRun(key, kind, ticket, startedAt, stdoutPath, stderrPath, readTriggeredBy(key))
     const starts = (kind === 'demand' ? demandStarts : bugStarts).get(ticket) ?? []
     const isLatest = starts[starts.length - 1] === startedAt
     if (!(running.has(`${kind}:${ticket}`) && isLatest)) {
@@ -890,18 +905,12 @@ export function loadRoster(s: ServiceDef): { id: string; display_name: string; i
 
 // ---------- 排程 ----------
 
-function latestPipelineTickets(limit = 300): string[] {
-  const rows = db.prepare('SELECT ticket FROM pipeline_runs ORDER BY started_at DESC LIMIT ?').all(limit) as { ticket: string }[]
-  return [...new Set(rows.map(r => r.ticket))]
-}
-
 export function startCollectors(opts: { probeEveryMs: number; ingestEveryMs: number }) {
   const tick = async () => {
     try {
       ingestAuditLogs()
       scanPipelineRuns()
       scanAgentTraces()
-      await refreshAssignees(latestPipelineTickets())
     } catch (err) {
       console.error(`ingest tick failed: ${err}`)
     }
