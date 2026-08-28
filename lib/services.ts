@@ -1,4 +1,4 @@
-// 監控對象登錄表：tg-dispatcher 本體 + 它 proxy 的五支 hosted MCP server + Cloudflare tunnel。
+// 監控對象登錄表：tg-dispatcher 本體 + 它 proxy 的九支 hosted MCP server + Cloudflare tunnel。
 // port / 路徑皆對照 telegram-dispatcher/lib/webhook-server/mcp-proxy.ts 的 PROXY_ROUTES
 // 與各 launchd/run-server*.sh 內的 export 值；改動那邊時這裡要同步。
 
@@ -95,6 +95,67 @@ export const SERVICES: ServiceDef[] = [
     logs: [
       { label: 'launchd-server.err', path: `${MCPS}/aladdin-platform/logs/launchd-server.err.log` },
       { label: 'launchd-server.out', path: `${MCPS}/aladdin-platform/logs/launchd-server.out.log` },
+    ],
+  },
+  {
+    // 2026-08-27：platform-dev-6t 上線（見 aladdin-platform/launchd/
+    // run-server-dev-6t.sh、mcp-proxy.ts PROXY_ROUTES），跟 'platform'（dev-pk）
+    // 是各自獨立的名冊/常駐服務，比照 admin-pre/admin-evi 的隔離慣例。
+    id: 'platform-6t',
+    name: 'aladdin-platform (dev-6t)',
+    port: 8793,
+    healthUrl: 'http://127.0.0.1:8793/health',
+    proxyPrefix: '/mcp-platform-dev-6t',
+    launchdLabel: 'com.aladdin.mcp-platform-dev-6t-server',
+    auditLog: `${MCPS}/aladdin-platform/logs/audit.dev-6t.jsonl`,
+    tokensPath: `${MCPS}/aladdin-platform/tokens.dev-6t.json`,
+    logs: [
+      { label: 'launchd-dev-6t-server.err', path: `${MCPS}/aladdin-platform/logs/launchd-dev-6t-server.err.log` },
+      { label: 'launchd-dev-6t-server.out', path: `${MCPS}/aladdin-platform/logs/launchd-dev-6t-server.out.log` },
+    ],
+  },
+  {
+    // 2026-08-27：pre×PK/pre×6T/evi×6T 三個同批比照 platform-6t 開放。
+    id: 'platform-pre-pk',
+    name: 'aladdin-platform (pre-pk)',
+    port: 8794,
+    healthUrl: 'http://127.0.0.1:8794/health',
+    proxyPrefix: '/mcp-platform-pre-pk',
+    launchdLabel: 'com.aladdin.mcp-platform-pre-pk-server',
+    auditLog: `${MCPS}/aladdin-platform/logs/audit.pre-pk.jsonl`,
+    tokensPath: `${MCPS}/aladdin-platform/tokens.pre-pk.json`,
+    logs: [
+      { label: 'launchd-pre-pk-server.err', path: `${MCPS}/aladdin-platform/logs/launchd-pre-pk-server.err.log` },
+      { label: 'launchd-pre-pk-server.out', path: `${MCPS}/aladdin-platform/logs/launchd-pre-pk-server.out.log` },
+    ],
+  },
+  {
+    id: 'platform-pre-6t',
+    name: 'aladdin-platform (pre-6t)',
+    port: 8795,
+    healthUrl: 'http://127.0.0.1:8795/health',
+    proxyPrefix: '/mcp-platform-pre-6t',
+    launchdLabel: 'com.aladdin.mcp-platform-pre-6t-server',
+    auditLog: `${MCPS}/aladdin-platform/logs/audit.pre-6t.jsonl`,
+    tokensPath: `${MCPS}/aladdin-platform/tokens.pre-6t.json`,
+    logs: [
+      { label: 'launchd-pre-6t-server.err', path: `${MCPS}/aladdin-platform/logs/launchd-pre-6t-server.err.log` },
+      { label: 'launchd-pre-6t-server.out', path: `${MCPS}/aladdin-platform/logs/launchd-pre-6t-server.out.log` },
+    ],
+  },
+  {
+    // evi 目前只有 6T 產品的後台網址，沒有 evi×PK（見 mcp-proxy.ts PROXY_ROUTES 註解）。
+    id: 'platform-evi-6t',
+    name: 'aladdin-platform (evi-6t)',
+    port: 8796,
+    healthUrl: 'http://127.0.0.1:8796/health',
+    proxyPrefix: '/mcp-platform-evi-6t',
+    launchdLabel: 'com.aladdin.mcp-platform-evi-6t-server',
+    auditLog: `${MCPS}/aladdin-platform/logs/audit.evi-6t.jsonl`,
+    tokensPath: `${MCPS}/aladdin-platform/tokens.evi-6t.json`,
+    logs: [
+      { label: 'launchd-evi-6t-server.err', path: `${MCPS}/aladdin-platform/logs/launchd-evi-6t-server.err.log` },
+      { label: 'launchd-evi-6t-server.out', path: `${MCPS}/aladdin-platform/logs/launchd-evi-6t-server.out.log` },
     ],
   },
   {

@@ -464,7 +464,7 @@ app.get('/api/token-grants', c => {
 const MAKE_KIT_SCRIPT = '/Users/user/aladdin/obsidian/mcps/aladdin-ai-assistant-kit/make-starter-kit.ts'
 const TOOLSMITH_TOKENS_SCRIPT = '/Users/user/aladdin/obsidian/mcps/aladdin-toolsmith/manage-tokens.ts'
 const KIT_RESEND_SCRIPT = '/Users/user/aladdin/telegram-dispatcher/lib/webhook-server/kit-resend.ts'
-const KIT_GRANT_BY_SERVICE: Record<string, string> = { 'admin-dev': 'admin-dev', 'admin-pre': 'admin-pre', 'admin-evi': 'admin-evi', 'platform': 'platform-dev-pk' }
+const KIT_GRANT_BY_SERVICE: Record<string, string> = { 'admin-dev': 'admin-dev', 'admin-pre': 'admin-pre', 'admin-evi': 'admin-evi', 'platform': 'platform-dev-pk', 'platform-6t': 'platform-dev-6t', 'platform-pre-pk': 'platform-pre-pk', 'platform-pre-6t': 'platform-pre-6t', 'platform-evi-6t': 'platform-evi-6t' }
 const KIT_ID_PATTERN = /^[a-z][a-z0-9_-]{1,31}$/
 
 async function runTokenScript(script: string, args: string[], timeoutMs: number): Promise<{ ok: boolean; result: string }> {
@@ -543,7 +543,7 @@ app.post('/api/token-grants/revoke', async c => {
   if (!KIT_ID_PATTERN.test(id)) return c.json({ ok: false, result: 'REVOKE_ERR_ARGS: id 格式不合法' }, 400)
   const wantToolsmith = services.includes('toolsmith')
   const kitGrants = services.filter(s => s !== 'toolsmith').map(s => KIT_GRANT_BY_SERVICE[s])
-  if (!services.length || kitGrants.some(g => !g)) return c.json({ ok: false, result: 'REVOKE_ERR_ARGS: services 只能是 admin-dev / admin-pre / admin-evi / platform / toolsmith' }, 400)
+  if (!services.length || kitGrants.some(g => !g)) return c.json({ ok: false, result: 'REVOKE_ERR_ARGS: services 只能是 admin-dev / admin-pre / admin-evi / platform / platform-6t / platform-pre-pk / platform-pre-6t / platform-evi-6t / toolsmith' }, 400)
   const parts: { ok: boolean; result: string }[] = []
   if (kitGrants.length) parts.push(await runMakeKit(['--revoke', '--id', id, '--grants', kitGrants.join(',')]))
   if (wantToolsmith) parts.push(await runToolsmithTokens(['--revoke', '--id', id]))
@@ -556,7 +556,7 @@ app.post('/api/token-grants/add', async c => {
   const id = (body?.id ?? '').trim()
   const service = (body?.service ?? '').trim()
   if (!KIT_ID_PATTERN.test(id)) return c.json({ ok: false, result: 'ADD_ERR_ARGS: id 格式不合法' }, 400)
-  if (service !== 'toolsmith' && !KIT_GRANT_BY_SERVICE[service]) return c.json({ ok: false, result: 'ADD_ERR_ARGS: service 只能是 admin-dev / admin-pre / admin-evi / platform / toolsmith' }, 400)
+  if (service !== 'toolsmith' && !KIT_GRANT_BY_SERVICE[service]) return c.json({ ok: false, result: 'ADD_ERR_ARGS: service 只能是 admin-dev / admin-pre / admin-evi / platform / platform-6t / platform-pre-pk / platform-pre-6t / platform-evi-6t / toolsmith' }, 400)
   // 只允許「補簽還沒有的環境」：該環境名冊已有這個 id 時，底層會走 rotate 換掉
   // 現役 token——那是「重簽」，不該由「簽發」按鈕誤觸。
   if (rosterHas(service, id)) return c.json({ ok: false, result: 'ADD_ERR_EXISTS: 此環境已有這個 id 的 token（要換新 token 請用「重發 token」）' }, 409)
@@ -599,7 +599,7 @@ app.post('/api/token-grants/create', async c => {
   if (!KIT_ID_PATTERN.test(id)) return c.json({ ok: false, result: 'CREATE_ERR_ARGS: id 格式不合法（小寫英數/連字號/底線，2-32 字，小寫字母開頭）' }, 400)
   if (!name || name.length > 64) return c.json({ ok: false, result: 'CREATE_ERR_ARGS: display_name 不能為空且不超過 64 字' }, 400)
   const kitGrants = services.filter(s => s !== 'toolsmith').map(s => KIT_GRANT_BY_SERVICE[s])
-  if (!services.length || kitGrants.some(g => !g)) return c.json({ ok: false, result: 'CREATE_ERR_ARGS: services 至少一個，且只能是 admin-dev / admin-pre / admin-evi / platform / toolsmith' }, 400)
+  if (!services.length || kitGrants.some(g => !g)) return c.json({ ok: false, result: 'CREATE_ERR_ARGS: services 至少一個，且只能是 admin-dev / admin-pre / admin-evi / platform / platform-6t / platform-pre-pk / platform-pre-6t / platform-evi-6t / toolsmith' }, 400)
   const r = await reconcileGrants(id, name, services)
   return c.json(r, r.ok ? 200 : 409)
 })
@@ -618,7 +618,7 @@ app.post('/api/token-grants/resend', async c => {
   if (!existingServices.length) return c.json({ ok: false, result: 'RESEND_ERR_NOT_FOUND: 此 id 沒有任何環境的 token' }, 404)
   const services = Array.isArray(body?.services) ? body.services : existingServices
   const invalidService = services.some(s => s !== 'toolsmith' && !KIT_GRANT_BY_SERVICE[s])
-  if (!services.length || invalidService) return c.json({ ok: false, result: 'RESEND_ERR_ARGS: services 至少勾選一個，且只能是 admin-dev / admin-pre / admin-evi / platform / toolsmith' }, 400)
+  if (!services.length || invalidService) return c.json({ ok: false, result: 'RESEND_ERR_ARGS: services 至少勾選一個，且只能是 admin-dev / admin-pre / admin-evi / platform / platform-6t / platform-pre-pk / platform-pre-6t / platform-evi-6t / toolsmith' }, 400)
   const displayName = findDisplayName(id) || id
   const r = await reconcileGrants(id, displayName, services)
   return c.json(r, r.ok ? 200 : 409)

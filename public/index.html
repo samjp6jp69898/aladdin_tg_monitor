@@ -96,11 +96,12 @@
       <input id="ev-identity" placeholder="identity（使用者）">
       <input id="ev-q" placeholder="搜尋 tool / path / result / IP">
       <label><input type="checkbox" id="ev-errors"> 只看錯誤</label>
+      <label><input type="checkbox" id="ev-tool-only"> 只看有呼叫 tool（隱藏 initialize/list 等握手雜訊）</label>
       <label><input type="checkbox" id="ev-live" checked> 自動更新</label>
       <button class="btn" id="ev-reload">查詢</button>
       <span class="mute" id="ev-count"></span>
     </div>
-    <div class="scroll" style="max-height:80vh"><table><thead><tr><th>#</th><th>時間</th><th>服務</th><th>使用者</th><th>事件</th><th>method</th><th>path</th><th>tool</th><th>結果</th><th>耗時</th><th>IP</th><th>agrabah 帳號</th></tr></thead><tbody id="ev-body"></tbody></table></div>
+    <div class="scroll" style="max-height:80vh"><table><thead><tr><th>時間</th><th>服務</th><th>使用者</th><th>tool</th><th>結果</th><th>耗時</th><th></th></tr></thead><tbody id="ev-body"></tbody></table></div>
     <div class="bar" style="margin-top:8px"><button class="btn" id="ev-more">載入更早</button></div>
   </section>
 
@@ -136,10 +137,14 @@
           <input id="tkc-id" placeholder="id（小寫英數/連字號/底線）" style="width:230px">
           <input id="tkc-name" placeholder="display_name（顯示名）" style="width:190px">
           <label><input type="checkbox" class="tkc-env" value="admin-dev" checked> admin-dev</label>
-          <label><input type="checkbox" class="tkc-env" value="platform" checked> platform</label>
+          <label><input type="checkbox" class="tkc-env" value="platform" checked> platform（dev × PK）</label>
+          <label><input type="checkbox" class="tkc-env" value="platform-6t" checked> platform（dev × 6T）</label>
           <label><input type="checkbox" class="tkc-env" value="admin-pre"> admin-pre</label>
           <label><input type="checkbox" class="tkc-env" value="admin-evi"> admin-evi</label>
-          <label><input type="checkbox" class="tkc-env" value="toolsmith"> toolsmith（工程師）</label>
+          <label><input type="checkbox" class="tkc-env" value="platform-pre-pk"> platform（pre × PK）</label>
+          <label><input type="checkbox" class="tkc-env" value="platform-pre-6t"> platform（pre × 6T）</label>
+          <label><input type="checkbox" class="tkc-env" value="platform-evi-6t"> platform（evi × 6T）</label>
+          <label><input type="checkbox" class="tkc-env" value="toolsmith" checked> toolsmith（工程師）</label>
           <button class="btn" id="tkc-create">核發並發送到 Landon TG</button>
         </div>
         <div class="mute" style="font-size:15px">依勾選環境核發：沒有的環境會新核發、已有的環境會重簽（舊 token 立即失效）。id 已存在時也能用，等同補齊/重簽這次勾選的環境，不會動到沒勾的既有環境。設定會發到 Landon 的 TG，由他轉交對方。</div>
@@ -154,7 +159,11 @@
           <label><input type="checkbox" class="tkd-env" value="admin-dev"> admin-dev</label>
           <label><input type="checkbox" class="tkd-env" value="admin-pre"> admin-pre</label>
           <label><input type="checkbox" class="tkd-env" value="admin-evi"> admin-evi</label>
-          <label><input type="checkbox" class="tkd-env" value="platform"> platform</label>
+          <label><input type="checkbox" class="tkd-env" value="platform"> platform（dev × PK）</label>
+          <label><input type="checkbox" class="tkd-env" value="platform-6t"> platform（dev × 6T）</label>
+          <label><input type="checkbox" class="tkd-env" value="platform-pre-pk"> platform（pre × PK）</label>
+          <label><input type="checkbox" class="tkd-env" value="platform-pre-6t"> platform（pre × 6T）</label>
+          <label><input type="checkbox" class="tkd-env" value="platform-evi-6t"> platform（evi × 6T）</label>
           <label><input type="checkbox" class="tkd-env" value="toolsmith"> toolsmith（工程師）</label>
         </div>
         <div class="mute" style="font-size:15px">勾選的環境：沒有的會新核發、已有的會重簽（舊 token 立即失效）；沒勾的環境不動、不會自動撤銷。</div>
@@ -279,17 +288,19 @@ function fillServiceSelects(){
 
 // ---- events ----
 let evOldest = null
-function evQuery(before){ const p=new URLSearchParams(); const s=$('#ev-service').value, i=$('#ev-identity').value.trim(), q=$('#ev-q').value.trim(); if(s)p.set('service',s); if(i)p.set('identity',i); if(q)p.set('q',q); if($('#ev-errors').checked)p.set('errors','1'); if(before)p.set('before_id',before); p.set('limit','200'); return '/api/events?'+p }
-const evRow = r => `<tr><td class="mono mute">${r.id}</td><td class="mono">${fmt(r.ts)}</td><td>${esc(r.service)}</td><td><b style="color:var(--acc)">${esc(r.identity||'')}</b></td><td>${r.event==='auth_failure'?'<span class="pill bad">auth_failure</span>':'<span class="pill">req</span>'}</td><td class="mono">${esc(r.method||'')}</td><td class="mono">${esc(r.path||'')}</td><td class="mono">${esc(r.tool||'')}</td><td>${r.event==='auth_failure'?'<span class="pill bad">'+esc(r.reason||'')+'</span>':resPill(r.result)}</td><td class="mono">${r.duration_ms??''}${r.duration_ms!=null?'ms':''}</td><td class="mono mute">${esc(r.source_ip||'')}</td><td class="mono">${esc(r.agrabah_identifier||'')}</td></tr>`
+function evQuery(before){ const p=new URLSearchParams(); const s=$('#ev-service').value, i=$('#ev-identity').value.trim(), q=$('#ev-q').value.trim(); if(s)p.set('service',s); if(i)p.set('identity',i); if(q)p.set('q',q); if($('#ev-errors').checked)p.set('errors','1'); if($('#ev-tool-only').checked)p.set('toolOnly','1'); if(before)p.set('before_id',before); p.set('limit','200'); return '/api/events?'+p }
+window.toggleEvDetail = id => { const d=$('#ev-d-'+id); if(!d) return; d.hidden=!d.hidden; const btn=$('#ev-t-'+id); if(btn) btn.textContent = d.hidden?'▸':'▾' }
+const evRow = r => `<tr id="ev-r-${r.id}"><td class="mono">${fmt(r.ts)}</td><td>${esc(r.service)}</td><td><b style="color:var(--acc)">${esc(r.identity||'')}</b></td><td class="mono">${esc(r.tool||'')}</td><td>${r.event==='auth_failure'?'<span class="pill bad">'+esc(r.reason||'')+'</span>':resPill(r.result)}</td><td class="mono">${r.duration_ms??''}${r.duration_ms!=null?'ms':''}</td><td><button class="btn" id="ev-t-${r.id}" style="padding:2px 8px" onclick="toggleEvDetail(${r.id})">▸</button></td></tr>
+<tr id="ev-d-${r.id}" hidden><td colspan="7"><div class="kv" style="padding:4px 0 8px"><span>#</span><b>${r.id}</b><span>事件</span><b>${r.event==='auth_failure'?'<span class="pill bad">auth_failure</span>':'<span class="pill">req</span>'}</b><span>method</span><b>${esc(r.method||'')}</b><span>path</span><b>${esc(r.path||'')}</b><span>IP</span><b>${esc(r.source_ip||'')}</b><span>agrabah 帳號</span><b>${esc(r.agrabah_identifier||'')}</b></div></td></tr>`
 async function loadEvents(append){
   const d = await api(evQuery(append?evOldest:null))
   if (!append) $('#ev-body').innerHTML = ''
   $('#ev-body').insertAdjacentHTML('beforeend', d.rows.map(evRow).join(''))
   if (d.rows.length) evOldest = d.rows[d.rows.length-1].id
-  $('#ev-count').textContent = `顯示 ${$('#ev-body').children.length} 筆`
+  $('#ev-count').textContent = `顯示 ${$('#ev-body').querySelectorAll('tr[id^="ev-r-"]').length} 筆`
 }
 $('#ev-reload').onclick = () => loadEvents(false); $('#ev-more').onclick = () => loadEvents(true)
-;['#ev-service','#ev-errors'].forEach(s=>$(s).onchange=()=>loadEvents(false))
+;['#ev-service','#ev-errors','#ev-tool-only'].forEach(s=>$(s).onchange=()=>loadEvents(false))
 ;['#ev-identity','#ev-q'].forEach(s=>$(s).onkeydown=e=>{ if(e.key==='Enter') loadEvents(false) })
 
 // ---- sessions ----
@@ -299,6 +310,9 @@ async function loadSessions(){
   $('#ss-body').innerHTML = d.sessions.map(s=>`<tr><td><b style="color:var(--acc)">${esc(s.identity)}</b></td><td>${esc(s.service)}</td><td class="mono">${fmt(s.start)}</td><td class="mono">${fmt(s.end)} <span class="mute">${ago(s.end)}</span></td><td class="mono">${dur(s.start,s.end)}</td><td class="mono">${s.count}</td><td class="mono ${s.errors?'err':''}">${s.errors}</td><td class="mono">${esc(s.logins.join(', '))}</td><td class="mono mute">${esc(s.ips.join(', '))}</td><td class="tools">${s.tools.length?s.tools.map(t=>`<span>${esc(t)}</span>`).join(''):'<span class="mute">（只有握手，未呼叫 tool）</span>'}</td><td><a href="#events" onclick="jumpEvents('${esc(s.service)}','${esc(s.identity)}')">看事件</a></td></tr>`).join('') || '<tr><td colspan="11" class="mute">無資料</td></tr>'
 }
 window.jumpEvents = (svc, who) => { $('#ev-service').value=svc; $('#ev-identity').value=who; showTab('events') }
+// 從歷史統計的聚合列（tool 排行 / 認證失敗來源）點進去看該列對應的原始事件——
+// 聚合表只有次數/平均耗時，實際錯誤訊息、時間點、identity 得回 Events 頁查。
+window.jumpEventsQuery = (svc, q, errorsOnly) => { $('#ev-service').value=svc||''; $('#ev-identity').value=''; $('#ev-q').value=q||''; $('#ev-errors').checked=!!errorsOnly; $('#ev-tool-only').checked=false; showTab('events') }
 $('#ss-reload').onclick = loadSessions; ['#ss-service','#ss-days'].forEach(s=>$(s).onchange=loadSessions); $('#ss-identity').onkeydown=e=>{ if(e.key==='Enter') loadSessions() }
 
 // ---- SVG 長條圖 ----
@@ -333,8 +347,8 @@ async function loadStats(){
   const days=[...new Set(d.perDay.map(x=>x.day))], svcs=[...new Set(d.perDay.map(x=>x.service))]
   $('#st-perday').innerHTML = days.length?'<table><tr><th>日期</th>'+svcs.map(s=>`<th>${esc(s)}</th>`).join('')+'</tr>'+days.reverse().map(day=>`<tr><td class="mono">${day}</td>${svcs.map(s=>`<td class="mono">${(d.perDay.find(x=>x.day===day&&x.service===s)||{}).n||''}</td>`).join('')}</tr>`).join('')+'</table>':'<div class="mute">無資料</div>'
   $('#st-ident').innerHTML = d.topIdentities.length?'<table>'+d.topIdentities.map(r=>`<tr><td><b style="color:var(--acc)">${esc(r.identity)}</b></td><td>${esc(r.service)}</td><td class="mono">${r.n}</td><td class="mono mute">${ago(r.last_ts)}</td></tr>`).join('')+'</table>':'<div class="mute">無資料</div>'
-  $('#st-tools').innerHTML = d.topTools.length?'<table>'+d.topTools.map(r=>`<tr><td class="mono">${esc(r.tool)}</td><td>${esc(r.service)}</td><td class="mono">${r.n}</td><td class="mono ${r.errors?'err':''}">${r.errors}</td><td class="mono mute">${r.avg_ms??'-'}ms</td></tr>`).join('')+'</table>':'<div class="mute">尚無 tool 呼叫</div>'
-  $('#st-auth').innerHTML = d.authFailures.length?'<table>'+d.authFailures.map(r=>`<tr><td>${esc(r.service)}</td><td class="mono">${esc(r.source_ip||'')}</td><td class="mono err">${esc(r.reason||'')}</td><td class="mono">${r.n}</td><td class="mono mute">${ago(r.last_ts)}</td></tr>`).join('')+'</table>':'<div class="ok">期間內無認證失敗</div>'
+  $('#st-tools').innerHTML = d.topTools.length?'<table>'+d.topTools.map(r=>`<tr><td class="mono">${esc(r.tool)}</td><td>${esc(r.service)}</td><td class="mono">${r.n}</td><td class="mono ${r.errors?'err':''}">${r.errors}</td><td class="mono mute">${r.avg_ms??'-'}ms</td><td><a href="#events" onclick="jumpEventsQuery('${esc(r.service)}','${esc(r.tool)}',${r.errors?'true':'false'})">${r.errors?'看錯誤':'看事件'}</a></td></tr>`).join('')+'</table>':'<div class="mute">尚無 tool 呼叫</div>'
+  $('#st-auth').innerHTML = d.authFailures.length?'<table>'+d.authFailures.map(r=>`<tr><td>${esc(r.service)}</td><td class="mono">${esc(r.source_ip||'')}</td><td class="mono err">${esc(r.reason||'')}</td><td class="mono">${r.n}</td><td class="mono mute">${ago(r.last_ts)}</td><td><a href="#events" onclick="jumpEventsQuery('${esc(r.service)}','${esc(r.source_ip||'')}',true)">看事件</a></td></tr>`).join('')+'</table>':'<div class="ok">期間內無認證失敗</div>'
   const ro = await api('/api/rosters')
   $('#st-roster').innerHTML = '<table><tr><th>服務</th><th>id</th><th>display_name</th><th>核發時間</th></tr>'+ro.flatMap(x=>x.roster.map(t=>`<tr><td>${esc(x.service)}</td><td class="mono">${esc(t.id)}</td><td>${esc(t.display_name)}</td><td class="mono mute">${fmt(t.issued_at)}</td></tr>`)).join('')+'</table>'
 }
@@ -342,9 +356,9 @@ $('#st-reload').onclick = loadStats; $('#st-days').onchange = loadStats
 
 // ---- token 權限 ----
 let tkData = null, curTokenId = null
-// 此頁可管理的環境：kit 四環境（server 端走 make-starter-kit.ts）+ toolsmith
+// 此頁可管理的環境：kit 八環境（server 端走 make-starter-kit.ts）+ toolsmith
 // （server 端走 manage-tokens.ts；工程師名冊，token 以 TG 訊息交付、不進 kit zip）。
-const TK_MANAGED = ['admin-dev','admin-pre','admin-evi','platform','toolsmith']
+const TK_MANAGED = ['admin-dev','admin-pre','admin-evi','platform','platform-6t','platform-pre-pk','platform-pre-6t','platform-evi-6t','toolsmith']
 async function loadTokenGrants(){
   tkData = await api('/api/token-grants')
   $('#tk-n').textContent = tkData.people.length
