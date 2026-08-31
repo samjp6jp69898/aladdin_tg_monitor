@@ -14,6 +14,7 @@ import { db } from './lib/db.ts'
 import { startCollectors, getLastProbes, listRunningPipelineProcs, listBugLocks, loadRoster, cancelPipeline, summarizeEvents, computeBugStages, readTrackerStatusAsync, isBugOutcomeRetryable, parseClaudeEvents } from './lib/ingest.ts'
 import { loadConnectedUsers, loadPendingSenders, loadAllTechUsers, assignChatId, unsetChatId, sendTestMessage } from './lib/tg-users.ts'
 import { getWebhookStatus } from './lib/webhook-status.ts'
+import { fetchPipelineLimits, readQueuedTickets } from './lib/pipeline-queue-state.ts'
 
 const execFileAsync = promisify(execFile)
 // telegram-dispatcher 是另一個獨立 repo，跟 tg-monitor 沒有 package.json 依賴
@@ -29,6 +30,12 @@ const ACTIVE_WINDOW_MIN = 5
 const SESSION_GAP_MIN = 10
 
 startCollectors({ probeEveryMs: 5000, ingestEveryMs: 3000 })
+
+// 2026-08-28（使用者定案）：併發上限不再複製數字寫死（先前 demand 上限漂移
+// 成 2、實際程式碼是 6），啟動時經 CLI 行程邊界讀 dispatcher 程式碼裡的
+// 真實常數——見 lib/pipeline-queue-state.ts 檔頭註解。
+const PIPELINE_LIMITS = await fetchPipelineLimits()
+console.error(`tg-monitor: pipeline 併發上限 bug=${PIPELINE_LIMITS.bug} demand=${PIPELINE_LIMITS.demand}（source=${PIPELINE_LIMITS.source}）`)
 
 const app = new Hono()
 
@@ -74,6 +81,9 @@ app.get('/api/overview', async c => {
   const webhook = await getWebhookStatus()
   const connected = loadConnectedUsers()
   const pending = loadPendingSenders()
+  // 排隊中的單（2026-08-28 排隊機制）：dispatcher 額滿時排入 FIFO 佇列，
+  // 快照落在 logs/pipeline-queue.*.json，見 lib/pipeline-queue-state.ts。
+  const queued = readQueuedTickets()
   return c.json({
     now: new Date(now).toISOString(),
     activeWindowMin: ACTIVE_WINDOW_MIN,
@@ -82,8 +92,10 @@ app.get('/api/overview', async c => {
     tgUsers: { connectedCount: connected.length, pendingCount: pending.length },
     pipelines: {
       running,
-      bugSlots: { used: running.filter(r => r.kind === 'bug').length, limit: 5 },
-      demandSlots: { used: running.filter(r => r.kind === 'demand').length, limit: 2 },
+      queued,
+      limitsSource: PIPELINE_LIMITS.source,
+      bugSlots: { used: running.filter(r => r.kind === 'bug').length, limit: PIPELINE_LIMITS.bug, queued: queued.filter(q => q.kind === 'bug').length },
+      demandSlots: { used: running.filter(r => r.kind === 'demand').length, limit: PIPELINE_LIMITS.demand, queued: queued.filter(q => q.kind === 'demand').length },
       locks: listBugLocks(),
     },
   })
@@ -209,15 +221,25 @@ function attachAgentRuns(rows: any[]) {
 }
 
 app.get('/api/pipelines', c => {
+  // 排隊中的單（2026-08-28）：不在 pipeline_runs（還沒 spawn、沒有 log 檔），
+  // 從佇列快照另組一段清單，前端顯示在列表最上方。
+  const queued = readQueuedTickets()
   const rows = db.prepare('SELECT * FROM pipeline_runs ORDER BY started_at DESC LIMIT 300').all() as any[]
   attachAgentRuns(rows)
   for (const r of rows) delete r.agents // 列表只給彙總，詳情另打 /api/pipelines/run
-  const running = new Set(listRunningPipelineProcs().map(r => `${r.kind}:${r.ticket}`))
+  // 2026-08-28（FAQ-4768 連點事故）：bug run 以 stdout 路徑對應 ps 行程歸戶
+  // （見 lib/ingest.ts scanPipelineRuns 同日註解）；demand 維持 ticket+最新
+  // 一次的判法。
+  const procs = listRunningPipelineProcs()
+  const runningBugPaths = new Set(procs.filter(p => p.kind === 'bug').map(p => p.extra))
+  const runningDemand = new Set(procs.filter(p => p.kind === 'demand').map(p => `demand:${p.ticket}`))
   // 同票多次執行時只有最新一次（第一筆，已依 started_at DESC 排序）可能是 running
   const seen = new Set<string>()
   for (const r of rows) {
     const k = `${r.kind}:${r.ticket}`
-    r.running = !seen.has(k) && r.finished_at === null && running.has(k)
+    r.running = r.kind === 'bug'
+      ? runningBugPaths.has(r.stdout_path)
+      : !seen.has(k) && r.finished_at === null && runningDemand.has(k)
     seen.add(k)
     // 2026-08-27 使用者釐清：這欄要顯示「當時觸發這次 run 的人」，不是 Notion
     // 當前指派（那欄事後會被轉派給別人，例如轉測試給非技術人員，兩者是不同
@@ -231,7 +253,7 @@ app.get('/api/pipelines', c => {
     // retry 端點送出當下的即時檢查為準，這裡只保證「大致準、失敗會有清楚錯誤訊息」。
     r.retryable = r.kind === 'bug' && !r.running && isBugOutcomeRetryable(r.outcome)
   }
-  return c.json({ rows })
+  return c.json({ rows, queued })
 })
 
 // 單一 run 詳情：run 本身 + 每個 agent 的摘要
@@ -242,9 +264,12 @@ app.get('/api/pipelines/run', async c => {
   const siblings = db.prepare('SELECT * FROM pipeline_runs WHERE kind = ? AND ticket = ?').all(run.kind, run.ticket) as any[]
   attachAgentRuns(siblings)
   const me = siblings.find(r => r.key === key)
-  const running = new Set(listRunningPipelineProcs().map(r => `${r.kind}:${r.ticket}`))
+  const procs = listRunningPipelineProcs()
   const latest = siblings.slice().sort((a, b) => (a.started_at < b.started_at ? 1 : -1))[0]
-  me.running = me.finished_at === null && running.has(`${me.kind}:${me.ticket}`) && latest.key === me.key
+  // bug 以 stdout 路徑歸戶（見 /api/pipelines 同日註解），demand 維持舊判法。
+  me.running = me.kind === 'bug'
+    ? procs.some(p => p.kind === 'bug' && p.extra === me.stdout_path)
+    : me.finished_at === null && procs.some(p => p.kind === 'demand' && p.ticket === me.ticket) && latest.key === me.key
   // 需求單：把 demand-pipeline.log 該區間的進度行一併回傳
   let progress: { ts: string; msg: string }[] = []
   if (run.kind === 'demand') {
@@ -260,9 +285,13 @@ app.get('/api/pipelines/run', async c => {
   }
   // Bug pipeline：Debug/{ticket}/{ticket}-*.md 存在與否即階段檢核表，見
   // computeBugStages 註解——同一張票的多次執行（例如失敗後 rerun）共用同一份
-  // Debug 產物，檢核表用「最新一次」的 run 顯示即可，不逐次分別重算。
+  // Debug 產物，不逐次分別重算。歸屬規則（2026-08-28 FAQ-4768 連點事故後
+  // 修正）：有行程真的在跑時，檢核表跟著**真正在跑的那次**（me.running，以
+  // stdout 路徑歸戶）；都沒在跑時才退回「最新一次」的歷史檢視——舊邏輯只認
+  // 最新一次，重複觸發時活著的舊 run 反而分不到檢核表（實際踩過）。
+  const ticketHasRunningProc = procs.some(p => p.kind === 'bug' && p.ticket === run.ticket)
   let stages: ReturnType<typeof computeBugStages> = []
-  if (run.kind === 'bug' && latest.key === me.key) {
+  if (run.kind === 'bug' && (me.running || (!ticketHasRunningProc && latest.key === me.key))) {
     // 非同步版本（execFile 非 execFileSync）——這個 endpoint 是票詳情頁開著時
     // 定期輪詢的，用 *Sync 版本會撞 lib/ingest.ts 檔頭記載的「handler 內同步
     // spawn 遇客戶端中斷會 segfault」既有踩坑（見 listRunningPipelineProcs 旁
@@ -352,7 +381,9 @@ app.post('/api/pipelines/cancel', async c => {
 // 有），就算讀得到也是另一份從 0 開始、彼此不同步的計數器，用它判斷會允許
 // 超過真正上限。ps 快照不管由哪個 process 觸發都反映同一個事實，天生不會有
 // 這個問題。
-const RETRY_CONCURRENCY_LIMIT = 5 // 跟 telegram-dispatcher/lib/pipeline-runner/concurrency-limiter.ts 的 GLOBAL_CONCURRENCY_LIMIT 同步，兩個 repo 無 import 關係，改動要同步調整
+// 2026-08-28 起不再複製數字：啟動時經 CLI 讀 dispatcher 的
+// GLOBAL_CONCURRENCY_LIMIT 真實常數（見 PIPELINE_LIMITS），不會再漂移。
+const RETRY_CONCURRENCY_LIMIT = PIPELINE_LIMITS.bug
 app.post('/api/pipelines/retry', async c => {
   const body = await c.req.json().catch(() => null) as { ticket?: string } | null
   const ticket = body?.ticket ?? ''

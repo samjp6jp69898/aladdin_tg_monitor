@@ -182,6 +182,13 @@ export function upsertRun(key: string, kind: string, ticket: string, startedAt: 
 export function finishRun(key: string, finishedAt: string, outcome: string) {
   finishRunStmt.run(finishedAt, outcome, key)
 }
+// 2026-08-28：重複觸發事故（FAQ-4768 連點兩次）後新增——以 stdout 路徑歸戶
+// 發現某 run 的行程其實還活著、但列已被先前「同票最新一次才可能 running」的
+// 舊邏輯誤結案時，把終態清掉讓它回到執行中。
+const reopenRunStmt = db.prepare('UPDATE pipeline_runs SET finished_at = NULL, outcome = NULL WHERE key = ? AND finished_at IS NOT NULL')
+export function reopenRun(key: string) {
+  reopenRunStmt.run(key)
+}
 
 const agentMtimeStmt = db.prepare('SELECT file_mtime FROM agent_runs WHERE path = ?')
 const upsertAgentStmt = db.prepare(`

@@ -16,7 +16,7 @@ import { join } from 'node:path'
 
 const execFileAsync = promisify(execFile)
 import { SERVICES, DISPATCHER_LOG_DIR, AGENT_TRACE_DIR, BUG_LOCK_DIR, type ServiceDef } from './services.ts'
-import { db, insertMany, getOffset, setOffset, recordStatusIfChanged, upsertRun, finishRun, markCancelled, agentRunMtime, upsertAgentRun } from './db.ts'
+import { db, insertMany, getOffset, setOffset, recordStatusIfChanged, upsertRun, finishRun, reopenRun, markCancelled, agentRunMtime, upsertAgentRun } from './db.ts'
 
 // ---------- 1) audit.jsonl tail ----------
 
@@ -326,6 +326,13 @@ export function scanPipelineRuns() {
   if (!existsSync(DISPATCHER_LOG_DIR)) { cachedRunning = scanRunningPipelineProcs(); return }
   cachedRunning = scanRunningPipelineProcs()
   const running = new Set(cachedRunning.map(r => `${r.kind}:${r.ticket}`))
+  // 2026-08-28（FAQ-4768 連點兩次事故）：bug run 的歸戶改用 stdout 路徑——
+  // wrapper 命令列的位置參數本來就帶著這次 run 專屬的 stdout log 路徑
+  // （RunningProc.extra），比「同票最新一次才可能 running」精確：同一張票
+  // 短時間內被重複觸發兩條時，舊邏輯會把還活著的舊 run 誤結案成 done、把
+  // 已死的新 run 誤標成 running（實際踩過）。demand 的 extra 是 assignee
+  // email、不帶可識別路徑，維持原本 ticket+最新一次的判法。
+  const runningBugPaths = new Set(cachedRunning.filter(r => r.kind === 'bug').map(r => r.extra))
   const files = readdirSync(DISPATCHER_LOG_DIR)
   // 每張票各次開始時間（排序）：需求單用來切 demand-pipeline.log 區間；兩種都用來
   // 判斷「只有最新一次才可能是 running」，舊的同票紀錄一律結案。
@@ -353,7 +360,8 @@ export function scanPipelineRuns() {
     upsertRun(key, kind, ticket, startedAt, stdoutPath, stderrPath, readTriggeredBy(key))
     const starts = (kind === 'demand' ? demandStarts : bugStarts).get(ticket) ?? []
     const isLatest = starts[starts.length - 1] === startedAt
-    if (!(running.has(`${kind}:${ticket}`) && isLatest)) {
+    const isRunningRow = kind === 'bug' ? runningBugPaths.has(stdoutPath) : running.has(`${kind}:${ticket}`) && isLatest
+    if (!isRunningRow) {
       try {
         if (kind === 'demand') {
           const nextStart = demandStarts.get(ticket)?.find(t => t > startedAt) ?? null
@@ -386,6 +394,9 @@ export function scanPipelineRuns() {
         }
       } catch {}
     } else if (kind === 'bug') {
+      // 行程還活著但列已被結案（重複觸發時舊歸戶邏輯留下的錯誤終態，或本檔
+      // 改版前寫入的歷史值）：清掉終態讓它回到執行中，自癒。
+      try { reopenRun(key) } catch {}
       // 執行中的 bug run（2026-08-26，stream-json 之後才有意義）：JSONL 逐行
       // 落盤，執行中就能收出即時的 agent 摘要（ended_at=null → UI 顯示
       // 進行中）；結束後上面的 finish 分支會用同一個 path upsert 蓋上最終值。
@@ -497,6 +508,12 @@ function findPipelineTranscript(ticket: string, runStartedAt: string): string | 
   if (hit) return hit
   try {
     const runStart = Date.parse(runStartedAt)
+    // 2026-08-28（FAQ-4768 連點事故）：同一張票短時間內兩條 run 會有兩份
+    // prompt 相同、mtime 都 >= runStart 的 transcript——舊版取「readdir 順序
+    // 第一個命中」可能把死掉那條的 transcript 綁給活著的 run，階段推定從此
+    // 全空。改成收集全部命中後取 mtime 最新的：活著的 run 的 transcript 持續
+    // append、mtime 必然最新；單一 run 的正常情況行為不變。
+    let best: { path: string; mtimeMs: number } | null = null
     for (const f of readdirSync(TRANSCRIPT_DIR)) {
       if (!f.endsWith('.jsonl')) continue
       const p = join(TRANSCRIPT_DIR, f)
@@ -509,10 +526,13 @@ function findPipelineTranscript(ticket: string, runStartedAt: string): string | 
         const buf = Buffer.alloc(2048)
         head = buf.toString('utf8', 0, readSync(fd, buf, 0, 2048, 0))
       } finally { closeSync(fd) }
-      if (head.includes(`/create-mr:create-mr ${ticket}`)) {
-        transcriptPathCache.set(cacheKey, p)
-        return p
+      if (head.includes(`/create-mr:create-mr ${ticket}`) && (!best || st.mtime.getTime() > best.mtimeMs)) {
+        best = { path: p, mtimeMs: st.mtime.getTime() }
       }
+    }
+    if (best) {
+      transcriptPathCache.set(cacheKey, best.path)
+      return best.path
     }
   } catch {}
   return null
