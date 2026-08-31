@@ -63,6 +63,10 @@ export const SERVICES: ServiceDef[] = [
     healthUrl: 'http://127.0.0.1:8788/health',
     proxyPrefix: '/toolsmith',
     launchdLabel: 'com.aladdin.mcp-toolsmith-server',
+    // 2026-08-31：toolsmith 補上 audit_log.ts（比照 aladdin-admin/aladdin-platform
+    // 的 H32 稽核 log），從此有 per-request 稽核可讀，「使用 Session」「即時
+    // 序列」等分頁不再只有 admin/platform 看得到 tool 使用紀錄。
+    auditLog: `${MCPS}/aladdin-toolsmith/logs/audit.jsonl`,
     tokensPath: `${MCPS}/aladdin-toolsmith/tokens.json`,
     logs: [
       { label: 'launchd-server.err', path: `${MCPS}/aladdin-toolsmith/logs/launchd-server.err.log` },

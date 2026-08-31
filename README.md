@@ -16,7 +16,7 @@ bash /Users/user/aladdin/tg-monitor/monitor.sh stop
 |---|---|---|---|
 | 8787 | tg-dispatcher webhook | — | 無（不記 per-request） |
 | 4040 | ngrok admin API | — | 無 |
-| 8788 | aladdin-toolsmith | `/toolsmith` | 無稽核 log（該服務尚未實作） |
+| 8788 | aladdin-toolsmith | `/toolsmith` | `mcps/aladdin-toolsmith/logs/audit.jsonl`（2026-08-31 補上） |
 | 8789 | aladdin-admin dev | `/mcp-admin-dev` | `mcps/aladdin-admin/logs/audit.jsonl` |
 | 8790 | aladdin-platform dev-pk | `/mcp-platform` | `mcps/aladdin-platform/logs/audit.jsonl` |
 | 8791 | aladdin-admin pre/cqa | `/mcp-admin-pre` | `…/logs/audit.pre.jsonl` |
@@ -55,4 +55,4 @@ port / 路徑對照 `telegram-dispatcher/lib/webhook-server/mcp-proxy.ts` 的 `P
 
 - Bun 1.2.9 在 request handler 內跑 `Bun.spawnSync` 或用 `ReadableStream` SSE 遇到客戶端中斷會 segfault，所以 `ps`/`lsof` 只在背景 collector 跑並快取、即時跟隨用輪詢。
 - 「目前使用中」= 最近 5 分鐘有稽核紀錄；MCP 是無狀態 HTTP，沒有真正的連線存活概念。
-- toolsmith 與 dispatcher 自身沒有 per-request 稽核，只能看存活與 log。
+- dispatcher 自身（8787）沒有 per-request 稽核，只能看存活與 log；toolsmith 已於 2026-08-31 補上稽核 log（見上表）。
