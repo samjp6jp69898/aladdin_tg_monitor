@@ -451,6 +451,23 @@ app.post('/api/pipelines/cancel', async c => {
 // 2026-08-28 起不再複製數字：啟動時經 CLI 讀 dispatcher 的
 // GLOBAL_CONCURRENCY_LIMIT 真實常數（見 PIPELINE_LIMITS），不會再漂移。
 const RETRY_CONCURRENCY_LIMIT = PIPELINE_LIMITS.bug
+/**
+ * 這張票最近一筆 bug run 的發起人 email：讀 telegram-dispatcher 寫的
+ * `<key>.triggered-by.json` sidecar（pipeline_runs.triggered_by 只存了 name，
+ * 而 spawn-create-mr.ts 的 `--triggered-by-email` 要的是 email）。任一環節缺
+ * （沒跑過、sidecar 不存在、格式跑掉）都回 null，重試照舊不帶發起人。
+ */
+function readLastTriggeredByEmail(ticket: string): string | null {
+  const row = db.prepare("SELECT key FROM pipeline_runs WHERE kind = 'bug' AND ticket = ? ORDER BY started_at DESC LIMIT 1").get(ticket) as { key: string } | undefined
+  if (!row) return null
+  try {
+    const parsed = JSON.parse(readFileSync(join(DISPATCHER_LOG_DIR, `${row.key}.triggered-by.json`), 'utf8')) as { email?: unknown }
+    return typeof parsed.email === 'string' && /^[^\s@]+@[^\s@]+$/.test(parsed.email) ? parsed.email : null
+  } catch {
+    return null
+  }
+}
+
 app.post('/api/pipelines/retry', async c => {
   const body = await c.req.json().catch(() => null) as { ticket?: string } | null
   const ticket = body?.ticket ?? ''
@@ -480,8 +497,13 @@ app.post('/api/pipelines/retry', async c => {
   }
   // CLI 邊界呼叫 telegram-dispatcher 的 spawn-create-mr.ts（見檔頭 import 註解），
   // 不是直接 import spawnCreateMr——結果走 stdout 一行 JSON + exit code。
+  // 2026-09-01：重試沿用上一筆 run 的發起人（`--triggered-by-email`），否則
+  // 重試出來的 run 在列表「發起人」欄會空白，看不出這張單是誰認領的。取不到
+  // （上一筆本來就是人工 CLI 跑的、sidecar 缺檔）就不帶旗標，行為同以前。
+  const prevEmail = readLastTriggeredByEmail(ticket)
+  const spawnArgs = [SPAWN_CREATE_MR_SCRIPT, ticket, '--resume', ...(prevEmail ? ['--triggered-by-email', prevEmail] : [])]
   try {
-    const { stdout } = await execFileAsync('bun', [SPAWN_CREATE_MR_SCRIPT, ticket, '--resume'], { encoding: 'utf8', timeout: 10_000 })
+    const { stdout } = await execFileAsync('bun', spawnArgs, { encoding: 'utf8', timeout: 10_000 })
     const spawned = JSON.parse(stdout.trim()) as { ok: true; pid: number | undefined } | { ok: false; reason: string }
     if (!spawned.ok) return c.json({ ok: false, reason: `spawn 失敗：${spawned.reason}` }, 500)
     return c.json({ ok: true, pid: spawned.pid })
