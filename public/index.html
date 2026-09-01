@@ -11,6 +11,9 @@
   header h1{font-size:20px;margin:0}
   nav button{background:none;border:1px solid transparent;color:var(--mute);padding:8px 14px;border-radius:6px;cursor:pointer;font-size:18px}
   nav button.on{color:var(--fg);border-color:var(--line);background:var(--bg)}
+  .subnav{display:flex;gap:6px;margin-bottom:14px;border-bottom:1px solid var(--line);padding-bottom:12px}
+  .subnav button{background:none;border:1px solid transparent;color:var(--mute);padding:6px 12px;border-radius:6px;cursor:pointer;font-size:16.5px}
+  .subnav button.on{color:var(--acc);border-color:var(--acc)}
   main{padding:20px 22px;max-width:1700px;margin:0 auto}
   .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(440px,1fr));gap:16px}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 18px;min-width:0}
@@ -69,11 +72,10 @@
     <button data-tab="events">即時序列</button>
     <button data-tab="sessions">使用 Session</button>
     <button data-tab="stats">歷史統計</button>
-    <button data-tab="tokens">Token 權限</button>
+    <button data-tab="tokens" data-group="tokens tg-connected tg-pending">連接</button>
     <button data-tab="pipelines">Pipelines</button>
+    <button data-tab="toolsmith">Toolsmith</button>
     <button data-tab="workers">Workers</button>
-    <button data-tab="tg-connected">TG 已連接</button>
-    <button data-tab="tg-pending">TG 待處理</button>
     <button data-tab="logs">Logs</button>
   </nav>
   <button class="btn" id="global-reload" title="立即刷新當前分頁的資料" style="margin-left:auto">↻ 刷新</button>
@@ -130,6 +132,11 @@
   </section>
 
   <section id="tab-tokens" hidden>
+    <div class="subnav">
+      <button class="subtab" data-tab="tokens" onclick="showTab('tokens')">Token 權限</button>
+      <button class="subtab" data-tab="tg-connected" onclick="showTab('tg-connected')">TG 已連接</button>
+      <button class="subtab" data-tab="tg-pending" onclick="showTab('tg-pending')">TG 待處理</button>
+    </div>
     <div class="bar"><button class="btn" id="tk-reload">重新整理</button><span class="mute">名冊來源：各 hosted MCP server 的 tokens*.json（只讀 id / display_name / 核發時間，絕不顯示 token 值）。</span></div>
     <div id="tk-list-view">
       <div class="card"><h3>Token 持有人（<span id="tk-n">0</span> 人）</h3><div class="scroll" id="tk-table"></div></div>
@@ -200,6 +207,11 @@
     </div>
   </section>
 
+  <section id="tab-toolsmith" hidden>
+    <div class="bar"><button class="btn" id="ts-reload">重新整理</button><span class="mute">資料來源：aladdin-toolsmith 的 scratch/&lt;requestId&gt;/conversation.json（即時現讀，非收集器）。企劃呼叫 aladdin_toolsmith_generate_tool 後，這裡會出現一筆請求，狀態隨背景處理即時更新。</span></div>
+    <div class="scroll" style="max-height:80vh"><table><thead><tr><th>requestId</th><th>target</th><th>發起人</th><th>狀態</th><th>輪次</th><th>建立</th><th>更新</th><th>摘要</th><th>log</th><th></th></tr></thead><tbody id="ts-body"></tbody></table></div>
+  </section>
+
   <section id="tab-workers" hidden>
     <div class="bar"><button class="btn" id="wk-reload">重新整理</button><span class="mute" id="wk-secret-note"></span></div>
     <div id="wk-list-view">
@@ -222,11 +234,21 @@
   </section>
 
   <section id="tab-tg-connected" hidden>
+    <div class="subnav">
+      <button class="subtab" data-tab="tokens" onclick="showTab('tokens')">Token 權限</button>
+      <button class="subtab" data-tab="tg-connected" onclick="showTab('tg-connected')">TG 已連接</button>
+      <button class="subtab" data-tab="tg-pending" onclick="showTab('tg-pending')">TG 待處理</button>
+    </div>
     <div class="bar"><button class="btn" id="tuc-reload">重新整理</button><span class="mute">tech-users.csv 已回填 tg_chat_id 的人。</span></div>
     <div class="card"><h3>已連接（<span id="tuc-n">0</span>）</h3><div class="scroll" id="tuc-list"></div></div>
   </section>
 
   <section id="tab-tg-pending" hidden>
+    <div class="subnav">
+      <button class="subtab" data-tab="tokens" onclick="showTab('tokens')">Token 權限</button>
+      <button class="subtab" data-tab="tg-connected" onclick="showTab('tg-connected')">TG 已連接</button>
+      <button class="subtab" data-tab="tg-pending" onclick="showTab('tg-pending')">TG 待處理</button>
+    </div>
     <div class="bar"><button class="btn" id="tup-reload">重新整理</button><span class="mute">DM 過 bot 但還沒對映回 CSV 的 chat_id。有人 DM 時會自動觸發 tg-auto-sync：高信心直接寫入，否則會通知維運者；這裡也可以直接手動指定。</span></div>
     <div class="card"><h3>待處理（<span id="tup-n">0</span>）</h3><div class="scroll" id="tup-list"></div></div>
   </section>
@@ -257,7 +279,7 @@ let services = []
 // ---- tabs ----
 let tab = location.hash.slice(1) || 'overview'
 document.querySelectorAll('nav button').forEach(b => b.onclick = () => showTab(b.dataset.tab))
-function showTab(t){ tab=t; location.hash=t; document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('on',b.dataset.tab===t)); document.querySelectorAll('main > section').forEach(s=>s.hidden = s.id!=='tab-'+t); refresh(true) }
+function showTab(t){ tab=t; location.hash=t; document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('on', b.dataset.tab===t || (b.dataset.group||'').split(' ').includes(t))); document.querySelectorAll('.subtab').forEach(b=>b.classList.toggle('on',b.dataset.tab===t)); document.querySelectorAll('main > section').forEach(s=>s.hidden = s.id!=='tab-'+t); refresh(true) }
 $('#global-reload').onclick = () => refresh(true)
 
 // ---- overview ----
@@ -590,6 +612,44 @@ async function loadPipelines(){
 }
 $('#pl-reload').onclick = loadPipelines
 
+// ---------- Toolsmith（aladdin_toolsmith_generate_tool 即時進度） ----------
+const TS_STATUS_LABEL = { queued:'排隊中', researching:'研究/寫代碼中', needs_clarification:'待澄清', deploying:'部署中', done:'完成', failed:'失敗' }
+const tsStatusPill = st => {
+  const label = TS_STATUS_LABEL[st] || st
+  if (st === 'done') return `<span class="pill ok">${esc(label)}</span>`
+  if (st === 'failed') return `<span class="pill bad">${esc(label)}</span>`
+  if (st === 'needs_clarification') return `<span class="pill warn">${esc(label)}</span>`
+  return `<span class="pill warn">${esc(label)}</span>` // queued/researching/deploying：仍在跑
+}
+const tsGatePills = gates => !gates ? '<span class="mute">（部署尚未開始）</span>' : gates.map(g => {
+  const cls = g.status === 'pass' ? 'ok' : g.status === 'fail' ? 'bad' : ''
+  return `<span class="pill ${cls}" title="${esc(g.label)}">${esc(g.key)}${g.status==='pass'?'✓':g.status==='fail'?'✗':'…'}</span>`
+}).join(' ')
+async function loadToolsmith(){
+  const d = await api('/api/toolsmith')
+  $('#ts-body').innerHTML = (d.rows||[]).map(r => `<tr id="ts-r-${esc(r.requestId)}">
+    <td class="mono" title="${esc(r.requestId)}">${esc(r.requestId.slice(0,8))}</td>
+    <td class="mono">${esc(r.target)}</td>
+    <td>${esc(r.requestedBy)}</td>
+    <td>${tsStatusPill(r.status)}</td>
+    <td class="mono">${r.roundsCount}</td>
+    <td class="mono">${fmt(r.createdAt)}</td>
+    <td class="mono" title="${ago(r.updatedAt)}">${fmt(r.updatedAt)}</td>
+    <td>${esc(r.request.length>60?r.request.slice(0,60)+'…':r.request)}</td>
+    <td>${r.agentLogExists?`<a href="#logs" onclick="openLog('${esc(r.agentLogPath)}');return false">研究log</a>`:'<span class="mute">研究log</span>'} · ${r.deployLogExists?`<a href="#logs" onclick="openLog('${esc(r.deployLogPath)}');return false">部署log</a>`:'<span class="mute">部署log</span>'}</td>
+    <td><button class="btn" id="ts-t-${esc(r.requestId)}" style="padding:2px 8px" onclick="toggleTsDetail('${esc(r.requestId)}')">▸</button></td>
+  </tr>
+  <tr id="ts-d-${esc(r.requestId)}" hidden><td colspan="10"><div class="kv" style="padding:4px 0 8px">
+    <span>notes</span><b>${r.notes?esc(r.notes):'<span class="mute">（無）</span>'}</b>
+    <span>完整需求</span><b style="white-space:pre-wrap">${esc(r.request)}</b>
+    ${r.pendingQuestions?`<span>待回答問題</span><b><ul style="margin:0;padding-left:18px">${r.pendingQuestions.map(q=>`<li>${esc(q)}</li>`).join('')}</ul></b>`:''}
+    <span>部署關卡</span><b>${tsGatePills(r.gates)}</b>
+    ${r.finalResult?`<span>終局結果</span><b>${r.finalResult.success?'<span class="pill ok">success</span>':'<span class="pill bad">failed</span>'} ${esc(r.finalResult.stage||r.finalResult.errorKind||'')} — ${esc(r.finalResult.message)}</b>`:''}
+  </div></td></tr>`).join('') || '<tr><td colspan="10" class="mute">無資料</td></tr>'
+}
+window.toggleTsDetail = id => { const d=$('#ts-d-'+id); if(!d) return; d.hidden=!d.hidden; const btn=$('#ts-t-'+id); if(btn) btn.textContent = d.hidden?'▸':'▾' }
+$('#ts-reload').onclick = loadToolsmith
+
 // ---- workers ----
 let curWorkerName = null
 async function loadWorkers(){
@@ -747,6 +807,7 @@ async function refresh(force){
     else if (tab==='stats') await loadStats()
     else if (tab==='tokens') { if (curTokenId) await loadTokenDetail(); else await loadTokenGrants() }
     else if (tab==='pipelines') { if (curRunKey) await loadRunDetail(); else await loadPipelines() }
+    else if (tab==='toolsmith') await loadToolsmith()
     else if (tab==='workers') { if (curWorkerName) await loadWorkerDetail(); else await loadWorkers() }
     else if (tab==='tg-connected') await loadTgConnected()
     else if (tab==='tg-pending') { if (force || !isPickingTechUser()) await loadTgPending() }

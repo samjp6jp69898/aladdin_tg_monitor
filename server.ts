@@ -16,6 +16,7 @@ import { loadConnectedUsers, loadPendingSenders, loadAllTechUsers, assignChatId,
 import { getWebhookStatus } from './lib/webhook-status.ts'
 import { fetchPipelineLimits, readQueuedTickets } from './lib/pipeline-queue-state.ts'
 import { getClusterSecret, listWorkers, listDispatchEntries, fetchWorkerHealth, fetchWorkerCapacity, fetchWorkerJobStatus, disableWorker, enableWorker, removeWorker } from './lib/cluster-state.ts'
+import { listToolsmithRuns } from './lib/toolsmith.ts'
 
 const execFileAsync = promisify(execFile)
 // telegram-dispatcher 是另一個獨立 repo，跟 tg-monitor 沒有 package.json 依賴
@@ -260,6 +261,15 @@ app.get('/api/pipelines', c => {
     r.retryable = r.kind === 'bug' && !r.running && isBugOutcomeRetryable(r.outcome)
   }
   return c.json({ rows, queued, remote })
+})
+
+// aladdin_toolsmith_generate_tool 的即時進度（企劃透過 toolsmith 自助擴充
+// admin/platform tool 的每一次請求）：不落地成 pipeline_runs（那張表是靠 ps
+// 掃 telegram-dispatcher 產生的子行程，toolsmith 的背景任務活在它自己
+// hosted server 的 process 裡，這裡沒有對應的子行程可掃），直接現讀
+// scratch/<requestId>/conversation.json，見 lib/toolsmith.ts 檔頭說明。
+app.get('/api/toolsmith', c => {
+  return c.json({ rows: listToolsmithRuns() })
 })
 
 // ---------- 多機派工（T37 head/worker cluster）----------

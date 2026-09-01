@@ -197,10 +197,27 @@ export const AGENT_TRACE_DIR = `${DISPATCHER}/logs/agent-traces`
 export const BUG_LOCK_DIR = '/tmp/bug-analysis-locks'
 export const WORKTREES_DIR = `${ALADDIN}/worktrees`
 
-/** UI 可 tail 的 log 路徑白名單（只允許登錄表內的檔案 + dispatcher 的 pipeline 逐票 log） */
+// aladdin_toolsmith_generate_tool 每個 requestId 的即時進度來源：run-agent.ts
+// 的主要 sub-agent log（TOOLSMITH_LOGS_DIR/<requestId>.log）與
+// deploy-pipeline.ts 的 deploy.log（TOOLSMITH_SCRATCH_DIR/<requestId>/deploy.log）。
+// 見 aladdin_mcps/aladdin-toolsmith/src/const.ts 的 LOGS_DIR / SCRATCH_DIR。
+export const TOOLSMITH_SCRATCH_DIR = `${MCPS}/aladdin-toolsmith/scratch`
+export const TOOLSMITH_LOGS_DIR = `${MCPS}/aladdin-toolsmith/logs`
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+/** UI 可 tail 的 log 路徑白名單（只允許登錄表內的檔案 + dispatcher 的 pipeline 逐票 log + toolsmith 逐請求 log） */
 export function isAllowedLogPath(p: string): boolean {
   if (SERVICES.some(s => s.logs.some(l => l.path === p))) return true
-  return p.startsWith(`${DISPATCHER_LOG_DIR}/`) && !p.includes('..') && p.endsWith('.log')
+  if (p.startsWith(`${DISPATCHER_LOG_DIR}/`) && !p.includes('..') && p.endsWith('.log')) return true
+  const agentLogMatch = p.match(new RegExp(`^${escapeRe(TOOLSMITH_LOGS_DIR)}/([^/]+)\\.log$`))
+  if (agentLogMatch && UUID_RE.test(agentLogMatch[1])) return true
+  const deployLogMatch = p.match(new RegExp(`^${escapeRe(TOOLSMITH_SCRATCH_DIR)}/([^/]+)/deploy\\.log$`))
+  if (deployLogMatch && UUID_RE.test(deployLogMatch[1])) return true
+  return false
+}
+
+function escapeRe(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
 /** agent trace 可讀範圍：agent-traces 目錄下的 .json，或 dispatcher logs 下的 stdout.log（bug pipeline） */
