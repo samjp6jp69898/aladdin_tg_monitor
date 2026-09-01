@@ -71,6 +71,7 @@
     <button data-tab="stats">歷史統計</button>
     <button data-tab="tokens">Token 權限</button>
     <button data-tab="pipelines">Pipelines</button>
+    <button data-tab="workers">Workers</button>
     <button data-tab="tg-connected">TG 已連接</button>
     <button data-tab="tg-pending">TG 待處理</button>
     <button data-tab="logs">Logs</button>
@@ -175,7 +176,7 @@
   <section id="tab-pipelines" hidden>
     <div class="bar"><button class="btn" id="pl-reload">重新整理</button><button class="btn" id="pl-outcome-toggle" onclick="toggleOutcomeCol()">隱藏結果欄</button><span class="mute">資料來源：telegram-dispatcher/logs 逐票 log 檔名 + ps 行程表。需求單（demand）的進度在共用的 demand-pipeline.log，逐票 stdout 為空是正常的。</span></div>
     <div id="pl-list">
-    <div class="scroll" style="max-height:80vh"><table><thead><tr><th>狀態</th><th>類型</th><th>票號</th><th>發起人</th><th>開始</th><th>結束</th><th>耗時</th><th>agents</th><th>tokens in / out</th><th class="col-outcome">結果</th><th>log</th><th></th></tr></thead><tbody id="pl-body"></tbody></table></div>
+    <div class="scroll" style="max-height:80vh"><table><thead><tr><th>票號</th><th>Worker</th><th>發起人</th><th>開始</th><th>結束</th><th>耗時</th><th>tokens in / out</th><th class="col-outcome">結果</th><th>log</th><th></th></tr></thead><tbody id="pl-body"></tbody></table></div>
     </div>
     <div id="pl-detail" hidden>
       <div class="bar"><button class="btn" onclick="closeRun()">← 返回列表</button><span id="pd-title" style="font-size:20px;font-weight:600"></span><span id="pd-sub" class="mute"></span></div>
@@ -195,6 +196,27 @@
         <details><summary>Prompt（輸入給 agent 的完整提示）</summary><pre class="log" style="height:auto;max-height:40vh" id="pd-prompt"></pre></details>
         <div id="pd-turns" style="margin-top:12px"></div>
         <div id="pd-result" style="margin-top:12px"></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="tab-workers" hidden>
+    <div class="bar"><button class="btn" id="wk-reload">重新整理</button><span class="mute" id="wk-secret-note"></span></div>
+    <div id="wk-list-view">
+      <div class="card"><h3>已註冊 Worker（<span id="wk-n">0</span>）</h3><div class="scroll" id="wk-table"></div>
+        <div class="mute" style="font-size:15px;margin-top:8px">名冊來源：telegram-dispatcher/logs/cluster-workers.json（worker-agent 啟動時登記，其後每 30 分鐘冪等重送）。名冊只是「去哪裡問」的地址簿，不保證活著——狀態欄是即時探測 /health 的結果。「中斷」只是讓 head 停止把新工作派給它，不影響已經在跑的工作；「移除」如果該機 worker-agent 行程還在跑，30 分鐘內會自動重新登記回來，要真正退役請同時在該機停掉 worker-agent。</div>
+      </div>
+    </div>
+    <div id="wk-detail" hidden>
+      <div class="bar"><button class="btn" onclick="closeWorkerDetail()">← 返回列表</button><span id="wkd-title" style="font-size:20px;font-weight:600"></span><span id="wkd-sub" class="mute"></span></div>
+      <div class="two">
+        <div class="card"><h3>GET /health</h3><pre class="log" style="height:auto;max-height:30vh" id="wkd-health"></pre></div>
+        <div class="card"><h3>GET /capacity</h3><pre class="log" style="height:auto;max-height:30vh" id="wkd-capacity"></pre></div>
+      </div>
+      <div class="card" style="margin-top:12px"><h3>目前指派在這台的票</h3><div class="scroll" id="wkd-tickets"></div></div>
+      <div class="card" style="margin-top:12px"><h3>查詢任一票在這台的 GET /jobs/:ticket</h3>
+        <div class="bar"><input id="wkd-ticket-input" placeholder="FAQ-1234 或 ALDREQ-1234" style="width:220px"><button class="btn" id="wkd-ticket-query">查詢</button></div>
+        <pre class="log" style="height:auto;max-height:30vh" id="wkd-ticket-result"></pre>
       </div>
     </div>
   </section>
@@ -557,11 +579,85 @@ async function loadPipelines(){
   const d = await api('/api/pipelines')
   // 排隊中的單（還沒 spawn、沒有 run 紀錄）置頂顯示：資料來自 dispatcher 的
   // logs/pipeline-queue.*.json 佇列快照，輪到時 dispatcher 會自動 spawn，
-  // 屆時這列自然轉為 running 的 run 列。
-  const queuedRows = (d.queued||[]).map(q=>`<tr><td><span class="pill warn" title="併發額滿，排隊等待中（先進先出），輪到時自動開始">排隊 #${q.position}</span></td><td>${q.kind}</td><td class="mono">${esc(q.ticket)}</td><td>${esc(q.triggeredBy||'')}</td><td class="mono" title="排入佇列時間">${q.enqueuedAt?fmt(q.enqueuedAt):'-'}</td><td class="mono">-</td><td class="mono" title="已等待">${q.enqueuedAt?dur(q.enqueuedAt,null):'-'}</td><td class="mono"></td><td class="mono"></td><td class="col-outcome"></td><td></td><td></td></tr>`).join('')
-  $('#pl-body').innerHTML = queuedRows + (d.rows.map(r=>`<tr><td>${r.running?'<span class="pill warn">running</span>':(r.finished_at?'<span class="pill">done</span>':'<span class="pill bad">unknown</span>')}</td><td>${r.kind}</td><td class="mono"><a href="#pipelines" onclick="openRun('${esc(r.key)}');return false">${esc(r.ticket)}</a></td><td>${esc(r.assignee||'')}</td><td class="mono">${fmt(r.started_at)}</td><td class="mono">${fmt(r.finished_at)}</td><td class="mono">${dur(r.started_at,r.finished_at)}</td><td class="mono">${r.agent_count||''}</td><td class="mono">${r.agent_count?fmtTok(r.total_input)+' / '+fmtTok(r.total_output):''}</td><td class="col-outcome">${r.outcome==='cancelled'?'<span class="pill warn">cancelled</span>':(r.outcome?resPill(r.outcome==='success'?'success':r.outcome.split(' ')[0]):'')}</td><td>${r.kind==='demand'?`<a href="#logs" onclick="openLog('/Users/user/aladdin/telegram-dispatcher/logs/demand-pipeline.log')" title="需求 pipeline 的進度全部寫在共用的 demand-pipeline.log，逐票 stdout 固定是空的">進度 log</a> · `:`<a href="#logs" onclick="openLog('${esc(r.stdout_path)}')">stdout</a> · `}<a href="#logs" onclick="openLog('${esc(r.stderr_path)}')">stderr</a></td><td>${r.running?cancelBtn(r.kind,r.ticket):(r.retryable?retryBtn(r.ticket):'')}</td></tr>`).join('') || (queuedRows?'':'<tr><td colspan="12" class="mute">無資料</td></tr>'))
+  // 屆時這列自然轉為 running 的 run 列。派工選擇會先試遠端 worker 再退回
+  // 本機佇列，所以排隊中的單一定是本機（見 dispatch.ts）。
+  const queuedRows = (d.queued||[]).map(q=>`<tr><td class="mono">${esc(q.ticket)}</td><td class="mono">本機</td><td>${esc(q.triggeredBy||'')}</td><td class="mono" title="排入佇列時間">${q.enqueuedAt?fmt(q.enqueuedAt):'-'}</td><td class="mono">-</td><td class="mono" title="已等待">${q.enqueuedAt?dur(q.enqueuedAt,null):'-'}</td><td class="mono"></td><td class="col-outcome"></td><td></td><td></td></tr>`).join('')
+  // 派在遠端 worker 上執行中的單（T37 多機派工）：這台 head 沒有它的
+  // pipeline_runs 紀錄（log 檔在 worker 那台），只能靠 dispatch-registry 這份
+  // 「派到哪台」登記表顯示；worker 回報結束後這列就會消失（見 server.ts 註解）。
+  const remoteRows = (d.remote||[]).map(r=>`<tr><td class="mono">${esc(r.ticket)}</td><td class="mono">${r.worker?`<a href="#workers" onclick="openWorkerTicket('${esc(r.worker)}','${esc(r.ticket)}');return false">${esc(r.worker)}</a>`:'(交涉中)'}</td><td>${esc(r.triggeredBy?.name||'')}</td><td class="mono">${fmt(r.dispatchedAt)}</td><td class="mono">-</td><td class="mono">${dur(r.dispatchedAt,null)}</td><td class="mono"></td><td class="col-outcome"></td><td class="mute">在 worker 本機</td><td></td></tr>`).join('')
+  $('#pl-body').innerHTML = queuedRows + remoteRows + (d.rows.map(r=>`<tr><td class="mono"><a href="#pipelines" onclick="openRun('${esc(r.key)}');return false">${esc(r.ticket)}</a></td><td class="mono">本機</td><td>${esc(r.assignee||'')}</td><td class="mono">${fmt(r.started_at)}</td><td class="mono">${fmt(r.finished_at)}</td><td class="mono">${dur(r.started_at,r.finished_at)}</td><td class="mono">${r.agent_count?fmtTok(r.total_input)+' / '+fmtTok(r.total_output):''}</td><td class="col-outcome">${r.outcome==='cancelled'?'<span class="pill warn">cancelled</span>':(r.outcome?resPill(r.outcome==='success'?'success':r.outcome.split(' ')[0]):'')}</td><td>${r.kind==='demand'?`<a href="#logs" onclick="openLog('/Users/user/aladdin/telegram-dispatcher/logs/demand-pipeline.log')" title="需求 pipeline 的進度全部寫在共用的 demand-pipeline.log，逐票 stdout 固定是空的">進度 log</a> · `:`<a href="#logs" onclick="openLog('${esc(r.stdout_path)}')">stdout</a> · `}<a href="#logs" onclick="openLog('${esc(r.stderr_path)}')">stderr</a></td><td>${r.running?cancelBtn(r.kind,r.ticket):(r.retryable?retryBtn(r.ticket):'')}</td></tr>`).join('') || ((queuedRows||remoteRows)?'':'<tr><td colspan="10" class="mute">無資料</td></tr>'))
 }
 $('#pl-reload').onclick = loadPipelines
+
+// ---- workers ----
+let curWorkerName = null
+async function loadWorkers(){
+  const d = await api('/api/cluster/workers')
+  $('#wk-secret-note').textContent = d.secretConfigured ? '' : '（CLUSTER_SHARED_SECRET 未設定或格式不對：無法探測名額/票務，僅顯示名冊）'
+  $('#wk-n').textContent = d.workers.length
+  $('#wk-table').innerHTML = d.workers.length ? '<table><tr><th>名稱</th><th>URL</th><th>狀態</th><th>Bug 名額</th><th>Demand 名額</th><th>登記時間</th><th>操作</th></tr>'+
+    d.workers.map(w=>{
+      const cap = w.capacity
+      const slot = s => s ? `${s.running}/${s.limit}${s.queued?` (+${s.queued} 排隊)`:''}` : '-'
+      return `<tr><td><b style="color:var(--acc)">${esc(w.name)}</b></td><td class="mono">${esc(w.url)}</td><td><span class="dot ${w.online?'up':'down'}"></span> <span class="pill ${w.online?'ok':'bad'}">${w.online?'UP':'DOWN'}</span>${w.disabled?' <span class="pill warn">已停用</span>':''}</td><td class="mono">${slot(cap&&cap.bug)}</td><td class="mono">${slot(cap&&cap.demand)}</td><td class="mono">${fmt(w.registeredAt)}</td><td>
+        <button class="btn" onclick="openWorkerDetail('${esc(w.name)}')">詳情</button>
+        <button class="btn ${w.disabled?'':'warn'}" onclick="${w.disabled?'enableWorkerRow':'disableWorkerRow'}('${esc(w.name)}')">${w.disabled?'恢復':'中斷'}</button>
+        <button class="btn" onclick="reconnectWorkerRow('${esc(w.name)}')">重連</button>
+        <button class="btn danger" onclick="removeWorkerRow('${esc(w.name)}')">移除</button>
+      </td></tr>`
+    }).join('') + '</table>' : '<div class="mute">尚無已註冊的 worker（worker 機啟動 worker-agent.ts 後會自動登記，其後每 30 分鐘冪等重送）</div>'
+}
+$('#wk-reload').onclick = loadWorkers
+
+async function callWorkerAction(path, name){
+  const r = await fetch(path, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ name }) }).then(x=>x.json()).catch(e=>({ok:false, reason:String(e)}))
+  return r
+}
+window.disableWorkerRow = async (name) => {
+  if (!confirm(`確定要中斷 worker「${name}」嗎？\n\nhead 之後不會再把新工作派給它，但目前已經在它身上跑的工作不受影響（不會被砍掉）。`)) return
+  const r = await callWorkerAction('/api/cluster/worker/disable', name)
+  if (!r.ok) alert(`中斷失敗：${r.reason}`)
+  loadWorkers()
+}
+window.enableWorkerRow = async (name) => {
+  const r = await callWorkerAction('/api/cluster/worker/enable', name)
+  if (!r.ok) alert(`恢復失敗：${r.reason}`)
+  loadWorkers()
+}
+window.removeWorkerRow = async (name) => {
+  if (!confirm(`確定要把 worker「${name}」從名冊移除嗎？\n\n注意：如果該機的 worker-agent 行程還在跑，它每 30 分鐘會自己重新登記回來（停用狀態也會重置）。要讓它真正退役，請同時在該機停掉 worker-agent（launchctl bootout）。`)) return
+  const r = await callWorkerAction('/api/cluster/worker/remove', name)
+  if (!r.ok) alert(`移除失敗：${r.reason}`)
+  loadWorkers()
+}
+window.reconnectWorkerRow = async (name) => {
+  // 重連＝立即重新探測這台的 /health 與 /capacity（GET /api/cluster/worker
+  // 本來就是即時 live probe，沒有快取層可繞）；探測完順便刷新整個表格，
+  // 讓這一列的最新結果反映出來。
+  await api('/api/cluster/worker?name='+encodeURIComponent(name))
+  await loadWorkers()
+}
+window.openWorkerDetail = async (name) => { curWorkerName = name; $('#wk-list-view').hidden=true; $('#wk-detail').hidden=false; await loadWorkerDetail() }
+window.closeWorkerDetail = () => { curWorkerName = null; $('#wk-detail').hidden=true; $('#wk-list-view').hidden=false; loadWorkers() }
+async function loadWorkerDetail(){
+  if (!curWorkerName) return
+  const d = await api('/api/cluster/worker?name='+encodeURIComponent(curWorkerName))
+  if (d.error) { $('#wkd-title').textContent = curWorkerName; $('#wkd-sub').textContent = d.error; return }
+  $('#wkd-title').textContent = d.worker.name
+  $('#wkd-sub').textContent = `${d.worker.url}（登記於 ${fmt(d.worker.registeredAt)}）`
+  $('#wkd-health').textContent = d.health ? JSON.stringify(d.health, null, 2) : '（連不上 /health，worker 可能離線）'
+  $('#wkd-capacity').textContent = d.capacity ? JSON.stringify(d.capacity, null, 2) : '（連不上 /capacity，或 CLUSTER_SHARED_SECRET 未設定）'
+  $('#wkd-tickets').innerHTML = d.tickets.length ? '<table><tr><th>票號</th><th>種類</th><th>狀態</th><th>派工時間</th><th>觸發人</th></tr>'+d.tickets.map(t=>`<tr><td class="mono">${esc(t.ticket)}</td><td>${t.kind}</td><td>${t.status}</td><td class="mono">${fmt(t.dispatchedAt)}</td><td>${esc(t.triggeredBy&&t.triggeredBy.name||'')}</td></tr>`).join('')+'</table>' : '<div class="mute">目前沒有票派在這台</div>'
+}
+async function queryWorkerTicket(){
+  const ticket = $('#wkd-ticket-input').value.trim()
+  if (!ticket || !curWorkerName) return
+  const d = await api('/api/cluster/worker?name='+encodeURIComponent(curWorkerName)+'&ticket='+encodeURIComponent(ticket))
+  $('#wkd-ticket-result').textContent = d.ticketStatus ? JSON.stringify(d.ticketStatus, null, 2) : '（查詢失敗：worker 連不上，或票號格式不對，或 CLUSTER_SHARED_SECRET 未設定）'
+}
+$('#wkd-ticket-query').onclick = queryWorkerTicket
+window.openWorkerTicket = async (name, ticket) => { curWorkerName = name; showTab('workers'); $('#wk-list-view').hidden=true; $('#wk-detail').hidden=false; await loadWorkerDetail(); $('#wkd-ticket-input').value = ticket; await queryWorkerTicket() }
 
 // ---- logs ----
 let lgTimer = null, lgOffset = 0
@@ -651,6 +747,7 @@ async function refresh(force){
     else if (tab==='stats') await loadStats()
     else if (tab==='tokens') { if (curTokenId) await loadTokenDetail(); else await loadTokenGrants() }
     else if (tab==='pipelines') { if (curRunKey) await loadRunDetail(); else await loadPipelines() }
+    else if (tab==='workers') { if (curWorkerName) await loadWorkerDetail(); else await loadWorkers() }
     else if (tab==='tg-connected') await loadTgConnected()
     else if (tab==='tg-pending') { if (force || !isPickingTechUser()) await loadTgPending() }
     else if (tab==='logs') { if (force) { await loadLogList(); if (!$('#lg-file').value && $('#lg-file').options.length) $('#lg-file').selectedIndex=0; await loadLog() } else if (document.activeElement !== $('#lg-file')) await loadLogList() }

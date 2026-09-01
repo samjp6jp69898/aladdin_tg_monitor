@@ -5,7 +5,7 @@
 import { execFileSync } from 'node:child_process'
 
 const ALADDIN = '/Users/user/aladdin'
-const MCPS = `${ALADDIN}/obsidian/mcps`
+const MCPS = `${ALADDIN}/aladdin_mcps`
 const DISPATCHER = `${ALADDIN}/telegram-dispatcher`
 
 export type ServiceDef = {

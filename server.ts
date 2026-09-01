@@ -15,6 +15,7 @@ import { startCollectors, getLastProbes, listRunningPipelineProcs, listBugLocks,
 import { loadConnectedUsers, loadPendingSenders, loadAllTechUsers, assignChatId, unsetChatId, sendTestMessage } from './lib/tg-users.ts'
 import { getWebhookStatus } from './lib/webhook-status.ts'
 import { fetchPipelineLimits, readQueuedTickets } from './lib/pipeline-queue-state.ts'
+import { getClusterSecret, listWorkers, listDispatchEntries, fetchWorkerHealth, fetchWorkerCapacity, fetchWorkerJobStatus, disableWorker, enableWorker, removeWorker } from './lib/cluster-state.ts'
 
 const execFileAsync = promisify(execFile)
 // telegram-dispatcher 是另一個獨立 repo，跟 tg-monitor 沒有 package.json 依賴
@@ -224,6 +225,11 @@ app.get('/api/pipelines', c => {
   // 排隊中的單（2026-08-28）：不在 pipeline_runs（還沒 spawn、沒有 log 檔），
   // 從佇列快照另組一段清單，前端顯示在列表最上方。
   const queued = readQueuedTickets()
+  // 派在遠端 worker 上執行中的單（2026-08-31 T37）：這台 head 完全沒有它的
+  // pipeline_runs 紀錄（log 檔落在 worker 那台機器上），唯一的可見痕跡就是
+  // dispatch-registry 這份「派到哪台」登記表——只有進行中的條目，worker 回報
+  // job-done 後就清掉，看不到遠端執行的歷史（見 cluster-state.ts 檔頭）。
+  const remote = listDispatchEntries()
   const rows = db.prepare('SELECT * FROM pipeline_runs ORDER BY started_at DESC LIMIT 300').all() as any[]
   attachAgentRuns(rows)
   for (const r of rows) delete r.agents // 列表只給彙總，詳情另打 /api/pipelines/run
@@ -253,8 +259,59 @@ app.get('/api/pipelines', c => {
     // retry 端點送出當下的即時檢查為準，這裡只保證「大致準、失敗會有清楚錯誤訊息」。
     r.retryable = r.kind === 'bug' && !r.running && isBugOutcomeRetryable(r.outcome)
   }
-  return c.json({ rows, queued })
+  return c.json({ rows, queued, remote })
 })
+
+// ---------- 多機派工（T37 head/worker cluster）----------
+app.get('/api/cluster/workers', async c => {
+  const secret = getClusterSecret()
+  const workers = listWorkers()
+  const dispatched = listDispatchEntries()
+  const rows = await Promise.all(
+    workers.map(async w => {
+      const health = await fetchWorkerHealth(w.url)
+      const capacity = secret ? await fetchWorkerCapacity(w.url, secret) : null
+      return { ...w, online: health !== null, health, capacity, tickets: dispatched.filter(d => d.worker === w.name) }
+    }),
+  )
+  return c.json({ secretConfigured: secret !== null, workers: rows })
+})
+
+// 單一 worker 的即時詳情（health + capacity + 指派在它身上的票），可選帶
+// ?ticket= 順便查那張票在該 worker 的實況（GET /jobs/:ticket）——供 Workers
+// 分頁的詳情面板與 Pipelines 分頁「查看 worker」連結共用。
+app.get('/api/cluster/worker', async c => {
+  const name = c.req.query('name') ?? ''
+  const worker = listWorkers().find(w => w.name === name)
+  if (!worker) return c.json({ error: 'worker 未註冊（可能已退役或名稱打錯）' }, 404)
+  const secret = getClusterSecret()
+  const [health, capacity] = await Promise.all([fetchWorkerHealth(worker.url), secret ? fetchWorkerCapacity(worker.url, secret) : Promise.resolve(null)])
+  const ticket = c.req.query('ticket')
+  let ticketStatus: unknown = null
+  if (ticket && secret && /^(FAQ|ALDREQ)-\d+$/.test(ticket)) {
+    ticketStatus = { ticket, status: await fetchWorkerJobStatus(worker.url, secret, ticket) }
+  }
+  return c.json({ worker, online: health !== null, health, capacity, tickets: listDispatchEntries().filter(d => d.worker === name), ticketStatus })
+})
+
+// 中斷／恢復／移除（只接受本機請求；server 本來就只綁 127.0.0.1）：實際動作
+// 是打 head（telegram-dispatcher 8787）新增的 /cluster/worker/:name/* 端點，
+// 見 cluster-state.ts 檔頭——名冊活在 head 的 process 記憶體裡，這裡不能
+// 直接改檔案。CLUSTER_SHARED_SECRET 未設定時這三個動作結構上不可能成功
+// （head 那組路由整個沒掛），直接回錯誤訊息，不嘗試打網路。
+async function handleWorkerAction(c: any, action: (name: string, secret: string) => Promise<{ ok: boolean; status: number }>) {
+  const body = (await c.req.json().catch(() => null)) as { name?: string } | null
+  const name = (body?.name ?? '').trim()
+  if (!name) return c.json({ ok: false, reason: 'missing name' }, 400)
+  const secret = getClusterSecret()
+  if (secret === null) return c.json({ ok: false, reason: 'CLUSTER_SHARED_SECRET 未設定，cluster 機制停用' }, 409)
+  const r = await action(name, secret)
+  if (r.ok) return c.json({ ok: true })
+  return c.json({ ok: false, reason: r.status === 404 ? `head 名冊裡找不到 worker「${name}」` : `head 回應 ${r.status || '（連不上）'}` }, 409)
+}
+app.post('/api/cluster/worker/disable', c => handleWorkerAction(c, disableWorker))
+app.post('/api/cluster/worker/enable', c => handleWorkerAction(c, enableWorker))
+app.post('/api/cluster/worker/remove', c => handleWorkerAction(c, removeWorker))
 
 // 單一 run 詳情：run 本身 + 每個 agent 的摘要
 app.get('/api/pipelines/run', async c => {
@@ -492,8 +549,8 @@ app.get('/api/token-grants', c => {
 // manage-tokens.ts（各自都是該名冊的唯一寫入者），monitor 絕不自己改名冊
 // JSON。toolsmith 不屬於企劃 kit（工程師名冊）：token 不進 kit zip，簽發/重簽
 // 時由 manage-tokens.ts 直接把 .mcp.json 片段發到 kit 管理者 TG。
-const MAKE_KIT_SCRIPT = '/Users/user/aladdin/obsidian/mcps/aladdin-ai-assistant-kit/make-starter-kit.ts'
-const TOOLSMITH_TOKENS_SCRIPT = '/Users/user/aladdin/obsidian/mcps/aladdin-toolsmith/manage-tokens.ts'
+const MAKE_KIT_SCRIPT = '/Users/user/aladdin/aladdin_mcps/aladdin-ai-assistant-kit/make-starter-kit.ts'
+const TOOLSMITH_TOKENS_SCRIPT = '/Users/user/aladdin/aladdin_mcps/aladdin-toolsmith/manage-tokens.ts'
 const KIT_RESEND_SCRIPT = '/Users/user/aladdin/telegram-dispatcher/lib/webhook-server/kit-resend.ts'
 const KIT_GRANT_BY_SERVICE: Record<string, string> = { 'admin-dev': 'admin-dev', 'admin-pre': 'admin-pre', 'admin-evi': 'admin-evi', 'platform': 'platform-dev-pk', 'platform-6t': 'platform-dev-6t', 'platform-pre-pk': 'platform-pre-pk', 'platform-pre-6t': 'platform-pre-6t', 'platform-evi-6t': 'platform-evi-6t' }
 const KIT_ID_PATTERN = /^[a-z][a-z0-9_-]{1,31}$/

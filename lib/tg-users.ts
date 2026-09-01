@@ -7,10 +7,10 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
 
-const TECH_USERS_CSV = '/Users/user/aladdin/obsidian/commands/create-mr/references/tech-users.csv'
+const TECH_USERS_CSV = '/Users/user/aladdin/aladdin_ai/commands/create-mr/references/tech-users.csv'
 const UNKNOWN_SENDERS_LOG = '/Users/user/aladdin/telegram-dispatcher/logs/unknown-senders.jsonl'
-const TG_MAP_SCRIPT = '/Users/user/aladdin/obsidian/scripts/tg-map-chatids.sh'
-const TG_NOTIFY_SCRIPT = '/Users/user/aladdin/obsidian/scripts/tg-notify.sh'
+const TG_MAP_SCRIPT = '/Users/user/aladdin/aladdin_ai/scripts/tg-map-chatids.sh'
+const TG_NOTIFY_SCRIPT = '/Users/user/aladdin/aladdin_ai/scripts/tg-notify.sh'
 
 export type ConnectedUser = { name: string; email: string; chat_id: string }
 export type PendingSender = { chat_id: string; first_name: string; last_name: string; username: string; last_ts: string }
