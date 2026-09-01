@@ -7,7 +7,8 @@
 
 import { readFileSync } from 'node:fs'
 
-const ENV_FILE = '/Users/user/aladdin/.env'
+// TG_DISPATCH_BOT_TOKEN 唯一來源（2026-09-01 起，根目錄 .env 已退役）。
+const ENV_FILE = '/Users/user/aladdin/telegram-dispatcher/.env'
 const REFRESH_MS = 30_000
 
 export type WebhookStatus = {

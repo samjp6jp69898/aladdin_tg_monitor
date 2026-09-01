@@ -15,14 +15,15 @@
 //     型別/去重邏輯，複製這幾個小函式比拉一條跨 repo 依賴划算。
 //
 // CLUSTER_SHARED_SECRET 讀取衛生比照 telegram-dispatcher/launchd/run-server.sh
-// 的 grep 手法：只從根目錄 .env 讀，不印出值、不寫死；tg-monitor 的
+// 的 grep 手法：只從 telegram-dispatcher/.env 讀（2026-09-01 起 CLUSTER_SHARED_SECRET
+// 的唯一來源，根目錄 .env 已退役），不印出值、不寫死；tg-monitor 的
 // launchd plist 沒有替它匯出這個變數（跟 dispatcher 是各自獨立的 launchd
 // job），所以用同一招直接讀檔案。
 
 import { existsSync, readFileSync } from 'node:fs'
 import { DISPATCHER_LOG_DIR } from './services.ts'
 
-const ENV_FILE = '/Users/user/aladdin/.env'
+const ENV_FILE = '/Users/user/aladdin/telegram-dispatcher/.env'
 const MIN_SECRET_LENGTH = 32
 
 let cachedSecret: string | null | undefined // undefined = 尚未讀過
