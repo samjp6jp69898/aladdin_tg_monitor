@@ -183,7 +183,17 @@ export interface EventsParams {
   toolOnly?: '1'
   /** 對 tool/path/result/source_ip/agrabah_identifier 做 LIKE %q% */
   q?: string
-  /** 分頁游標，`id < before_id` */
+  /**
+   * 分頁游標（opaque）。**客戶端不得構造或解析它**——內容由伺服器決定，
+   * 只能原樣回傳上一次回應給的 `next_cursor`。這正是 opaque 的用意：
+   * 游標的內部結構不成為契約的一部分，日後改結構不會再是破壞性變更。
+   */
+  cursor?: string
+  /**
+   * @deprecated 舊的單欄游標（`id < before_id`）。後端排序改為 `ts DESC, id DESC` 之後，
+   * 單欄 id 游標會造成跳頁與重複列。請改用 `cursor`。
+   * 保留是為了相容尚未部署新後端的環境（以及瀏覽器裡開著的舊分頁）。
+   */
   before_id?: number
   /** 預設 200，後端上限 1000 */
   limit?: number
@@ -192,6 +202,14 @@ export interface EventsParams {
 export interface EventsResponse {
   rows: EventRow[]
   limit: number
+  /**
+   * 下一頁的 opaque 游標；`null` ＝ 沒有更早的資料了。
+   * **舊後端不會回這個欄位**（為 `undefined`），前端據此判斷要走 cursor 還是 before_id 舊路徑。
+   *
+   * 後端判準是 `rows.length < limit`：剛好整頁時仍會給游標，客戶端會多發一次拿到 0 筆、
+   * 那一次回 `null` 而終止——多一次請求換「不會漏最後一頁」，是刻意取捨。
+   */
+  next_cursor?: string | null
 }
 
 /* ────────────────────────────── GET /api/sessions ────────────────────────────── */

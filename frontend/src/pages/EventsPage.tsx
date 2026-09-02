@@ -73,11 +73,18 @@ export function EventsPage() {
   // 顯示中的列表；一般查詢（含輪詢）整批取代，「載入更早」累加。
   const [rows, setRows] = useState<EventRow[]>([])
   const [oldestId, setOldestId] = useState<number | null>(null)
+  /** 新後端的 opaque 游標（`null` = 已到底、`undefined` = 尚不知道／舊後端）。 */
+  const [cursor, setCursor] = useState<string | null | undefined>(undefined)
+  const [reachedEnd, setReachedEnd] = useState(false)
 
   useEffect(() => {
     if (!resource.data) return
     setRows(resource.data.rows)
     if (resource.data.rows.length) setOldestId(resource.data.rows[resource.data.rows.length - 1].id)
+    // 每次一般查詢（含篩選條件變動與輪詢）都會整批取代列表，所以分頁狀態必須跟著重設——
+    // 沿用上一組條件的游標會讓「載入更早」接到另一個查詢的資料流。
+    setCursor(resource.data.next_cursor)
+    setReachedEnd(resource.data.next_cursor === null)
   }, [resource.data])
 
   /**
@@ -118,12 +125,25 @@ export function EventsPage() {
   const moreAction = useAction()
   async function loadMore() {
     await moreAction.run(async () => {
-      if (oldestId == null) return null
-      const resp = await fetchEvents({ ...queryParams, before_id: oldestId, limit: 200 })
+      // 新後端給 opaque `next_cursor` 就用它；舊後端不回該欄位（undefined），退回 before_id。
+      // 兩條路並存是因為前端 build 產物一寫進 dist 就即時上線，而後端可能還沒部署——
+      // 只走 cursor 會在新前端＋舊後端的組合下讓「載入更早」直接失效。
+      const usingCursor = cursor != null
+      if (!usingCursor && oldestId == null) return null
+      const resp = await fetchEvents(
+        usingCursor
+          ? { ...queryParams, cursor: cursor!, limit: 200 }
+          : { ...queryParams, before_id: oldestId!, limit: 200 },
+      )
       setRows(prev => [...prev, ...resp.rows])
-      // 對應舊版 `if (d.rows.length) evOldest = ...`：0 筆時不更新，之後「載入更早」會用同一個
-      // before_id 重查、永遠 0 筆——沒有 disable 按鈕或「已到底」提示，這是原版已知行為。
-      if (resp.rows.length) setOldestId(resp.rows[resp.rows.length - 1].id)
+      if (resp.next_cursor !== undefined) {
+        // 新後端：null 代表沒有更早的資料了，據此關掉按鈕並顯示已到底。
+        setCursor(resp.next_cursor)
+        setReachedEnd(resp.next_cursor === null)
+      } else if (resp.rows.length) {
+        // 舊後端路徑：維持原行為（0 筆時不更新 oldestId）。
+        setOldestId(resp.rows[resp.rows.length - 1].id)
+      }
       return resp
     })
   }
@@ -252,9 +272,12 @@ export function EventsPage() {
 
       <div style={{ marginTop: 8 }}>
         <Toolbar>
-          <Button disabled={moreAction.pending} onClick={() => void loadMore()}>
+          {/* 已到底只有新後端判斷得出來（next_cursor === null）；舊後端不回該欄位，
+              reachedEnd 永遠 false，按鈕行為與原版完全一致（點了拿 0 筆、無提示）。 */}
+          <Button disabled={moreAction.pending || reachedEnd} onClick={() => void loadMore()}>
             載入更早
           </Button>
+          {reachedEnd && <span className="mute">已到底</span>}
         </Toolbar>
       </div>
     </div>
