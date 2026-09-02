@@ -429,13 +429,76 @@ function demandOutcomeFromLog(ticket: string, startedAt: string, nextStart: stri
 // 下個 tick 重算出同樣或更大的值，NOOP 或再 bump 一次而已。
 const lastPersistedRounds = new Map<string, { review: number; final: number }>()
 
+// mon_ui 側的 rounds 寫入範圍（對抗審查 BLOCKING-1(a)）：scanPipelineRuns 的
+// finish 分支對 DISPATCHER_LOG_DIR 底下**每一個**歷史 stdout log 每個 tick
+// 都會呼叫 persistReviewRounds 一次（實測本機 40 個歷史 bug run，40 個都算得
+// 出 counts），若不設界，mon_ui 這一段會對每個歷史 run 每 3 秒重打一次
+// SELECT，且與 cancel 共用同一個 4 連線 pool（見 mon-db.ts 的
+// connectionLimit:4 + waitForConnections:false）——這條背景路徑不能無界。
+// 比照同檔 reconcileStaleOutcomes 既有的 6 小時窗：只有「執行中」（finishedAt
+// 傳 null）或「6 小時內結束」的 run 才進 mon_ui 分支；更舊的歷史 run 的
+// rounds 是靜態值，本來就不需要每 3 秒重試。
+const ROUNDS_MON_DB_RECENT_WINDOW_MS = 6 * 3600 * 1000
+export function isRoundsMonDbEligible(finishedAt: string | null): boolean {
+  if (finishedAt === null) return true // 執行中：呼叫端本就只在 ps 快照命中時才會走到這裡，天然有界。
+  return finishedAt >= new Date(Date.now() - ROUNDS_MON_DB_RECENT_WINDOW_MS).toISOString()
+}
+
+/**
+ * mon_ui 側 rounds 寫入的掛載點（與 sqlite 側的 persistReviewRounds 分開匯
+ * 出，讓「flag 開但 MON_DB_* 缺漏」這條 BLOCKING-2 迴歸路徑可以不依賴真實
+ * transcript/檔案系統直接單元測試——counts 由呼叫端算好傳入，不在這裡重算）。
+ *
+ * 兩層防線對應對抗審查兩個 BLOCKING：
+ *   - BLOCKING-1(a) 範圍限縮：`isRoundsMonDbEligible` 見上方常數註解。
+ *   - BLOCKING-2：`getMonitorPool()` 是同步呼叫，MON_DB_* 任一環境變數缺漏
+ *     時會同步 throw（見 mon-db.ts）；本函式外層沒有任何 try/catch 的呼叫者
+ *     （running 分支 `:5xx` 不在任何 try 內）曾經因此讓整個 scanPipelineRuns
+ *     中斷、reconcileStaleOutcomes 永遠不執行、scanAgentTraces 每 tick 被跳
+ *     過——這裡整段自己包 try/catch，設定錯誤只 WARN，不炸呼叫端。
+ *
+ * fire-and-forget：呼叫端是同步函式、掛在 scanPipelineRuns 的同步迴圈裡，不
+ * 能為了一次 DB 寫入拖住整個 collector tick；失敗只 WARN、不落 spool，rounds
+ * 每個 ingest tick 都會重算，下一輪自然重試，自癒。
+ */
+export function persistReviewRoundsToMonDbGuarded(
+  key: string,
+  ticket: string,
+  stdoutPath: string,
+  finishedAt: string | null,
+  counts: { reviewRounds: number; finalReviewRounds: number },
+): void {
+  if (!isMonitorDbEnabled() || !isRoundsMonDbEligible(finishedAt)) return
+  try {
+    const pool = getMonitorPool()
+    void persistReviewRoundsToMonDb(pool, {
+      key,
+      ticket,
+      stdoutPath,
+      reviewRounds: counts.reviewRounds,
+      finalReviewRounds: counts.finalReviewRounds,
+    }).catch(err => {
+      console.warn(`mon-db: rounds 寫入例外（ticket=${ticket} key=${key}）：${err}`)
+    })
+  } catch (err) {
+    // getMonitorPool() 的同步 throw（MON_DB_HOST/PORT/SCHEMA/USER/PASSWORD
+    // 任一缺漏、或 PORT 非法）落在這裡——不往外冒，呼叫端（scanPipelineRuns
+    // 的其餘 run、reconcileStaleOutcomes、collector tick 的其他職責）照常跑。
+    console.warn(`mon-db: rounds 掛載失敗（ticket=${ticket} key=${key}，可能是 MON_DB_* 環境變數缺漏）：${err}`)
+  }
+}
+
 /**
  * 把目前累計的審查輪數（見 getReviewRoundCounts）持久化到該 run 列，值沒有
  * 進展就不寫 DB。掛在 scanPipelineRuns 的既有 tick 上呼叫，run 執行中與剛
  * 結束的最後一次掃描都會呼叫到（見呼叫處註解），確保 run 結束、transcript
  * 停止增長後，DB 欄位仍留著最終輪數。
+ *
+ * `finishedAt`：run 仍在執行中傳 `null`（呼叫端天然有界，見
+ * `isRoundsMonDbEligible` 註解）；已結束傳該次執行的結束時間，用來把 mon_ui
+ * 那段的寫入範圍限縮在最近 6 小時內（BLOCKING-1(a)）。
  */
-function persistReviewRounds(key: string, ticket: string, startedAt: string, stdoutPath: string): void {
+function persistReviewRounds(key: string, ticket: string, startedAt: string, stdoutPath: string, finishedAt: string | null): void {
   const counts = getReviewRoundCounts(ticket, startedAt)
   if (!counts) return
   const last = lastPersistedRounds.get(key)
@@ -449,21 +512,8 @@ function persistReviewRounds(key: string, ticket: string, startedAt: string, std
   // mon_ui 側（Phase 8 讀取面 a4 的唯一 rounds 來源，migration 004 就位）：
   // 獨立於上面的 sqlite bump——sqlite 那段可能因為值沒進展而跳過，mon_ui 這
   // 邊仍要跑（它有自己獨立的 last-written cache，見 persistReviewRoundsToMonDb
-  // 註解），兩邊各自只在自己那次寫入成功才推進自己的 cache。fire-and-forget：
-  // 這裡是同步函式、掛在 scanPipelineRuns 的同步迴圈裡，不能為了一次 DB 寫入
-  // 拖住整個 collector tick；失敗只 WARN，下一輪自然重試。
-  if (isMonitorDbEnabled()) {
-    const pool = getMonitorPool()
-    void persistReviewRoundsToMonDb(pool, {
-      key,
-      ticket,
-      stdoutPath,
-      reviewRounds: counts.reviewRounds,
-      finalReviewRounds: counts.finalReviewRounds,
-    }).catch(err => {
-      console.warn(`mon-db: rounds 寫入例外（ticket=${ticket} key=${key}）：${err}`)
-    })
-  }
+  // 註解），兩邊各自只在自己那次寫入成功才推進自己的 cache。
+  persistReviewRoundsToMonDbGuarded(key, ticket, stdoutPath, finishedAt, counts)
 }
 
 export function scanPipelineRuns() {
@@ -539,7 +589,7 @@ export function scanPipelineRuns() {
           // 才寫下最後幾筆派工事件（例如最後一輪 reviewer 或 Step 6.5），確保
           // 這些也被算進去再持久化一次——之後 pending 就此不再增長，這是最後
           // 機會。
-          persistReviewRounds(key, ticket, startedAt, stdoutPath)
+          persistReviewRounds(key, ticket, startedAt, stdoutPath, finishedAt)
         }
       } catch {}
     } else if (kind === 'bug') {
@@ -555,8 +605,10 @@ export function scanPipelineRuns() {
       } catch {}
       // 審查輪數持久化（2026-09-02）：掛在既有 collector tick 上，不新增
       // timer；跟 finish 分支共用同一個 persistReviewRounds（只增不減，值沒變
-      // 就不寫），run 結束前每個 tick 都有機會把最新輪數落地。
-      persistReviewRounds(key, ticket, startedAt, stdoutPath)
+      // 就不寫），run 結束前每個 tick 都有機會把最新輪數落地。finishedAt 傳
+      // null：這個分支只有 ps 快照命中的執行中 run 才會走到（天然有界，見
+      // isRoundsMonDbEligible 註解），不受 BLOCKING-1(a) 的 6 小時窗限制。
+      persistReviewRounds(key, ticket, startedAt, stdoutPath, null)
     }
   }
   reconcileStaleOutcomes()

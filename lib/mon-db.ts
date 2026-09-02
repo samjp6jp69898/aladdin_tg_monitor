@@ -376,9 +376,15 @@ export async function writeCancelFlag(pool: MonitorDbExecutor, input: WriteCance
 // 一列」的硬約束，不同於 cancel 的 R4/R5 placeholder 退路）。
 // ─────────────────────────────────────────────────────────────────────────
 
+// kind 寫死 'bug'（不是參數）：rounds 只可能算得出 bug pipeline 的
+// counts——getReviewRoundCounts 靠 transcript 裡的 `/create-mr:create-mr
+// <ticket>` prompt 標記找 session，demand pipeline 沒有這個標記，
+// findPipelineTranscript 對 demand run 恆回 null，呼叫端（ingest.ts 的
+// persistReviewRounds）在 `if (!counts) return` 那一行就已經把 demand 濾掉，
+// 走不到這裡。加回這個篩選對齊 cancel 的 R3（同一組欄位），零成本。
 const ROUNDS_RESOLVE_SQL = `
 SELECT run_id FROM runs
- WHERE host = ? AND ticket = ? AND (legacy_key = ? OR stdout_path = ?)
+ WHERE host = ? AND ticket = ? AND kind = 'bug' AND (legacy_key = ? OR stdout_path = ?)
 `.trim()
 
 /** 由 legacy_key/stdout_path 對位 mon_ui 的 run_id；0 或 >1 列命中一律回
@@ -434,8 +440,22 @@ export async function writeRunRounds(pool: MonitorDbExecutor, input: WriteRunRou
 
 const ROUNDS_DB_BUDGET_MS = 1000
 
+// migration 004 檔頭載明的 A 包對位慣例：「pipeline 執行期負向快取每 30 秒
+// 失效重試」——找不到 run_id 不是永久放棄（mon_ui 那一列可能稍晚才由
+// telegram-dispatcher 寫入，下一輪還是要重試），但也不能讓每 3 秒一次的
+// ingest tick 對同一個對不到的 key 每次都重打一次 SELECT；改成「同一個 key
+// 30 秒內只嘗試一次」的 TTL 負向快取（對抗審查 BLOCKING-1(b)）。
+const ROUNDS_RUN_ID_MISS_TTL_MS = 30_000
+
+// 與 cancel 共用同一個 4 連線 mon_ui pool（connectionLimit:4、
+// waitForConnections:false，見 getMonitorPool），rounds 這條背景路徑最多同時
+// 佔用這麼多連線，搶不到名額的呼叫直接放棄（不排隊），下一輪 ingest tick 自
+// 然重試——避免一次 tick 對很多 run 同時發起查詢時把 cancel 擠掉連線（對抗
+// 審查 BLOCKING-1(d)）。
+const ROUNDS_MAX_CONCURRENT_DB_OPS = 2
+
 export interface PersistRunRoundsInput {
-  /** pipeline_runs.key（`<ticket>.<file-ts>`），同時是本函式兩個內部 cache 的鍵。 */
+  /** pipeline_runs.key（`<ticket>.<file-ts>`），同時是本函式內部各 cache 的鍵。 */
   key: string
   ticket: string
   /** BUG_RE 命中的 stdout log 絕對路徑；deriveLegacyKey 由此反推 legacy_key，
@@ -450,37 +470,51 @@ export interface PersistRunRoundsInput {
 // 這一側真的寫成功後才推進這一側的 cache，任一邊失敗都不影響另一邊的重試。
 const lastWrittenRounds = new Map<string, { review: number; final: number }>()
 // run_id 只 cache 命中；找不到不 cache（mon_ui 那一列可能是 telegram-dispatcher
-// 稍晚才寫入，不能一次找不到就永久放棄，下一輪自然重試）。
+// 稍晚才寫入，不能一次找不到就永久放棄，下一輪自然重試——用下面的 TTL 負向
+// 快取節流重試頻率，而不是完全不重試）。
 const roundsRunIdCache = new Map<string, string>()
+// key → 上次「對不到 run_id」的嘗試時間（epoch ms）。TTL 負向快取，見上方常數註解。
+const roundsRunIdMissCache = new Map<string, number>()
+// key → 是否已經為「目前這一串連續失敗」印過 WARN；成功一次就清掉，讓下一次
+// 失敗重新印一次——不是永久靜音，只是同一串連續失敗不重複洗版（對抗審查
+// BLOCKING-1(c)）。
+const roundsWarnedKeys = new Set<string>()
 // 對不到 run_id 的行程內計數（不落 DB、不告警風暴）。
 let roundsUnresolvedCount = 0
+// 目前同時在跑的 mon_ui rounds DB 操作數，見 ROUNDS_MAX_CONCURRENT_DB_OPS。
+let roundsInFlightCount = 0
 
 export function getRoundsUnresolvedCountForTest(): number {
   return roundsUnresolvedCount
 }
 
-/** 測試專用：清空本節兩個 cache 與計數，避免跨測試互相污染（模組級狀態）。 */
+/** 測試專用：清空本節所有 cache／計數，避免跨測試互相污染（模組級狀態）。 */
 export function __resetRoundsMonDbStateForTest(): void {
   lastWrittenRounds.clear()
   roundsRunIdCache.clear()
+  roundsRunIdMissCache.clear()
+  roundsWarnedKeys.clear()
   roundsUnresolvedCount = 0
+  roundsInFlightCount = 0
 }
 
 /**
  * 掛在 ingest.ts persistReviewRounds 既有 tick 之後：值有進展才寫、run_id
- * 對位失敗只 skip+計數、整段套 budgetMs 預算（比照 cancelPipeline 的
- * Promise.race 慣例，避免 mysql2 對已建立但對端卡死連線沒有 per-query 逾時的
- * 已知限制拖住 collector tick）。budgetMs 預設 1000ms，測試可覆寫成很小的值
- * 以確定性驗證逾時分支，不需要真的等待。
+ * 對位失敗只 skip+計數（帶 TTL 負向快取節流）、有界並發（避免與 cancel 搶
+ * mon_ui 連線）、整段套 budgetMs 預算（比照 cancelPipeline 的 Promise.race
+ * 慣例，避免 mysql2 對已建立但對端卡死連線沒有 per-query 逾時的已知限制拖住
+ * collector tick）。budgetMs / missTtlMs 皆可覆寫，測試可用極小值或 0 確定性
+ * 驗證逾時／TTL 分支，不需要真的等待。
  *
- * 失敗/逾時只 WARN——不落 spool（與 cancel 旗標不同）：rounds 每個 ingest
- * tick 都會重算，下一輪自然重試，自癒；沒有「這次沒寫就永久遺失」的風險，
- * 落 spool 反而多一套要重放的機制，不成比例。
+ * 失敗/逾時只 WARN（同一 key 連續失敗只印一次）——不落 spool（與 cancel 旗標
+ * 不同）：rounds 每個 ingest tick 都會重算，下一輪自然重試，自癒；沒有「這次
+ * 沒寫就永久遺失」的風險，落 spool 反而多一套要重放的機制，不成比例。
  */
 export async function persistReviewRoundsToMonDb(
   pool: MonitorDbExecutor,
   input: PersistRunRoundsInput,
   budgetMs: number = ROUNDS_DB_BUDGET_MS,
+  missTtlMs: number = ROUNDS_RUN_ID_MISS_TTL_MS,
 ): Promise<{ wrote: boolean }> {
   // 深度防禦：呼叫端（ingest.ts）已在旗標關閉時完全不建 pool、不呼叫到這裡，
   // 這裡自己再擋一次，比照 appendStatusLogToSpool 的慣例。
@@ -488,31 +522,56 @@ export async function persistReviewRoundsToMonDb(
   const last = lastWrittenRounds.get(input.key)
   if (last && input.reviewRounds <= last.review && input.finalReviewRounds <= last.final) return { wrote: false }
 
-  const attempt = (async (): Promise<WriteRunRoundsResult> => {
-    let runId = roundsRunIdCache.get(input.key)
-    if (runId === undefined) {
-      const legacyKey = deriveLegacyKey(input.stdoutPath)
-      const resolved = await resolveRunIdForRounds(pool, input.ticket, legacyKey, input.stdoutPath)
-      if (resolved === null) {
-        roundsUnresolvedCount += 1
-        return { ok: false }
+  // 有界並發（BLOCKING-1(d)）：名額用滿就直接放棄，不排隊——下一輪 ingest
+  // tick 自然重試，不留下未完成的佇列（本函式從不主動累積待辦）。
+  if (roundsInFlightCount >= ROUNDS_MAX_CONCURRENT_DB_OPS) return { wrote: false }
+  roundsInFlightCount++
+  try {
+    const attempt = (async (): Promise<WriteRunRoundsResult> => {
+      let runId = roundsRunIdCache.get(input.key)
+      if (runId === undefined) {
+        const now = Date.now()
+        const lastMiss = roundsRunIdMissCache.get(input.key)
+        if (lastMiss !== undefined && now - lastMiss < missTtlMs) {
+          // TTL 負向快取命中：距離上次對不到還沒滿 missTtlMs，不重打 SELECT。
+          return { ok: false }
+        }
+        const legacyKey = deriveLegacyKey(input.stdoutPath)
+        const resolved = await resolveRunIdForRounds(pool, input.ticket, legacyKey, input.stdoutPath)
+        if (resolved === null) {
+          roundsRunIdMissCache.set(input.key, now)
+          roundsUnresolvedCount += 1
+          return { ok: false }
+        }
+        runId = resolved
+        roundsRunIdCache.set(input.key, runId)
+        roundsRunIdMissCache.delete(input.key)
       }
-      runId = resolved
-      roundsRunIdCache.set(input.key, runId)
-    }
-    return writeRunRounds(pool, { runId, reviewRounds: input.reviewRounds, finalReviewRounds: input.finalReviewRounds })
-  })()
-  const budget = new Promise<WriteRunRoundsResult>(resolve => setTimeout(() => resolve({ ok: false }), budgetMs))
-  // attempt 若晚於 budget 完成，讓它繼續在背景跑完（不取消，mysql2 沒有內建
-  // query cancel）；race 只決定這次呼叫要不要等它推進 cache。
-  const raced = await Promise.race([attempt.catch((): WriteRunRoundsResult => ({ ok: false })), budget])
+      return writeRunRounds(pool, { runId, reviewRounds: input.reviewRounds, finalReviewRounds: input.finalReviewRounds })
+    })()
 
-  if (raced.ok) {
-    lastWrittenRounds.set(input.key, { review: input.reviewRounds, final: input.finalReviewRounds })
-    return { wrote: true }
+    let budgetTimer: ReturnType<typeof setTimeout>
+    const budget = new Promise<WriteRunRoundsResult>(resolve => {
+      budgetTimer = setTimeout(() => resolve({ ok: false }), budgetMs)
+    })
+    // attempt 若晚於 budget 完成，讓它繼續在背景跑完（不取消，mysql2 沒有內建
+    // query cancel）；race 只決定這次呼叫要不要等它推進 cache。
+    const raced = await Promise.race([attempt.catch((): WriteRunRoundsResult => ({ ok: false })), budget])
+    clearTimeout(budgetTimer!) // NB-2：attempt 先贏的話，budget 那顆計時器已經沒用了，清掉不留空轉的 timer。
+
+    if (raced.ok) {
+      lastWrittenRounds.set(input.key, { review: input.reviewRounds, final: input.finalReviewRounds })
+      roundsWarnedKeys.delete(input.key)
+      return { wrote: true }
+    }
+    if (!roundsWarnedKeys.has(input.key)) {
+      roundsWarnedKeys.add(input.key)
+      console.warn(`mon-db: rounds 寫入未成功（ticket=${input.ticket} key=${input.key}），下一輪自然重試（同一 run 連續失敗只印這一次，成功或狀態改變後才會再印）`)
+    }
+    return { wrote: false }
+  } finally {
+    roundsInFlightCount--
   }
-  console.warn(`mon-db: rounds 寫入未成功（ticket=${input.ticket} key=${input.key}），下一輪自然重試`)
-  return { wrote: false }
 }
 
 // ─────────────────────────────────────────────────────────────────────────

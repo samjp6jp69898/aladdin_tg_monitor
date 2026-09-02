@@ -26,6 +26,7 @@ import {
   __resetRoundsMonDbStateForTest,
   type ResolveRunIdInput,
 } from './mon-db.ts'
+import { persistReviewRoundsToMonDbGuarded, isRoundsMonDbEligible } from './ingest.ts'
 
 // ---------- resolveRunId：假 pool，比對邏輯與 cancel-resolve.ts 相同 ----------
 
@@ -363,6 +364,19 @@ describe('resolveRunIdForRounds', () => {
     const runId = await resolveRunIdForRounds(pool, 'FAQ-1', 'k', null)
     expect(runId).toBeNull()
   })
+
+  test("SQL 形狀：篩 kind='bug'，與 cancel R3 對齊（NB-3）", async () => {
+    class SqlCapturePool {
+      lastSql = ''
+      async execute(sql: string, _params: unknown[] = []): Promise<[unknown, unknown]> {
+        this.lastSql = sql
+        return [[], []]
+      }
+    }
+    const pool = new SqlCapturePool()
+    await resolveRunIdForRounds(pool, 'FAQ-1', 'k', null)
+    expect(pool.lastSql).toContain("kind = 'bug'")
+  })
 })
 
 // ---------- writeRunRounds（單調不回退守衛全在 WHERE） ----------
@@ -507,7 +521,7 @@ describe('persistReviewRoundsToMonDb', () => {
     expect(pool.calls.map(c => c.kind)).toEqual(['write'])
   })
 
-  test('對不到 run_id → skip（wrote=false）、計數 +1、不猜不鑄新列；下一輪重新嘗試解析（不永久放棄）', async () => {
+  test('對不到 run_id → skip（wrote=false）、計數 +1、不猜不鑄新列；TTL 期間內（預設 30 秒）不重複查詢（BLOCKING-1(b) TTL 負向快取）', async () => {
     restoreFlag = setMonDbFlag('1')
     const pool = new FakeRoundsFullPool() // resolveRows 空 → 永遠對不到
     const before = getRoundsUnresolvedCountForTest()
@@ -517,10 +531,28 @@ describe('persistReviewRoundsToMonDb', () => {
     expect(getRoundsUnresolvedCountForTest()).toBe(before + 1)
     expect(pool.calls.map(c => c.kind)).toEqual(['resolve']) // 對不到就不會有 write
 
-    // 下一輪（值又進展了）再試一次仍然對不到 → 計數再 +1（沒有把「對不到」錯誤 cache 成永久放棄）。
+    // 下一輪（值又進展了）緊接著再試一次：兩次呼叫間隔只有幾毫秒的真實時間，
+    // 遠小於預設 30 秒的 TTL 窗——這是靠「兩次呼叫本來就很快連續發生」這個
+    // 事實成立，不是靠等待時間讓測試通過，不違反禁 sleep。
+    pool.calls = []
     const r2 = await persistReviewRoundsToMonDb(pool, { key: 'FAQ-2.a', ticket: 'FAQ-2', stdoutPath: '/logs/FAQ-2.a.stdout.log', reviewRounds: 2, finalReviewRounds: 0 })
     expect(r2.wrote).toBe(false)
-    expect(getRoundsUnresolvedCountForTest()).toBe(before + 2)
+    expect(getRoundsUnresolvedCountForTest()).toBe(before + 1) // TTL 命中 → 沒有真的再查一次，計數不變
+    expect(pool.calls.length).toBe(0) // 沒有打到 pool
+  })
+
+  test('missTtlMs=0（停用負向快取，測試專用覆寫）→ 每次都重新查詢，計數持續前進；證明「對不到」不是永久放棄，只是被 TTL 節流', async () => {
+    restoreFlag = setMonDbFlag('1')
+    const pool = new FakeRoundsFullPool() // resolveRows 空 → 永遠對不到
+    const before = getRoundsUnresolvedCountForTest()
+
+    const r1 = await persistReviewRoundsToMonDb(pool, { key: 'FAQ-2b.a', ticket: 'FAQ-2b', stdoutPath: '/logs/FAQ-2b.a.stdout.log', reviewRounds: 1, finalReviewRounds: 0 }, undefined, 0)
+    expect(r1.wrote).toBe(false)
+    expect(getRoundsUnresolvedCountForTest()).toBe(before + 1)
+
+    const r2 = await persistReviewRoundsToMonDb(pool, { key: 'FAQ-2b.a', ticket: 'FAQ-2b', stdoutPath: '/logs/FAQ-2b.a.stdout.log', reviewRounds: 2, finalReviewRounds: 0 }, undefined, 0)
+    expect(r2.wrote).toBe(false)
+    expect(getRoundsUnresolvedCountForTest()).toBe(before + 2) // missTtlMs=0 → 每次都真的重查一次
   })
 
   test('write 失敗（單調守衛擋下）→ cache 不推進，下一輪同值仍會重試', async () => {
@@ -540,10 +572,129 @@ describe('persistReviewRoundsToMonDb', () => {
     expect(pool.calls.length).toBeGreaterThan(0) // 沒有被「值未變化」短路跳過
   })
 
-  // 註：budgetMs 逾時分支（Promise.race 對 setTimeout）不在此檔用真實延遲測試
-  // ——「禁 sleep」硬規則明文「測試碼不得靠等待時間成立」，逾時競態若要確定性
-  // 驗證，需要真的讓一條路徑比另一條慢，等同於靠等待時間成立，不划算也不合規。
-  // 這裡只驗證邏輯分支本身（成功/失敗兩種 raced.ok 結果都會正確處理 cache），
-  // Promise.race + setTimeout 的機制與 cancelPipeline 已驗證過的 writeCancelFlag
-  // 完全同構，不重複驗證同一個機制。
+  test('budgetMs 逾時分支：注入永不 resolve 的假 pool + budgetMs:0 → 確定性走 budget 分支，零等待（對抗審查 NB-1，之前誤判為不可測）', async () => {
+    restoreFlag = setMonDbFlag('1')
+    class NeverResolvePool {
+      calls = 0
+      async execute(): Promise<[unknown, unknown]> {
+        this.calls++
+        return new Promise(() => {}) // 永不 resolve——budget 分支必勝，與真實時間無關。
+      }
+    }
+    const pool = new NeverResolvePool()
+    const r = await persistReviewRoundsToMonDb(
+      pool,
+      { key: 'FAQ-4.a', ticket: 'FAQ-4', stdoutPath: '/logs/FAQ-4.a.stdout.log', reviewRounds: 1, finalReviewRounds: 0 },
+      0, // budgetMs=0：budget 這顆 setTimeout(fn,0) 一定比永不 resolve 的 attempt 先觸發
+    )
+    expect(r.wrote).toBe(false)
+    expect(pool.calls).toBe(1) // 有真的發起查詢（不是被別的短路擋掉）
+
+    // cache 未推進：同 key 再打一次仍然會再查一次（不是被「值未變化」短路跳過）。
+    const r2 = await persistReviewRoundsToMonDb(
+      pool,
+      { key: 'FAQ-4.a', ticket: 'FAQ-4', stdoutPath: '/logs/FAQ-4.a.stdout.log', reviewRounds: 1, finalReviewRounds: 0 },
+      0,
+    )
+    expect(r2.wrote).toBe(false)
+    expect(pool.calls).toBe(2)
+  })
+
+  test('有界並發（BLOCKING-1(d)）：ROUNDS_MAX_CONCURRENT_DB_OPS(=2) 個名額用滿後，第三路不打 pool、直接放棄，不排隊', async () => {
+    restoreFlag = setMonDbFlag('1')
+    let releaseGate!: () => void
+    const gate = new Promise<void>(resolve => {
+      releaseGate = resolve
+    })
+    class GatedPool {
+      calls: string[] = []
+      async execute(sql: string, params: unknown[] = []): Promise<[unknown, unknown]> {
+        if (sql.includes('legacy_key = ? OR stdout_path = ?')) {
+          this.calls.push(`resolve:${(params as unknown[])[1]}`)
+          await gate // 卡住直到測試主動釋放——不是靠等待時間，是靠外部控制的 deferred promise。
+          return [[], []] // 模擬找不到 run_id，本測試不關心最終結果，只看有沒有搶到名額
+        }
+        throw new Error(`GatedPool: 未預期的 SQL：${sql}`)
+      }
+    }
+    const pool = new GatedPool()
+
+    // 三路「同時」發起（不 await，讓它們各自跑到自己的第一個真正 await 為止）：
+    // JS 對 async function 的呼叫在第一個 await 之前是同步執行的，所以呼叫完
+    // 這三行之後，前兩路（名額內）已經同步執行到 `await gate`、pool.execute
+    // 的 push 也已經真的發生；第三路的並發檢查同樣是同步判斷，此刻已經決定
+    // 放棄——完全不需要任何 `await Promise.resolve()` 之類的額外等待。
+    const p1 = persistReviewRoundsToMonDb(pool, { key: 'FAQ-c1', ticket: 'FAQ-c1', stdoutPath: '/logs/c1.stdout.log', reviewRounds: 1, finalReviewRounds: 0 })
+    const p2 = persistReviewRoundsToMonDb(pool, { key: 'FAQ-c2', ticket: 'FAQ-c2', stdoutPath: '/logs/c2.stdout.log', reviewRounds: 1, finalReviewRounds: 0 })
+    const p3 = persistReviewRoundsToMonDb(pool, { key: 'FAQ-c3', ticket: 'FAQ-c3', stdoutPath: '/logs/c3.stdout.log', reviewRounds: 1, finalReviewRounds: 0 })
+
+    expect(pool.calls.length).toBe(2) // 只有名額內的兩路真的打到 pool，第三路被同步擋下
+    expect(pool.calls).toEqual(['resolve:FAQ-c1', 'resolve:FAQ-c2'])
+
+    releaseGate()
+    const [r1, r2, r3] = await Promise.all([p1, p2, p3])
+    expect(r3.wrote).toBe(false) // 第三路從未打到 pool，也自然不可能寫成功
+    // 名額釋放後（roundsInFlightCount 遞減）新的一輪能再搶到名額——用第四路驗證不是永久卡死。
+    const p4 = persistReviewRoundsToMonDb(pool, { key: 'FAQ-c4', ticket: 'FAQ-c4', stdoutPath: '/logs/c4.stdout.log', reviewRounds: 1, finalReviewRounds: 0 })
+    expect(pool.calls).toContain('resolve:FAQ-c4')
+    await p4
+    void r1
+    void r2
+  })
+})
+
+// ---------- persistReviewRoundsToMonDbGuarded（ingest.ts）：BLOCKING-2 迴歸測試 ----------
+//
+// getMonitorPool()（mon-db.ts）在 MON_DB_HOST/PORT/SCHEMA/USER/PASSWORD 任一
+// 缺漏時是**同步 throw**。對抗審查抓到：舊版呼叫端在 running 分支完全沒有
+// try/catch 包住這段，一次「旗標開了、連線參數還沒補齊」的設定錯誤會讓
+// scanPipelineRuns 的 for 迴圈當場中斷、reconcileStaleOutcomes 永遠不執行、
+// scanAgentTraces 每個 tick 都被跳過——行程不死，但兩個與 rounds 完全無關的
+// collector 職責會無聲停擺。這裡直接測最小可重現單元：不依賴真實 transcript
+// /DISPATCHER_LOG_DIR（那些依賴會讓端到端測試變成非確定性），只驗證
+// persistReviewRoundsToMonDbGuarded 本身「同步 throw 不會逃出函式」這件事。
+describe('persistReviewRoundsToMonDbGuarded（ingest.ts）— BLOCKING-2：getMonitorPool() 同步 throw 不炸呼叫端', () => {
+  test('MON_DB_ENABLED=1 但 MON_DB_HOST 缺漏 → getMonitorPool() 的同步 throw 被吞掉，函式本身不拋出', () => {
+    const restoreFlag = setMonDbFlag('1')
+    const savedHost = process.env.MON_DB_HOST
+    delete process.env.MON_DB_HOST // 保證 getMonitorPool() 走到 throw 分支（missing.length > 0）
+    try {
+      expect(() =>
+        persistReviewRoundsToMonDbGuarded('FAQ-9.a', 'FAQ-9', '/logs/FAQ-9.a.stdout.log', null, { reviewRounds: 1, finalReviewRounds: 0 }),
+      ).not.toThrow()
+    } finally {
+      if (savedHost === undefined) delete process.env.MON_DB_HOST
+      else process.env.MON_DB_HOST = savedHost
+      restoreFlag()
+    }
+  })
+
+  test('MON_DB_ENABLED 未設（關閉）→ 不會走到 getMonitorPool()，同樣不拋出（既有防線，順帶覆蓋）', () => {
+    const restoreFlag = setMonDbFlag(undefined)
+    try {
+      expect(() =>
+        persistReviewRoundsToMonDbGuarded('FAQ-10.a', 'FAQ-10', '/logs/FAQ-10.a.stdout.log', null, { reviewRounds: 1, finalReviewRounds: 0 }),
+      ).not.toThrow()
+    } finally {
+      restoreFlag()
+    }
+  })
+})
+
+// ---------- isRoundsMonDbEligible（ingest.ts）：BLOCKING-1(a) 6 小時窗 ----------
+
+describe('isRoundsMonDbEligible', () => {
+  test('finishedAt=null（執行中）→ 永遠 true', () => {
+    expect(isRoundsMonDbEligible(null)).toBe(true)
+  })
+
+  test('finishedAt 是 1 小時前 → true（在 6 小時窗內）', () => {
+    const oneHourAgo = new Date(Date.now() - 3600 * 1000).toISOString()
+    expect(isRoundsMonDbEligible(oneHourAgo)).toBe(true)
+  })
+
+  test('finishedAt 是 7 小時前 → false（超出 6 小時窗，歷史 run 不再每 tick 重試）', () => {
+    const sevenHoursAgo = new Date(Date.now() - 7 * 3600 * 1000).toISOString()
+    expect(isRoundsMonDbEligible(sevenHoursAgo)).toBe(false)
+  })
 })
