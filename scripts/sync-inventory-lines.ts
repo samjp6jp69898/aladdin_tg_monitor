@@ -72,9 +72,23 @@ if (!checkOnly && drifted.length) {
 }
 
 const gaps = stale.length + undocumented.length
+// 行號漂移與涵蓋性缺口**都算不合格**（裁定）。
+//
+// 2026-09-02 修正：原本 exit code 只看 `gaps`，於是 --check 會印出滿滿 36 行漂移、
+// 然後回 RESULT: OK 與 exit 0——擋門那格標籤宣稱「行號同步 + 雙向涵蓋」，實際上
+// 只驗了後半。這比完全沒驗更糟：它印了問題又說沒事，會訓練人忽略它的輸出。
+//
+// 理由與涵蓋性缺口同一條：契約檔是「回應形狀不變」的官方驗收基準，行號全錯的話
+// 人照著去看會看到別的東西（實例：照 905 去看，看到的是 SSE_MAX_CONSECUTIVE_FAILURES
+// 的註解區塊而不是路由）——那是基準有洞，不是文件小瑕疵。
+// 寫入模式下漂移已當場修好，不該再算成不合格（否則把本工具寫進腳本會「修完永遠失敗」）；
+// --check 模式沒寫檔，漂移仍存在，才要計入。
+const unresolvedDrift = checkOnly ? drifted.length : 0
+const bad = gaps + unresolvedDrift
 console.log(
-  gaps === 0
-    ? `\nRESULT: OK — server.ts ${routes.size} 條路由與文件小節雙向對齊`
-    : `\nRESULT: GAPS — 涵蓋性缺口 ${gaps} 處（見上），契約檔不可當驗收基準直到補齊`,
+  bad === 0
+    ? `\nRESULT: OK — server.ts ${routes.size} 條路由與文件小節雙向對齊，行號無漂移`
+    : `\nRESULT: NG — 行號漂移 ${unresolvedDrift} 處、涵蓋性缺口 ${gaps} 處，` +
+      `契約檔不可當驗收基準直到修正（漂移跑一次不帶 --check 即可修）`,
 )
-process.exit(gaps === 0 ? 0 : 1)
+process.exit(bad === 0 ? 0 : 1)
