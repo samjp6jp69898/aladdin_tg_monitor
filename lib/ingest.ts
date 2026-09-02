@@ -17,6 +17,17 @@ import { join } from 'node:path'
 const execFileAsync = promisify(execFile)
 import { SERVICES, DISPATCHER_LOG_DIR, AGENT_TRACE_DIR, BUG_LOCK_DIR, type ServiceDef } from './services.ts'
 import { db, insertMany, getOffset, setOffset, recordStatusIfChanged, upsertRun, finishRun, reopenRun, markCancelled, agentRunMtime, upsertAgentRun, bumpReviewRounds } from './db.ts'
+import {
+  isMonitorDbEnabled,
+  getMonitorPool,
+  resolveRunId,
+  resolveRunIdLocalOnly,
+  writeCancelFlag,
+  appendCancelFlagToSpool,
+  readActiveMarker,
+  deriveLegacyKey,
+  RUNS_HOST,
+} from './mon-db.ts'
 
 // ---------- 1) audit.jsonl tail ----------
 
@@ -145,6 +156,21 @@ function scanRunningPipelineProcs(): RunningProc[] {
   }
 }
 
+const CANCEL_FLAG_BUDGET_MS = 1000
+
+export interface CancelPipelineResult {
+  ok: boolean
+  killed: number[]
+  wrapperPid?: number
+  reason?: string
+  /** 以下三個欄位只在 isMonitorDbEnabled() 為 true 時才會出現（見 mon-db.ts）——
+   * flag 關閉期完全不寫、不落 spool，回應形狀與遷移前逐位元組相同
+   * （【G:MJ-G2】§6.4(2) 二擇一裁定）。 */
+  runId?: string
+  runIdResolvedBy?: string
+  flagWritten?: boolean
+}
+
 /**
  * 取消一條背景 pipeline：對 wrapper bash（ps 裡 `run-create-mr <ticket>` /
  * `run-demand-pipeline <ticket>` 那個 pid）與它的全部子孫送 SIGTERM，子孫先、
@@ -154,8 +180,15 @@ function scanRunningPipelineProcs(): RunningProc[] {
  * 殺 pgid，要走 ppid 樹。5 秒後還活著的補 SIGKILL。
  * 不在這裡 spawn 任何東西（只用 process.kill + 快取的 ps 快照），避開 Bun 1.2.9
  * handler 內 spawnSync 的 segfault。
+ *
+ * 監控 DB 化（plan-db-as-truth-v3.2.md §6.4(2) 修訂，【G:BL-G2】【G:MJ-G1】
+ * 【G:MJ-G2】）：殺行程前 await 五段 run_id 解析＋W4a/W4b 旗標寫入，單一
+ * 1000ms 預算涵蓋整段；逾時或任一步失敗仍照殺，只是旗標改落本機 spool（見
+ * mon-db.ts 的 appendCancelFlagToSpool）並計 cancel_flag_deferred。
+ * isMonitorDbEnabled()=false 時整段（步驟 2–4）完全跳過，行為與遷移前
+ * 逐位元組相同（唯一差異是函式簽名變成 async）。
  */
-export function cancelPipeline(kind: 'bug' | 'demand', ticket: string): { ok: boolean; killed: number[]; wrapperPid?: number; reason?: string } {
+export async function cancelPipeline(kind: 'bug' | 'demand', ticket: string): Promise<CancelPipelineResult> {
   const target = cachedRunning.find(r => r.kind === kind && r.ticket === ticket)
   if (!target) return { ok: false, killed: [], reason: 'not running（可能剛結束，或 ps 快照尚未更新，3 秒後再試）' }
   // 由 ppid 快照展開子孫（BFS），再反轉成「最深的先殺」
@@ -166,6 +199,66 @@ export function cancelPipeline(kind: 'bug' | 'demand', ticket: string): { ok: bo
     order.push(p)
     for (const [pid, ppid] of cachedPpid) if (ppid === p && !order.includes(pid)) queue.push(pid)
   }
+
+  let dbFields: { runId: string; runIdResolvedBy: string; flagWritten: boolean } | undefined
+
+  if (isMonitorDbEnabled()) {
+    // 步驟 3：本機解析，不佔預算（不需要 DB）。
+    const marker = readActiveMarker(kind, ticket)
+    const legacyKey = deriveLegacyKey(target.extra)
+    const cancelRequestedAt = new Date().toISOString()
+
+    // 步驟 4：單一 1000ms 預算涵蓋「解析 run_id ＋ 寫旗標」整段
+    // （【G:MJ-G1】：mysql2 對已建立但對端卡死的連線沒有 per-query 逾時，
+    // connectTimeout 管不到，必須整段用 Promise.race 包住）。
+    const attempt = (async () => {
+      const pool = getMonitorPool()
+      const resolved = await resolveRunId(pool, {
+        kind,
+        ticket,
+        target: { pid: target.pid, pidSet: order },
+        legacyKey,
+        stdoutPath: target.extra,
+        marker,
+      })
+      const write = await writeCancelFlag(pool, {
+        runId: resolved.runId,
+        ticket,
+        kind,
+        cancelRequestedAt,
+        resolvedBy: resolved.resolvedBy,
+        legacyKey,
+      })
+      return { runId: resolved.runId, resolvedBy: resolved.resolvedBy, ok: write.ok }
+    })()
+    const budget = new Promise<null>(resolve => setTimeout(() => resolve(null), CANCEL_FLAG_BUDGET_MS))
+    // attempt 若晚於 budget 完成，讓它繼續在背景跑完（不 unref/取消，mysql2 沒
+    // 有內建 query cancel）；race 只決定這次回應要不要等它。
+    const raced = await Promise.race([attempt.catch(() => null), budget])
+
+    if (raced && raced.ok) {
+      dbFields = { runId: raced.runId, runIdResolvedBy: raced.resolvedBy, flagWritten: true }
+    } else {
+      const local = resolveRunIdLocalOnly(kind, marker)
+      try {
+        appendCancelFlagToSpool({
+          runId: local.runId,
+          host: RUNS_HOST,
+          ticket,
+          kind,
+          cancelRequestedAt,
+          resolvedBy: local.resolvedBy,
+          legacyKey,
+        })
+      } catch (err) {
+        console.error(`cancelPipeline: 落 spool 失敗（${ticket}）：${err}`)
+      }
+      console.warn(`cancel_flag_deferred: ticket=${ticket} kind=${kind} runId=${local.runId}（旗標整段逾時/失敗，已落 spool）`)
+      dbFields = { runId: local.runId, runIdResolvedBy: local.resolvedBy, flagWritten: false }
+    }
+  }
+
+  // 步驟 5：既有 kill 流程，不論步驟 3/4 的結果如何，只要拿到 target 就一定執行。
   // 先只殺子孫（最深的先），讓 wrapper bash 自然 wait 到子行程的 143、在 EXIT
   // trap 裡拿到非 0 的 $? 而發出 TG 通知；實測若同時對 wrapper 送 TERM，trap
   // 看到的 $? 會是 0、通知就不會發。1.5 秒後 wrapper 還活著才補 TERM。
@@ -192,7 +285,7 @@ export function cancelPipeline(kind: 'bug' | 'demand', ticket: string): { ok: bo
     }
   }, 5000)
   markCancelled(kind, ticket)
-  return { ok: true, killed, wrapperPid: target.pid }
+  return { ok: true, killed, wrapperPid: target.pid, ...dbFields }
 }
 
 /**
@@ -235,9 +328,10 @@ function guessOutcome(stdoutPath: string): string {
   }
 }
 
-// spawn-create-mr.ts 的 WRAPPER_SCRIPT 目前設定 `timeout 5400`（90 分鐘）——
-// 兩個 repo 各自獨立、沒有 import 關係，這裡只能複製常數，改動時要同步調整。
-const CREATE_MR_TIMEOUT_SECONDS = 5400
+// spawn-create-mr.ts 的 WRAPPER_SCRIPT 目前設定 `timeout 10800`（180 分鐘，
+// plan-db-as-truth-v3.2.md §9.0(G) 逐點對照表第 6 列）——兩個 repo 各自獨立、
+// 沒有 import 關係，這裡只能複製常數，改動時要同步調整。
+const CREATE_MR_TIMEOUT_SECONDS = 10800
 
 const POST_RUN_NOTIFY_LOG = join(DISPATCHER_LOG_DIR, 'post-run-notify.log')
 

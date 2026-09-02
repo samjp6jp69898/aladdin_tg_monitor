@@ -453,7 +453,7 @@ app.post('/api/pipelines/cancel', async c => {
   const kind = body?.kind
   const ticket = body?.ticket ?? ''
   if ((kind !== 'bug' && kind !== 'demand') || !/^[A-Z]+-\d+$/.test(ticket)) return c.json({ ok: false, reason: 'bad params' }, 400)
-  const r = cancelPipeline(kind, ticket)
+  const r = await cancelPipeline(kind, ticket)
   console.error(`cancel ${kind} ${ticket}: ${JSON.stringify(r)}`)
   return c.json(r, r.ok ? 200 : 409)
 })
