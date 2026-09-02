@@ -48,6 +48,25 @@ const REPO = new URL('..', import.meta.url).pathname.replace(/\/$/, '')
  *   - 取 2000ms：足夠涵蓋負載下的 spawn 抖動，又遠小於「對錯列」會產生的差距
  *     （同票的不同次執行至少差幾分鐘），所以擋得住真正的誤配對。
  *   - 本腳本會印出**實測到的最大差值**；樣本夠多之後要收緊，改這個常數即可。
+ *
+ * **適用範圍（af 2026-09-02 提出，本輪查證後收斂）**：
+ *   單向性的前提是「兩個時戳出自同一顆時鐘」。因此本判準**只適用
+ *   `mysql.runs.host = 'head'` 的配對**：
+ *   - **回填列**（`host = 'unknown_pre_migration'`）：`backfill-sqlite.ts` 的
+ *     `mapPipelineRunToRunsRow` 是把 sqlite 的 `started_at` **原字串直通**寫進
+ *     MySQL、不經任何重算，所以 Δ ≡ 0 by construction。它們不走 spawn 路徑，
+ *     混進分布統計會讓「最大 Δ」失真（也會讓人拿 Δ=0 去質疑 2000ms 太寬）。
+ *   - **worker 執行的 run**（`host = <worker 名>`）：那是 worker 端的時鐘，跨機
+ *     偏差可以產生**合法的小幅負 Δ**，套「負差直接 FAIL」會誤報。
+ *     不過本輪查證的結論是**這種配對結構上不會出現**：head 的 sqlite
+ *     `pipeline_runs` 是 `scanPipelineRuns()` 掃**本機** `DISPATCHER_LOG_DIR`
+ *     產生的（`lib/ingest.ts:460`），worker 執行的 run 其 log 檔在 worker 那台
+ *     機器上，head 這份 sqlite 根本沒有對應列（`server.ts:250-253` 的既有註解
+ *     講的就是這件事）。所以 sqlite 側永遠只有 head-local 的 run，配得起來的
+ *     一定是 head 配 head。
+ *     真的出現非 head 配對只有一種可能：worker 的 `legacy_key`（`<ticket>.<ISO>`）
+ *     與 head 某列**撞了**——那是 key 碰撞、是真問題，所以本腳本不是把它靜靜
+ *     跳過，而是**單獨列為異常回報**。
  */
 export const STARTED_AT_TOLERANCE_MS = 2000
 
@@ -188,12 +207,23 @@ let observedMaxDelta = Number.NEGATIVE_INFINITY
   const IGNORE = new Set(['started_at', 'host', 'run_id', 'agents', 'agent_count', 'total_input', 'total_output', 'total_cost'])
   const fieldDiffs: string[] = []
   const badDelta: string[] = []
+  let backfillPairs = 0
+  const crossHostPairs: string[] = []
   for (const r of a) {
     const o = bk.get(r.key)
     if (!o) continue
-    const delta = Date.parse(o.started_at) - Date.parse(r.started_at)
-    observedMaxDelta = Math.max(observedMaxDelta, delta)
-    if (delta < 0 || delta > STARTED_AT_TOLERANCE_MS) badDelta.push(`${r.key} Δ=${delta}ms`)
+    // Δ 判準只適用 host='head' 的配對（理由見 STARTED_AT_TOLERANCE_MS 的說明）。
+    const host = (o as any).host
+    if (host === 'unknown_pre_migration') {
+      backfillPairs++ // 回填列 Δ≡0 by construction，不進分布統計
+    } else if (host !== 'head') {
+      // 結構上不該出現：head 的 sqlite 只有本機 run。出現＝legacy_key 撞了。
+      crossHostPairs.push(`${r.key}（host=${host}）`)
+    } else {
+      const delta = Date.parse(o.started_at) - Date.parse(r.started_at)
+      observedMaxDelta = Math.max(observedMaxDelta, delta)
+      if (delta < 0 || delta > STARTED_AT_TOLERANCE_MS) badDelta.push(`${r.key} Δ=${delta}ms`)
+    }
     for (const col of Object.keys(r)) {
       if (IGNORE.has(col)) continue
       if (JSON.stringify((r as any)[col] ?? null) !== JSON.stringify((o as any)[col] ?? null)) {
@@ -202,8 +232,14 @@ let observedMaxDelta = Number.NEGATIVE_INFINITY
     }
   }
   judge(badDelta.length === 0,
-    `C5 runs.started_at 在容差內（0 ≤ Δ ≤ ${STARTED_AT_TOLERANCE_MS}ms，Δ = mysql − sqlite）`,
-    `實測最大 Δ=${Number.isFinite(observedMaxDelta) ? observedMaxDelta + 'ms' : 'n/a（無交集樣本）'}${badDelta.length ? ' 逾差：' + badDelta.slice(0, 3).join('; ') : ''}`)
+    `C5 runs.started_at 在容差內（0 ≤ Δ ≤ ${STARTED_AT_TOLERANCE_MS}ms，Δ = mysql − sqlite，僅 host='head' 配對）`,
+    `實測最大 Δ=${Number.isFinite(observedMaxDelta) ? observedMaxDelta + 'ms' : "n/a（無 host='head' 交集樣本）"}` +
+      `｜回填列已排除 ${backfillPairs} 筆（Δ≡0 by construction）` +
+      (badDelta.length ? ` 逾差：${badDelta.slice(0, 3).join('; ')}` : ''))
+  // 非 head 配對是 key 碰撞的訊號，不靜靜跳過。
+  judge(crossHostPairs.length === 0,
+    "C5b 沒有 host≠'head' 的配對（head 的 sqlite 結構上只有本機 run，配到別台＝legacy_key 撞了）",
+    crossHostPairs.length ? crossHostPairs.slice(0, 3).join('; ') : '')
   judge(fieldDiffs.length === 0, 'C5 runs 其餘每一欄逐字相等',
     fieldDiffs.length ? fieldDiffs.slice(0, 4).join(' | ') : '')
 }
