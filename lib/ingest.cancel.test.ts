@@ -10,6 +10,7 @@
 // 五段解析 / W4a-W4b / spool 落地 / 逾時退路的核心邏輯已在 lib/mon-db.test.ts
 // 完整覆蓋（純函式、假 pool，不依賴 cachedRunning 這個私有狀態）；本檔只驗證
 // cancelPipeline 本身的「契約」沒有因為 async 化而跑掉。
+import './test-tmp-db.ts' // 必須排在 ./ingest.ts 之前：把 sqlite 導向暫存檔（NB-7）
 import { describe, expect, test } from 'bun:test'
 import { cancelPipeline } from './ingest.ts'
 

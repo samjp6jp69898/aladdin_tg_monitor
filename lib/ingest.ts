@@ -31,6 +31,7 @@ import {
   deriveLegacyKey,
   RUNS_HOST,
   persistReviewRoundsToMonDb,
+  forgetRoundsMonDbState,
 } from './mon-db.ts'
 
 // ---------- 1) audit.jsonl tail ----------
@@ -468,7 +469,14 @@ export function persistReviewRoundsToMonDbGuarded(
   finishedAt: string | null,
   counts: { reviewRounds: number; finalReviewRounds: number },
 ): void {
-  if (!isMonitorDbEnabled() || !isRoundsMonDbEligible(finishedAt)) return
+  if (!isMonitorDbEnabled()) return
+  if (!isRoundsMonDbEligible(finishedAt)) {
+    // 出窗（結束超過 6 小時）就順手清掉這個 key 在 mon-db.ts 四個模組級容器裡
+    // 的記錄——那些容器原本只增不減，清掉之後上界與 6 小時窗一致（對抗審查
+    // NB-1）。純記憶體操作，不建 pool、不做任何 I/O。
+    forgetRoundsMonDbState(key)
+    return
+  }
   try {
     const pool = getMonitorPool()
     void persistReviewRoundsToMonDb(pool, {

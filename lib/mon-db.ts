@@ -488,6 +488,41 @@ export function getRoundsUnresolvedCountForTest(): number {
   return roundsUnresolvedCount
 }
 
+/**
+ * 把某個 key 在本節四個模組級容器裡的記錄一次清掉。呼叫端是 ingest.ts 的
+ * persistReviewRoundsToMonDbGuarded：6 小時窗判定為不合格（run 已結束超過 6
+ * 小時）時順手呼叫一次。
+ *
+ * 這四個容器原本只增不減（條目只在成功對位／成功寫入時才刪），加上這一步之後
+ * 上界就與 6 小時窗一致——出窗的 run 不會再有任何路徑替它建條目，記錄也已經被
+ * 清掉（對抗審查 NB-1）。純記憶體操作、無 I/O，且不改變任何寫入語意：真的重新
+ * 進窗（不會發生，時間單調前進）才會重新建條目。
+ */
+export function forgetRoundsMonDbState(key: string): void {
+  lastWrittenRounds.delete(key)
+  roundsRunIdCache.delete(key)
+  roundsRunIdMissCache.delete(key)
+  roundsWarnedKeys.delete(key)
+}
+
+/**
+ * 「這一輪沒寫成功」的共用尾段：同一 key 的連續失敗只印一次 WARN，成功寫入後
+ * 由 persistReviewRoundsToMonDb 清掉標記、讓下一次失敗重新印一次。
+ *
+ * 兩條失敗路徑（TTL 負向快取命中、attempt 失敗／逾時）共用這裡，行為一致；
+ * 「搶不到名額」不走這裡，理由見該處註解。
+ * 訊息本體刻意不帶失敗原因——所以也不做「原因改變就重印」的狀態偵測，
+ * 文字據實只承諾「成功後才會再印」（對抗審查 NB-2：舊文字承諾了「狀態改變後再
+ * 印」，但實作從來沒有狀態偵測）。
+ */
+function noteRoundsWriteFailure(input: PersistRunRoundsInput): { wrote: boolean } {
+  if (!roundsWarnedKeys.has(input.key)) {
+    roundsWarnedKeys.add(input.key)
+    console.warn(`mon-db: rounds 寫入未成功（ticket=${input.ticket} key=${input.key}），下一輪自然重試（同一 run 連續失敗只印這一次，寫入成功後才會再印）`)
+  }
+  return { wrote: false }
+}
+
 /** 測試專用：清空本節所有 cache／計數，避免跨測試互相污染（模組級狀態）。 */
 export function __resetRoundsMonDbStateForTest(): void {
   lastWrittenRounds.clear()
@@ -522,20 +557,36 @@ export async function persistReviewRoundsToMonDb(
   const last = lastWrittenRounds.get(input.key)
   if (last && input.reviewRounds <= last.review && input.finalReviewRounds <= last.final) return { wrote: false }
 
+  // ── 「這一輪不會打 DB」的判斷全部排在取名額之前（對抗審查 BLOCKING-3）──
+  // 名額是「同時佔用 mon_ui 連線」的預算，只有真的要送查詢的路徑才該消耗它。
+  // 舊版把取名額放在 cache／TTL 判斷之前，TTL 負向快取命中（一次 SQL 都不發）
+  // 的 run 也會佔走名額，而名額要到外層 await 之後的 finally 才釋放；
+  // scanPipelineRuns 的迴圈是全同步的、微任務要等整圈跑完才排空 → 同一個 tick
+  // 內只有 readdir 順序最前面的 2 個合格 run 有機會，即使那 2 個完全不做事，
+  // 排在後面、真正可寫的 run（含 finishedAt=null 的執行中 run）被同步擋掉。
+  // 又因為 readdir 順序穩定、TTL miss 刷新後仍是 miss，下一輪的輸入條件與這一
+  // 輪完全相同 → 不是「下一輪自然重試」，是確定性飢餓。
+  const cachedRunId = roundsRunIdCache.get(input.key)
+  if (cachedRunId === undefined) {
+    const lastMiss = roundsRunIdMissCache.get(input.key)
+    // TTL 負向快取命中：距離上次對不到還沒滿 missTtlMs，不重打 SELECT，也不佔名額。
+    if (lastMiss !== undefined && Date.now() - lastMiss < missTtlMs) return noteRoundsWriteFailure(input)
+  }
+
+  // ── 到這裡才確定要打 DB（resolve 與／或 write 至少一次），才取名額 ──
   // 有界並發（BLOCKING-1(d)）：名額用滿就直接放棄，不排隊——下一輪 ingest
   // tick 自然重試，不留下未完成的佇列（本函式從不主動累積待辦）。
+  // 這條路徑刻意**不走 noteRoundsWriteFailure**（與修法前逐字相同的行為）：搶不
+  // 到名額是預期中的背壓，不是「寫入失敗」，而且它會隨名額釋放自行消失；若在這
+  // 裡也印 WARN，一個持續有進展的 run 就會在「這輪被擋→下輪寫成功清掉標記→再被
+  // 擋」之間反覆印。
   if (roundsInFlightCount >= ROUNDS_MAX_CONCURRENT_DB_OPS) return { wrote: false }
   roundsInFlightCount++
   try {
     const attempt = (async (): Promise<WriteRunRoundsResult> => {
-      let runId = roundsRunIdCache.get(input.key)
+      let runId = cachedRunId
       if (runId === undefined) {
         const now = Date.now()
-        const lastMiss = roundsRunIdMissCache.get(input.key)
-        if (lastMiss !== undefined && now - lastMiss < missTtlMs) {
-          // TTL 負向快取命中：距離上次對不到還沒滿 missTtlMs，不重打 SELECT。
-          return { ok: false }
-        }
         const legacyKey = deriveLegacyKey(input.stdoutPath)
         const resolved = await resolveRunIdForRounds(pool, input.ticket, legacyKey, input.stdoutPath)
         if (resolved === null) {
@@ -564,12 +615,14 @@ export async function persistReviewRoundsToMonDb(
       roundsWarnedKeys.delete(input.key)
       return { wrote: true }
     }
-    if (!roundsWarnedKeys.has(input.key)) {
-      roundsWarnedKeys.add(input.key)
-      console.warn(`mon-db: rounds 寫入未成功（ticket=${input.ticket} key=${input.key}），下一輪自然重試（同一 run 連續失敗只印這一次，成功或狀態改變後才會再印）`)
-    }
-    return { wrote: false }
+    return noteRoundsWriteFailure(input)
   } finally {
+    // 誠實記錄（對抗審查 NB-5，本輪不強修）：budget 先贏（逾時）時這裡就把名額
+    // 還回去，但背景 attempt 仍握著那條 mon_ui 連線、且沒有辦法取消（mysql2 沒
+    // 有 per-query cancel）——「rounds 最多同時佔 2 條連線」在逾時情境下會短暫
+    // 脫鉤。自限性來自 pool 的 waitForConnections:false：連線真的用完時新查詢
+    // 立刻報錯而不是排隊等待，錯誤走 attempt.catch → ok:false → 下一輪重試，
+    // 不會 hang 住 collector tick。
     roundsInFlightCount--
   }
 }

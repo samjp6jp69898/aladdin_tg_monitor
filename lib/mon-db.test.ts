@@ -7,7 +7,8 @@
 // 不是重新驗證 MySQL 語意本身；rounds 相關測試（resolveRunIdForRounds /
 // writeRunRounds / persistReviewRoundsToMonDb）是 tg-monitor 獨有邏輯，沒有
 // telegram-dispatcher 對應實作可比對，直接驗證本檔自己的行為契約。
-import { afterEach, describe, expect, test } from 'bun:test'
+import './test-tmp-db.ts' // 必須排在 ./ingest.ts 之前：把 sqlite 導向暫存檔（NB-7）
+import { afterEach, describe, expect, spyOn, test } from 'bun:test'
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -26,6 +27,8 @@ import {
   __resetRoundsMonDbStateForTest,
   type ResolveRunIdInput,
 } from './mon-db.ts'
+// 注意 import 順序：./test-tmp-db.ts 必須在本行之前（ingest.ts → db.ts 會在
+// import 當下開 sqlite）。
 import { persistReviewRoundsToMonDbGuarded, isRoundsMonDbEligible } from './ingest.ts'
 
 // ---------- resolveRunId：假 pool，比對邏輯與 cancel-resolve.ts 相同 ----------
@@ -606,13 +609,23 @@ describe('persistReviewRoundsToMonDb', () => {
     const gate = new Promise<void>(resolve => {
       releaseGate = resolve
     })
+    // NB-4：這個假 pool **每一路都對得到 run_id、也寫得進去**（不像舊版一律回
+    // 空列）。因此第三路的 `wrote===false` 只剩「被名額擋下」這一個成因——如果
+    // 名額檢查被拿掉，它就會跟前兩路一樣寫成功，測試立刻紅（D30：一測一故障，
+    // 這裡唯一注入的故障是 gate 把前兩路卡在 in-flight 狀態）。
     class GatedPool {
       calls: string[] = []
       async execute(sql: string, params: unknown[] = []): Promise<[unknown, unknown]> {
         if (sql.includes('legacy_key = ? OR stdout_path = ?')) {
-          this.calls.push(`resolve:${(params as unknown[])[1]}`)
+          const ticket = (params as unknown[])[1] as string
+          this.calls.push(`resolve:${ticket}`)
           await gate // 卡住直到測試主動釋放——不是靠等待時間，是靠外部控制的 deferred promise。
-          return [[], []] // 模擬找不到 run_id，本測試不關心最終結果，只看有沒有搶到名額
+          return [[{ run_id: `run-${ticket}` }], []] // 對得到 run_id
+        }
+        if (sql.startsWith('UPDATE runs')) {
+          const [, , runId] = params as [number, number, string, string]
+          this.calls.push(`write:${runId}`)
+          return [{ info: 'Rows matched: 1  Changed: 1  Warnings: 0' }, []] // 寫得進去
         }
         throw new Error(`GatedPool: 未預期的 SQL：${sql}`)
       }
@@ -633,13 +646,66 @@ describe('persistReviewRoundsToMonDb', () => {
 
     releaseGate()
     const [r1, r2, r3] = await Promise.all([p1, p2, p3])
-    expect(r3.wrote).toBe(false) // 第三路從未打到 pool，也自然不可能寫成功
+    expect(r1.wrote).toBe(true) // 名額內的兩路確實寫成功（證明假 pool 這條路是通的）
+    expect(r2.wrote).toBe(true)
+    expect(r3.wrote).toBe(false) // 唯一成因：名額被占滿。它從未打到 pool——
+    expect(pool.calls).not.toContain('resolve:FAQ-c3')
     // 名額釋放後（roundsInFlightCount 遞減）新的一輪能再搶到名額——用第四路驗證不是永久卡死。
     const p4 = persistReviewRoundsToMonDb(pool, { key: 'FAQ-c4', ticket: 'FAQ-c4', stdoutPath: '/logs/c4.stdout.log', reviewRounds: 1, finalReviewRounds: 0 })
     expect(pool.calls).toContain('resolve:FAQ-c4')
-    await p4
-    void r1
-    void r2
+    expect((await p4).wrote).toBe(true)
+  })
+
+  // ---------- BLOCKING-3 迴歸：取名額點必須晚於「不打 DB」的判斷 ----------
+  //
+  // 對抗審查第三輪抓到的缺陷：舊版把「取名額 + 上限檢查」放在 roundsRunIdCache
+  // 與 TTL 負向快取判斷**之前**，釋放又在外層 await 之後的 finally。於是一次
+  // ingest tick 裡，排在前面、TTL 命中而完全不打 DB 的 no-op run 會把 2 個名額
+  // 佔滿（scanPipelineRuns 的迴圈全同步，微任務要整圈跑完才排空），排在後面
+  // 真正可寫的 run 被同步擋掉；readdir 順序穩定 ⇒ 下一輪決定完全相同 ⇒ 確定性
+  // 飢餓，受害者恰好是 finishedAt=null 的執行中 run（Phase 8 a4 最需要的資料）。
+  test('BLOCKING-3：同一個同步批次裡，兩個 TTL 命中的 no-op 排在前面，也不會擋掉排在後面、真正可寫的 run', async () => {
+    restoreFlag = setMonDbFlag('1')
+    class Pool {
+      resolvable = new Set<string>()
+      calls: string[] = []
+      async execute(sql: string, params: unknown[] = []): Promise<[unknown, unknown]> {
+        if (sql.includes('legacy_key = ? OR stdout_path = ?')) {
+          const ticket = (params as unknown[])[1] as string
+          this.calls.push(`resolve:${ticket}`)
+          return [this.resolvable.has(ticket) ? [{ run_id: `run-${ticket}` }] : [], []]
+        }
+        if (sql.startsWith('UPDATE runs')) {
+          const [, , runId] = params as [number, number, string, string]
+          this.calls.push(`write:${runId}`)
+          return [{ info: 'Rows matched: 1  Changed: 1  Warnings: 0' }, []]
+        }
+        throw new Error(`Pool: 未預期的 SQL：${sql}`)
+      }
+    }
+    const pool = new Pool()
+    pool.resolvable.add('LIVE') // 只有 LIVE 這條在 mon_ui 有列（模擬旗標剛啟用的推廣視窗）
+
+    // 先各打一次，讓 A、B 進入 TTL 負向快取（= 6 小時窗內、對不到 run_id 的近期 run）。
+    await persistReviewRoundsToMonDb(pool, { key: 'A', ticket: 'A', stdoutPath: '/logs/A.stdout.log', reviewRounds: 1, finalReviewRounds: 0 })
+    await persistReviewRoundsToMonDb(pool, { key: 'B', ticket: 'B', stdoutPath: '/logs/B.stdout.log', reviewRounds: 1, finalReviewRounds: 0 })
+    expect(pool.calls).toEqual(['resolve:A', 'resolve:B'])
+
+    // 模擬下一個 tick 的同步迴圈：A、B（TTL 命中、完全不打 DB）排在 LIVE 前面。
+    // 三行呼叫之間沒有任何 await——與 scanPipelineRuns 的全同步迴圈同形。
+    pool.calls = []
+    const pA = persistReviewRoundsToMonDb(pool, { key: 'A', ticket: 'A', stdoutPath: '/logs/A.stdout.log', reviewRounds: 2, finalReviewRounds: 0 })
+    const pB = persistReviewRoundsToMonDb(pool, { key: 'B', ticket: 'B', stdoutPath: '/logs/B.stdout.log', reviewRounds: 2, finalReviewRounds: 0 })
+    const pLive = persistReviewRoundsToMonDb(pool, { key: 'LIVE', ticket: 'LIVE', stdoutPath: '/logs/LIVE.stdout.log', reviewRounds: 2, finalReviewRounds: 0 })
+
+    // LIVE 的 SELECT 必須在**同一個同步批次內**就已經發出（不是等到下一輪）。
+    expect(pool.calls).toEqual(['resolve:LIVE'])
+
+    const [rA, rB, rLive] = await Promise.all([pA, pB, pLive])
+    expect(rA.wrote).toBe(false) // A、B 是 TTL no-op：不打 DB、也沒佔名額
+    expect(rB.wrote).toBe(false)
+    expect(rLive.wrote).toBe(true) // LIVE 在同一個 tick 內完成寫入
+    expect(pool.calls).toEqual(['resolve:LIVE', 'write:run-LIVE'])
   })
 })
 
@@ -654,15 +720,27 @@ describe('persistReviewRoundsToMonDb', () => {
 // /DISPATCHER_LOG_DIR（那些依賴會讓端到端測試變成非確定性），只驗證
 // persistReviewRoundsToMonDbGuarded 本身「同步 throw 不會逃出函式」這件事。
 describe('persistReviewRoundsToMonDbGuarded（ingest.ts）— BLOCKING-2：getMonitorPool() 同步 throw 不炸呼叫端', () => {
-  test('MON_DB_ENABLED=1 但 MON_DB_HOST 缺漏 → getMonitorPool() 的同步 throw 被吞掉，函式本身不拋出', () => {
+  // NB-3：`not.toThrow()` 本身非鑑別性（任何提前 return，甚至函式被改成 no-op
+  // 都會通過）。用 console.warn spy 把「catch 分支真的被走到」釘死——訊息內容
+  // 同時證明它是 getMonitorPool() 的環境變數同步 throw，不是別的路徑。
+  // 附帶前提：getMonitorPool() 有 poolSingleton 快取，若日後有人在本檔加入「會
+  // 成功建池」的測試且排在本測試之前，本測試會靜默退化成空測——屆時要改成在
+  // 本測試裡先重置 singleton，或把本測試移到獨立檔案。
+  test('MON_DB_ENABLED=1 但 MON_DB_HOST 缺漏 → getMonitorPool() 的同步 throw 被吞掉、只留 WARN，函式本身不拋出', () => {
     const restoreFlag = setMonDbFlag('1')
     const savedHost = process.env.MON_DB_HOST
     delete process.env.MON_DB_HOST // 保證 getMonitorPool() 走到 throw 分支（missing.length > 0）
+    const warnSpy = spyOn(console, 'warn').mockImplementation(() => {})
     try {
       expect(() =>
         persistReviewRoundsToMonDbGuarded('FAQ-9.a', 'FAQ-9', '/logs/FAQ-9.a.stdout.log', null, { reviewRounds: 1, finalReviewRounds: 0 }),
       ).not.toThrow()
+      const messages = warnSpy.mock.calls.map((args: unknown[]) => String(args[0]))
+      expect(messages.length).toBe(1)
+      expect(messages[0]).toContain('rounds 掛載失敗')
+      expect(messages[0]).toContain('MON_DB_HOST') // 確認是 getMonitorPool() 的缺漏環境變數 throw 被接住
     } finally {
+      warnSpy.mockRestore()
       if (savedHost === undefined) delete process.env.MON_DB_HOST
       else process.env.MON_DB_HOST = savedHost
       restoreFlag()
@@ -696,5 +774,70 @@ describe('isRoundsMonDbEligible', () => {
   test('finishedAt 是 7 小時前 → false（超出 6 小時窗，歷史 run 不再每 tick 重試）', () => {
     const sevenHoursAgo = new Date(Date.now() - 7 * 3600 * 1000).toISOString()
     expect(isRoundsMonDbEligible(sevenHoursAgo)).toBe(false)
+  })
+
+  // NB-6：貼邊界的兩個案例（1 小時 / 7 小時離邊界太遠，測不到「窗到底切在哪」）。
+  // 一分鐘的餘裕遠大於 `Date.now()` 在本測試內的漂移（微秒級），不靠等待成立。
+  test('finishedAt 是 5 小時 59 分前 → true（貼著邊界的內側）', () => {
+    const justInside = new Date(Date.now() - (6 * 3600 - 60) * 1000).toISOString()
+    expect(isRoundsMonDbEligible(justInside)).toBe(true)
+  })
+
+  test('finishedAt 是 6 小時 1 分前 → false（貼著邊界的外側）', () => {
+    const justOutside = new Date(Date.now() - (6 * 3600 + 60) * 1000).toISOString()
+    expect(isRoundsMonDbEligible(justOutside)).toBe(false)
+  })
+})
+
+// ---------- 6 小時窗的「接線」：不合格的 run 連 getMonitorPool() 都不碰 ----------
+//
+// NB-6 指出上面三條只驗了純函式本身，沒有任何測試把「不合格 → 不建 pool、不打
+// DB」這條接線釘住。這裡用「MON_DB_HOST 缺漏」當探針：合格時會走到
+// getMonitorPool() 並印出掛載失敗 WARN（上面的 BLOCKING-2 測試已證明），不合格
+// 時必須**連那個 WARN 都沒有**——一次把「順序（窗判定在 getMonitorPool 之前）」
+// 與「不合格真的什麼都不做」兩件事驗到。
+describe('persistReviewRoundsToMonDbGuarded — 6 小時窗接線（NB-6 / NB-1）', () => {
+  test('不合格（7 小時前結束）→ 完全不碰 getMonitorPool()，MON_DB_HOST 缺漏也不會有任何 WARN', () => {
+    const restoreFlag = setMonDbFlag('1')
+    const savedHost = process.env.MON_DB_HOST
+    delete process.env.MON_DB_HOST
+    const warnSpy = spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const sevenHoursAgo = new Date(Date.now() - 7 * 3600 * 1000).toISOString()
+      persistReviewRoundsToMonDbGuarded('FAQ-11.a', 'FAQ-11', '/logs/FAQ-11.a.stdout.log', sevenHoursAgo, { reviewRounds: 1, finalReviewRounds: 0 })
+      expect(warnSpy.mock.calls.length).toBe(0)
+    } finally {
+      warnSpy.mockRestore()
+      if (savedHost === undefined) delete process.env.MON_DB_HOST
+      else process.env.MON_DB_HOST = savedHost
+      restoreFlag()
+    }
+  })
+
+  test('NB-1：不合格時順手清掉該 key 在四個模組級容器裡的記錄（容器上界與 6 小時窗一致）', async () => {
+    const restoreFlag = setMonDbFlag('1')
+    try {
+      __resetRoundsMonDbStateForTest()
+      const pool = new FakeRoundsFullPool() // resolveRows 空 → 對不到 run_id
+      const input = { key: 'FAQ-12.a', ticket: 'FAQ-12', stdoutPath: '/logs/FAQ-12.a.stdout.log', reviewRounds: 1, finalReviewRounds: 0 }
+
+      // 先讓這個 key 進入 TTL 負向快取（roundsRunIdMissCache 有條目）。
+      await persistReviewRoundsToMonDb(pool, input)
+      pool.calls = []
+      // 沒清掉的話，TTL 內第二次會直接 no-op、不打 pool（上面 TTL 測試已證明）。
+      await persistReviewRoundsToMonDb(pool, { ...input, reviewRounds: 2 })
+      expect(pool.calls.length).toBe(0)
+
+      // 走一次「出窗」的 guarded 呼叫 → 記錄被清掉。
+      const sevenHoursAgo = new Date(Date.now() - 7 * 3600 * 1000).toISOString()
+      persistReviewRoundsToMonDbGuarded(input.key, input.ticket, input.stdoutPath, sevenHoursAgo, { reviewRounds: 3, finalReviewRounds: 0 })
+
+      pool.calls = []
+      await persistReviewRoundsToMonDb(pool, { ...input, reviewRounds: 3 })
+      expect(pool.calls.map(c => c.kind)).toEqual(['resolve']) // TTL 記錄已被清掉 → 真的重查一次
+    } finally {
+      __resetRoundsMonDbStateForTest()
+      restoreFlag()
+    }
   })
 })

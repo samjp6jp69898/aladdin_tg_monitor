@@ -21,6 +21,7 @@
 // `string | null`，fn ∈ {insertStatusLogRow, upsertMonitorHeartbeat, ...}
 // 允許 null——本檔驗證寫出的每一條都恰好是顯式 null（不是省略欄位、不是空
 // 字串）。
+import './test-tmp-db.ts' // 必須排在 ./ingest.ts 之前：把 sqlite 導向暫存檔（NB-7）
 import { afterEach, describe, expect, test } from 'bun:test'
 import { readFileSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
