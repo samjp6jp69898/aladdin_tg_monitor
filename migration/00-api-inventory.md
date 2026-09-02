@@ -9,7 +9,10 @@
 
 **端點總數：32**（`grep -cE "app\.(get|post)\(" server.ts` = 32，與下列小節數一致，含 `GET /` 靜態首頁與 3 個 `handleWorkerAction` 共用 handler 的獨立路由）。
 
-**SSE：無**。`/api/events` 只是普通 GET + `c.json()`，一次性回傳陣列，不是串流。專案本身刻意不用 SSE——`server.ts:787-788` 明確寫「輪詢，不用 SSE——Bun 1.2.9 的 ReadableStream 在客戶端中斷連線時會 segfault，實測踩到」，即時跟隨改用 `/api/log/since` 的 offset 輪詢模式（見該端點小節）。
+**SSE：有一支**（2026-09-02 Phase 8 新增 `GET /api/stream`，見本檔末的「SSE 端點」節）。**原有 32 個端點的路徑、參數、回應形狀一律不變**，`/api/stream` 是**額外**加的一條，不取代任何既有端點；不打它的客戶端行為與遷移前完全相同。
+
+> 本節原文（保留作為脈絡）：「SSE：無。`/api/events` 只是普通 GET + `c.json()`，一次性回傳陣列，不是串流。專案本身刻意不用 SSE——`server.ts:787-788` 明確寫『輪詢，不用 SSE——Bun 1.2.9 的 ReadableStream 在客戶端中斷連線時會 segfault，實測踩到』，即時跟隨改用 `/api/log/since` 的 offset 輪詢模式（見該端點小節）。」
+> 該踩坑已於 2026-09-02 在 Bun 1.4.0 用 `scripts/sse-segfault-repro.ts` 實測解除（exit 0）。**另一條踩坑「handler 內同步 spawn 遇客戶端中斷會 segfault」並未解除**（`lib/ingest.ts:99-103`），`/api/stream` 的 handler 內因此禁用一切 `*Sync` spawn。
 
 ---
 
@@ -452,3 +455,48 @@ app.get('/', c => c.html(Bun.file(new URL('./public/index.html', import.meta.url
 3. **`GET /api/rosters` 頂層是陣列**，不同於其他端點多為物件頂層，寫 API client 時型別要區分。
 4. **`GET /api/pipelines` 回傳的 `rows[]` 與 `GET /api/pipelines/run` 回傳的 `run` 欄位不完全相同，但方向與原文相反**：兩者都有 `agent_count/total_input/total_output/total_cost`（彙總自同票全部歷史 run 的 agent），差別是後者（`run`）額外多了 `agents[]` 彙總來源本體，前者的 `rows[]` 在回傳前會 `delete r.agents` 只留彙總欄（`server.ts:251`）。（2026-09-02 修正：原文寫反，誤植成後者沒有彙總欄。）
 5. 目前完全沒有認證機制，是建立在「只綁 127.0.0.1」這個假設上；若日後前端改造讓這支 server 可能被非本機存取（例如透過反向 proxy），需要重新評估這個假設是否還成立——這不在本次盤點範圍內，僅提醒風險。
+
+---
+
+## SSE 端點（2026-09-02 Phase 8 新增）
+
+### GET /api/stream
+
+單一串流端點，取代前端對 overview / pipelines / toolsmith / log 跟隨這四類的定期輪詢。
+**契約與前端已定案**（`frontend/src/api/transport.ts:9,173,194`）：`event: <topic>`，`data` 是該 topic
+的**完整** JSON payload，與對應 GET 端點的回應**完全同形**——後端兩邊呼叫的是同一個
+`build*Payload()`，形狀結構上不可能分岔。
+
+- Query：
+  - `topics`（**必填**）：逗號分隔。合法值 `overview` / `pipelines` / `toolsmith` / `pipeline-run` / `log`。
+  - `key`：**`topics` 含 `pipeline-run` 時必填**，即 `pipeline_runs.key`（同 `GET /api/pipelines/run` 的 `key`）。
+  - `path`：**`topics` 含 `log` 時必填**，須通過 `isAllowedLogPath()` 白名單（同 `/api/log/tail`、`/api/log/since`）。
+  - `offset`：`log` 的起始位移，預設 0（同 `/api/log/since`）。非數字／負數一律當 0。
+- 錯誤（都在**開串流之前**以一般 HTTP 回應送出，不會先 200 再在串流裡報錯）：
+  - 缺 `topics` → 400 `{ error: 'missing topics' }`
+  - 不認得的 topic → 400 `{ error: 'unknown topics: <逗號分隔>' }`
+  - `pipeline-run` 缺 `key` → 400 `{ error: 'topic pipeline-run 需要 key 參數' }`
+  - `log` 的 `path` 不在白名單（含缺 `path`）→ 403 純文字 `'path not allowed'`
+- 成功：`200`，`content-type: text/event-stream; charset=utf-8`、`cache-control: no-cache, no-transform`、
+  `connection: keep-alive`、`x-accel-buffering: no`
+- 推送節奏（照抄前端既有的兩條輪詢迴圈）：`overview` / `pipelines` / `toolsmith` / `pipeline-run` 每 **5000ms**、
+  `log` 每 **1500ms**；**連上就先各推一份**，不必等第一個 interval。
+- 每則訊息的 payload：
+  | topic | payload | 與哪支 GET 同形 |
+  |---|---|---|
+  | `overview` | `{ now, activeWindowMin, services, webhook, tgUsers, pipelines }` | `GET /api/overview` |
+  | `pipelines` | `{ rows, queued, remote }` | `GET /api/pipelines` |
+  | `toolsmith` | `{ rows }` | `GET /api/toolsmith` |
+  | `pipeline-run` | `{ run, progress, stages }`；查無此 key 時推 `{ error: 'not found' }`（串流沒有狀態碼可用，body 與該端點 404 的 body 同形） | `GET /api/pipelines/run` |
+  | `log` | `{ text, offset }`；檔案不存在時 `{ text: '', offset: 0, missing: true }` | `GET /api/log/since` |
+- `log` 的增量語意與 `/api/log/since` 一字不差：伺服器端自己記住 offset 往前推；**沒有新內容的那一拍整拍不推**
+  （省頻寬）；檔案被截斷／輪替時 offset 歸零，前端既有的 `if (res.offset < offsetRef.current) setText('')`
+  判斷照樣成立。
+- 心跳：每 15 秒送一行 `: ping` 註解列（EventSource 規範會忽略 `:` 開頭的行）。某個 topic 產 payload
+  失敗時也送註解列 `: error <topic>`（同時寫 stderr）——**刻意不新增契約外的 event 名稱**。
+- 客戶端斷線：`ReadableStream.cancel()` 觸發後清掉該連線的所有 timer。實測 8 條連線硬斷後
+  server 存活且可繼續服務。
+
+> ⚠️ `pipeline-run` 這個 topic 是**額外**支援的：`transport.ts` 的 `STREAMABLE_TOPICS` 只列了四個，
+> 但 `topics.ts:66` 的 `pipelineRun` 已經標了 `streamable: true`（前端自身不一致）。後端兩邊都支援，
+> 前端要用哪個由前端決定。

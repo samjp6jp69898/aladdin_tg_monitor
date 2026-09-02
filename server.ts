@@ -10,7 +10,11 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { join } from 'node:path'
 import { SERVICES, DISPATCHER_LOG_DIR, isAllowedLogPath, isAllowedTracePath, restartService } from './lib/services.ts'
-import { db } from './lib/db.ts'
+// 讀取面（MON_READ_SOURCE=sqlite|mysql，plan-db-as-truth-v3.md §8.1）。
+// server.ts 只認識這個介面，不再直接碰 sqlite——所有 SQL 都在 lib/read/ 底下，
+// 兩個資料源交出同一個形狀，**回應組裝一律留在本檔**（單一來源、形狀不分岔）。
+import { getReader, initReader } from './lib/read/index.ts'
+import type { AgentRunRow } from './lib/read/types.ts'
 import { startCollectors, getLastProbes, listRunningPipelineProcs, listBugLocks, loadRoster, cancelPipeline, summarizeEvents, computeBugStages, readTrackerStatusAsync, isBugOutcomeRetryable, parseClaudeEvents, getReviewRoundCounts } from './lib/ingest.ts'
 import { loadConnectedUsers, loadPendingSenders, loadAllTechUsers, assignChatId, unsetChatId, sendTestMessage } from './lib/tg-users.ts'
 import { getWebhookStatus } from './lib/webhook-status.ts'
@@ -39,6 +43,12 @@ startCollectors({ probeEveryMs: 5000, ingestEveryMs: 3000 })
 const PIPELINE_LIMITS = await fetchPipelineLimits()
 console.error(`tg-monitor: pipeline 併發上限 bug=${PIPELINE_LIMITS.bug} demand=${PIPELINE_LIMITS.demand}（source=${PIPELINE_LIMITS.source}）`)
 
+// 讀取面來源（MON_READ_SOURCE）。預設 sqlite；切 mysql 失敗會退回 sqlite 並記
+// ERROR（見 lib/read/index.ts 的說明）。切換一律經由重啟：
+//   改 tg-monitor/.env 的一個字 + launchctl kickstart -k com.aladdin.tg-monitor
+const READ_SOURCE = await initReader()
+console.error(`tg-monitor: 讀取面資料源 = ${READ_SOURCE}`)
+
 const app = new Hono()
 
 // 舊版 vanilla JS 前端（public/index.html）已於 2026-09-02 經使用者核准刪除，React 版
@@ -63,41 +73,37 @@ app.get('/next/*', async c => {
 })
 
 // ---------- 總覽 ----------
-const activeUsersStmt = db.prepare(`
-  SELECT identity, COUNT(*) AS n, MAX(ts) AS last_ts, MIN(ts) AS first_ts,
-         (SELECT tool FROM events e2 WHERE e2.service = e.service AND e2.identity = e.identity AND e2.tool IS NOT NULL ORDER BY ts DESC LIMIT 1) AS last_tool,
-         (SELECT source_ip FROM events e3 WHERE e3.service = e.service AND e3.identity = e.identity ORDER BY ts DESC LIMIT 1) AS source_ip
-  FROM events e
-  WHERE service = ? AND ts >= ? AND identity IS NOT NULL
-  GROUP BY identity ORDER BY last_ts DESC
-`)
-const countSinceStmt = db.prepare('SELECT COUNT(*) AS n FROM events WHERE service = ? AND ts >= ?')
-const errSinceStmt = db.prepare("SELECT COUNT(*) AS n FROM events WHERE service = ? AND ts >= ? AND (event = 'auth_failure' OR result LIKE 'error:%')")
-const lastEventStmt = db.prepare('SELECT ts, identity, tool, path, result FROM events WHERE service = ? ORDER BY ts DESC LIMIT 1')
-const lastStatusChangeStmt = db.prepare('SELECT ts, status FROM status_log WHERE service = ? ORDER BY id DESC LIMIT 1')
-
-app.get('/api/overview', async c => {
+// 五條 SQL（activeUsers / req1h / req24h / err24h / lastEvent / lastStatusChange）
+// 已搬進 lib/read/sqlite.ts，逐字未改；這裡只剩「組裝」。
+async function buildOverviewPayload() {
   const now = Date.now()
   const activeSince = new Date(now - ACTIVE_WINDOW_MIN * 60_000).toISOString()
   const hourAgo = new Date(now - 3600_000).toISOString()
   const dayAgo = new Date(now - 86400_000).toISOString()
   const probes = new Map(getLastProbes().map(p => [p.id, p]))
-  const services = SERVICES.map(s => ({
-    id: s.id,
-    name: s.name,
-    port: s.port,
-    proxyPrefix: s.proxyPrefix ?? null,
-    launchdLabel: s.launchdLabel ?? null,
-    hasAudit: !!s.auditLog,
-    probe: probes.get(s.id) ?? null,
-    lastStatusChange: lastStatusChangeStmt.get(s.id) ?? null,
-    activeUsers: s.auditLog ? activeUsersStmt.all(s.id, activeSince) : [],
-    req1h: s.auditLog ? (countSinceStmt.get(s.id, hourAgo) as any).n : null,
-    req24h: s.auditLog ? (countSinceStmt.get(s.id, dayAgo) as any).n : null,
-    err24h: s.auditLog ? (errSinceStmt.get(s.id, dayAgo) as any).n : null,
-    lastEvent: s.auditLog ? (lastEventStmt.get(s.id) ?? null) : null,
-    rosterSize: loadRoster(s).length,
-  }))
+  const reader = getReader()
+  const auditIds = SERVICES.filter(s => s.auditLog).map(s => s.id)
+  const audit = await reader.serviceAuditStats(auditIds, { activeSince, hourAgo, dayAgo })
+  const statusChanges = await reader.lastStatusChanges(SERVICES.map(s => s.id))
+  const services = SERVICES.map(s => {
+    const a = s.auditLog ? audit.get(s.id) : undefined
+    return {
+      id: s.id,
+      name: s.name,
+      port: s.port,
+      proxyPrefix: s.proxyPrefix ?? null,
+      launchdLabel: s.launchdLabel ?? null,
+      hasAudit: !!s.auditLog,
+      probe: probes.get(s.id) ?? null,
+      lastStatusChange: statusChanges.get(s.id) ?? null,
+      activeUsers: a ? a.activeUsers : [],
+      req1h: a ? a.req1h : null,
+      req24h: a ? a.req24h : null,
+      err24h: a ? a.err24h : null,
+      lastEvent: a ? a.lastEvent : null,
+      rosterSize: loadRoster(s).length,
+    }
+  })
   const running = listRunningPipelineProcs()
   const webhook = await getWebhookStatus()
   const connected = loadConnectedUsers()
@@ -105,7 +111,7 @@ app.get('/api/overview', async c => {
   // 排隊中的單（2026-08-28 排隊機制）：dispatcher 額滿時排入 FIFO 佇列，
   // 快照落在 logs/pipeline-queue.*.json，見 lib/pipeline-queue-state.ts。
   const queued = readQueuedTickets()
-  return c.json({
+  return {
     now: new Date(now).toISOString(),
     activeWindowMin: ACTIVE_WINDOW_MIN,
     services,
@@ -119,8 +125,10 @@ app.get('/api/overview', async c => {
       demandSlots: { used: running.filter(r => r.kind === 'demand').length, limit: PIPELINE_LIMITS.demand, queued: queued.filter(q => q.kind === 'demand').length },
       locks: listBugLocks(),
     },
-  })
-})
+  }
+}
+
+app.get('/api/overview', async c => c.json(await buildOverviewPayload()))
 
 // 重啟登錄表內的服務（只接受本機請求；server 本來就只綁 127.0.0.1）。複用
 // lib/services.ts 的 restartService，id 必須是登錄表內、有 launchdLabel 的
@@ -134,48 +142,35 @@ app.post('/api/services/restart', async c => {
 })
 
 // ---------- 事件序列 / 歷史 ----------
-app.get('/api/events', c => {
+app.get('/api/events', async c => {
   const q = c.req.query()
-  const where: string[] = []
-  const params: any[] = []
-  if (q.service) { where.push('service = ?'); params.push(q.service) }
-  if (q.identity) { where.push('identity = ?'); params.push(q.identity) }
-  if (q.from) { where.push('ts >= ?'); params.push(q.from) }
-  if (q.to) { where.push('ts <= ?'); params.push(q.to) }
-  if (q.event) { where.push('event = ?'); params.push(q.event) }
-  if (q.errors === '1') where.push("(event = 'auth_failure' OR result LIKE 'error:%')")
-  // 只看真正呼叫了 tool 的請求（隱藏 initialize / tools-list / notifications 等
-  // MCP 握手雜訊——server 對每個 HTTP request 都建立全新 stateless McpServer，
-  // 一次企劃端的 tool 呼叫實際上會產生好幾個握手 request，這些依 audit_log.ts
-  // 設計 tool 欄固定 null，屬預期行為而非漏記，這裡只是給前端一個濾掉它們的開關）
-  if (q.toolOnly === '1') where.push('tool IS NOT NULL')
-  if (q.q) {
-    where.push('(tool LIKE ? OR path LIKE ? OR result LIKE ? OR source_ip LIKE ? OR agrabah_identifier LIKE ?)')
-    const like = `%${q.q}%`
-    params.push(like, like, like, like, like)
-  }
-  if (q.before_id) { where.push('id < ?'); params.push(Number(q.before_id)) }
   const limit = Math.min(Number(q.limit ?? 200), 1000)
-  const sql = `SELECT id, service, ts, event, identity, source_ip, method, path, tool, result, agrabah_identifier, duration_ms, reason
-               FROM events ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY id DESC LIMIT ?`
-  params.push(limit)
-  const rows = db.prepare(sql).all(...params)
+  const rows = await getReader().queryEvents({
+    service: q.service,
+    identity: q.identity,
+    from: q.from,
+    to: q.to,
+    event: q.event,
+    errorsOnly: q.errors === '1',
+    // 只看真正呼叫了 tool 的請求（隱藏 initialize / tools-list / notifications 等
+    // MCP 握手雜訊——server 對每個 HTTP request 都建立全新 stateless McpServer，
+    // 一次企劃端的 tool 呼叫實際上會產生好幾個握手 request，這些依 audit_log.ts
+    // 設計 tool 欄固定 null，屬預期行為而非漏記，這裡只是給前端一個濾掉它們的開關）
+    toolOnly: q.toolOnly === '1',
+    q: q.q,
+    beforeId: q.before_id ? Number(q.before_id) : undefined,
+    limit,
+  })
   return c.json({ rows, limit })
 })
 
 // 「序列」：把同一人在同一服務上的連續請求（間隔 < SESSION_GAP_MIN）串成一段 session，
 // 列出每段的起訖、請求數、依序用到的 tool。
-app.get('/api/sessions', c => {
+app.get('/api/sessions', async c => {
   const q = c.req.query()
   const days = Number(q.days ?? 7)
   const since = new Date(Date.now() - days * 86400_000).toISOString()
-  const where = ['ts >= ?', 'identity IS NOT NULL']
-  const params: any[] = [since]
-  if (q.service) { where.push('service = ?'); params.push(q.service) }
-  if (q.identity) { where.push('identity = ?'); params.push(q.identity) }
-  const rows = db
-    .prepare(`SELECT id, service, ts, identity, tool, path, result, source_ip, agrabah_identifier FROM events WHERE ${where.join(' AND ')} ORDER BY service, identity, ts`)
-    .all(...params) as any[]
+  const rows = (await getReader().sessionEvents({ since, service: q.service, identity: q.identity })) as any[]
   const gap = SESSION_GAP_MIN * 60_000
   const sessions: any[] = []
   let cur: any = null
@@ -198,34 +193,33 @@ app.get('/api/sessions', c => {
   return c.json({ sessions, gapMin: SESSION_GAP_MIN, days })
 })
 
-app.get('/api/stats', c => {
+app.get('/api/stats', async c => {
   const days = Number(c.req.query('days') ?? 7)
   const since = new Date(Date.now() - days * 86400_000).toISOString()
-  const perDay = db.prepare(`SELECT substr(ts, 1, 10) AS day, service, COUNT(*) AS n FROM events WHERE ts >= ? GROUP BY day, service ORDER BY day`).all(since)
-  const perHour = db.prepare(`SELECT substr(ts, 1, 13) AS hour, COUNT(*) AS n FROM events WHERE ts >= ? GROUP BY hour ORDER BY hour`).all(new Date(Date.now() - 86400_000).toISOString())
-  const topIdentities = db.prepare(`SELECT identity, service, COUNT(*) AS n, MAX(ts) AS last_ts FROM events WHERE ts >= ? AND identity IS NOT NULL GROUP BY identity, service ORDER BY last_ts DESC LIMIT 50`).all(since)
-  const topTools = db.prepare(`SELECT tool, service, COUNT(*) AS n, SUM(CASE WHEN result LIKE 'error:%' THEN 1 ELSE 0 END) AS errors, ROUND(AVG(duration_ms)) AS avg_ms FROM events WHERE ts >= ? AND tool IS NOT NULL GROUP BY tool, service ORDER BY n DESC LIMIT 50`).all(since)
-  const authFailures = db.prepare(`SELECT service, source_ip, reason, COUNT(*) AS n, MAX(ts) AS last_ts FROM events WHERE ts >= ? AND event = 'auth_failure' GROUP BY service, source_ip, reason ORDER BY n DESC LIMIT 50`).all(since)
-  const total = db.prepare('SELECT COUNT(*) AS n FROM events').get() as any
-  return c.json({ days, perDay, perHour, topIdentities, topTools, authFailures, totalEvents: total.n })
+  // perHour 固定近 24 小時，不受 days 影響（既有行為，見 00-api-inventory.md）。
+  const s = await getReader().stats(since, new Date(Date.now() - 86400_000).toISOString())
+  return c.json({ days, ...s })
 })
 
-app.get('/api/status-log', c => {
-  const service = c.req.query('service')
-  const rows = service
-    ? db.prepare('SELECT * FROM status_log WHERE service = ? ORDER BY id DESC LIMIT 200').all(service)
-    : db.prepare('SELECT * FROM status_log ORDER BY id DESC LIMIT 200').all()
+app.get('/api/status-log', async c => {
+  const rows = await getReader().statusLog(c.req.query('service'))
   return c.json({ rows })
 })
 
 // 把 agent_runs 依 (kind, ticket, 時間區間) 掛到對應的 pipeline run：
 // trace 的 started_at 落在 [run.started_at, 同票下一次 run.started_at) 即屬於該 run。
-function attachAgentRuns(rows: any[]) {
+function attachAgentRuns(rows: any[], agents: AgentRunRow[]) {
   const byKey = new Map<string, any[]>()
   for (const r of rows) byKey.set(`${r.kind}:${r.ticket}`, [...(byKey.get(`${r.kind}:${r.ticket}`) ?? []), r])
-  const agents = db.prepare('SELECT * FROM agent_runs ORDER BY started_at').all() as any[]
+  // MON_READ_SOURCE=mysql 時兩邊都帶 run_id（agent_runs 的 PK 一半就是它），
+  // 歸戶不必再靠時間視窗猜——直接對位。sqlite 模式兩邊都沒有 run_id，
+  // 這個 Map 是空的，一律落到下面既有的時間視窗邏輯，行為完全不變。
+  const byRunId = new Map<string, any>()
+  for (const r of rows) if (typeof r.run_id === 'string' && r.run_id) byRunId.set(r.run_id, r)
   for (const r of rows) { r.agents = []; }
-  for (const a of agents) {
+  for (const a of agents as any[]) {
+    const exact = typeof a.run_id === 'string' && a.run_id ? byRunId.get(a.run_id) : undefined
+    if (exact) { exact.agents.push(a); continue }
     const runs = (byKey.get(`${a.kind}:${a.ticket}`) ?? []).slice().sort((x, y) => (x.started_at < y.started_at ? -1 : 1))
     let owner: any = null
     for (const r of runs) if (r.started_at <= a.started_at) owner = r
@@ -241,7 +235,7 @@ function attachAgentRuns(rows: any[]) {
   }
 }
 
-app.get('/api/pipelines', c => {
+async function buildPipelinesPayload() {
   // 排隊中的單（2026-08-28）：不在 pipeline_runs（還沒 spawn、沒有 log 檔），
   // 從佇列快照另組一段清單，前端顯示在列表最上方。
   const queued = readQueuedTickets()
@@ -250,8 +244,9 @@ app.get('/api/pipelines', c => {
   // dispatch-registry 這份「派到哪台」登記表——只有進行中的條目，worker 回報
   // job-done 後就清掉，看不到遠端執行的歷史（見 cluster-state.ts 檔頭）。
   const remote = listDispatchEntries()
-  const rows = db.prepare('SELECT * FROM pipeline_runs ORDER BY started_at DESC LIMIT 300').all() as any[]
-  attachAgentRuns(rows)
+  const reader = getReader()
+  const rows = (await reader.pipelineRuns(300)) as any[]
+  attachAgentRuns(rows, await reader.allAgentRuns())
   for (const r of rows) delete r.agents // 列表只給彙總，詳情另打 /api/pipelines/run
   // 2026-08-28（FAQ-4768 連點事故）：bug run 以 stdout 路徑對應 ps 行程歸戶
   // （見 lib/ingest.ts scanPipelineRuns 同日註解）；demand 維持 ticket+最新
@@ -279,16 +274,22 @@ app.get('/api/pipelines', c => {
     // retry 端點送出當下的即時檢查為準，這裡只保證「大致準、失敗會有清楚錯誤訊息」。
     r.retryable = r.kind === 'bug' && !r.running && isBugOutcomeRetryable(r.outcome)
   }
-  return c.json({ rows, queued, remote })
-})
+  return { rows, queued, remote }
+}
+
+app.get('/api/pipelines', async c => c.json(await buildPipelinesPayload()))
 
 // aladdin_toolsmith_generate_tool 的即時進度（企劃透過 toolsmith 自助擴充
 // admin/platform tool 的每一次請求）：不落地成 pipeline_runs（那張表是靠 ps
 // 掃 telegram-dispatcher 產生的子行程，toolsmith 的背景任務活在它自己
 // hosted server 的 process 裡，這裡沒有對應的子行程可掃），直接現讀
 // scratch/<requestId>/conversation.json，見 lib/toolsmith.ts 檔頭說明。
+function buildToolsmithPayload() {
+  return { rows: listToolsmithRuns() }
+}
+
 app.get('/api/toolsmith', c => {
-  return c.json({ rows: listToolsmithRuns() })
+  return c.json(buildToolsmithPayload())
 })
 
 // ---------- 多機派工（T37 head/worker cluster）----------
@@ -343,13 +344,19 @@ app.post('/api/cluster/worker/enable', c => handleWorkerAction(c, enableWorker))
 app.post('/api/cluster/worker/remove', c => handleWorkerAction(c, removeWorker))
 
 // 單一 run 詳情：run 本身 + 每個 agent 的摘要
-app.get('/api/pipelines/run', async c => {
-  const key = c.req.query('key') ?? ''
-  const run = db.prepare('SELECT * FROM pipeline_runs WHERE key = ?').get(key) as any
-  if (!run) return c.json({ error: 'not found' }, 404)
-  const siblings = db.prepare('SELECT * FROM pipeline_runs WHERE kind = ? AND ticket = ?').all(run.kind, run.ticket) as any[]
-  attachAgentRuns(siblings)
-  const me = siblings.find(r => r.key === key)
+// 找不到該 key 回 null（呼叫端負責決定要 404 還是略過不推）。
+async function buildPipelineRunPayload(key: string) {
+  const reader = getReader()
+  const run = (await reader.pipelineRunByKey(key)) as any
+  if (!run) return null
+  const siblings = (await reader.pipelineRunsByTicket(run.kind, run.ticket)) as any[]
+  // mysql 模式下 key 有可能是以 run_id 命中的（legacy_key 為空的列），
+  // 而 siblings 是以 (kind, ticket) 撈的、其 key 一律是 legacy_key ?? run_id；
+  // 兩者對不上時把 run 自己補進去，避免 me 變成 undefined。
+  // sqlite 模式 run.key 必然等於查詢用的 key、且必在 siblings 內，這行不會生效。
+  if (!siblings.some(r => r.key === run.key)) siblings.push(run)
+  attachAgentRuns(siblings, await reader.allAgentRuns())
+  const me = siblings.find(r => r.key === run.key)
   const procs = listRunningPipelineProcs()
   const latest = siblings.slice().sort((a, b) => (a.started_at < b.started_at ? 1 : -1))[0]
   // bug 以 stdout 路徑歸戶（見 /api/pipelines 同日註解），demand 維持舊判法。
@@ -397,7 +404,13 @@ app.get('/api/pipelines/run', async c => {
       else if (s.key === 'final-review' && finalReviewRounds > 0) s.rounds = finalReviewRounds
     }
   }
-  return c.json({ run: me, progress, stages })
+  return { run: me, progress, stages }
+}
+
+app.get('/api/pipelines/run', async c => {
+  const payload = await buildPipelineRunPayload(c.req.query('key') ?? '')
+  if (!payload) return c.json({ error: 'not found' }, 404)
+  return c.json(payload)
 })
 
 // 單一 agent 的完整對話：現讀 trace JSON（或 bug pipeline 的 stdout.log），整理成 turns
@@ -489,11 +502,11 @@ const RETRY_CONCURRENCY_LIMIT = PIPELINE_LIMITS.bug
  * 而 spawn-create-mr.ts 的 `--triggered-by-email` 要的是 email）。任一環節缺
  * （沒跑過、sidecar 不存在、格式跑掉）都回 null，重試照舊不帶發起人。
  */
-function readLastTriggeredByEmail(ticket: string): string | null {
-  const row = db.prepare("SELECT key FROM pipeline_runs WHERE kind = 'bug' AND ticket = ? ORDER BY started_at DESC LIMIT 1").get(ticket) as { key: string } | undefined
-  if (!row) return null
+async function readLastTriggeredByEmail(ticket: string): Promise<string | null> {
+  const lastKey = await getReader().latestBugRunKey(ticket)
+  if (!lastKey) return null
   try {
-    const parsed = JSON.parse(readFileSync(join(DISPATCHER_LOG_DIR, `${row.key}.triggered-by.json`), 'utf8')) as { email?: unknown }
+    const parsed = JSON.parse(readFileSync(join(DISPATCHER_LOG_DIR, `${lastKey}.triggered-by.json`), 'utf8')) as { email?: unknown }
     return typeof parsed.email === 'string' && /^[^\s@]+@[^\s@]+$/.test(parsed.email) ? parsed.email : null
   } catch {
     return null
@@ -532,7 +545,7 @@ app.post('/api/pipelines/retry', async c => {
   // 2026-09-01：重試沿用上一筆 run 的發起人（`--triggered-by-email`），否則
   // 重試出來的 run 在列表「發起人」欄會空白，看不出這張單是誰認領的。取不到
   // （上一筆本來就是人工 CLI 跑的、sidecar 缺檔）就不帶旗標，行為同以前。
-  const prevEmail = readLastTriggeredByEmail(ticket)
+  const prevEmail = await readLastTriggeredByEmail(ticket)
   const spawnArgs = [SPAWN_CREATE_MR_SCRIPT, ticket, '--resume', ...(prevEmail ? ['--triggered-by-email', prevEmail] : [])]
   try {
     const { stdout } = await execFileAsync('bun', spawnArgs, { encoding: 'utf8', timeout: 10_000 })
@@ -586,9 +599,9 @@ app.get('/api/rosters', c => {
 // Token 權限總覽：把各名冊以「人」為主鍵樞紐——每人一列、每個 hosted server（環境）
 // 一欄，附核發時間與稽核事件推出的最後使用時間/累計請求數。只讀 id / display_name /
 // issued_at，絕不讀或回傳 token 值（同 loadRoster 的既有紀律）。
-app.get('/api/token-grants', c => {
+app.get('/api/token-grants', async c => {
   const svcs = SERVICES.filter(s => s.tokensPath)
-  const usage = db.prepare(`SELECT identity, service, MAX(ts) AS last_ts, COUNT(*) AS n FROM events WHERE identity IS NOT NULL AND event = 'request' GROUP BY identity, service`).all() as { identity: string; service: string; last_ts: string; n: number }[]
+  const usage = await getReader().identityUsage()
   const usageMap = new Map(usage.map(u => [`${u.identity}\u0000${u.service}`, u]))
   const people = new Map<string, { id: string; display_name: string; grants: Record<string, { issued_at: string; last_ts: string | null; n: number }> }>()
   for (const s of svcs) {
@@ -837,6 +850,166 @@ app.get('/api/log/since', c => {
   } finally {
     closeSync(fd)
   }
+})
+
+// ---------- SSE：單一串流端點 ----------
+//
+//   GET /api/stream?topics=overview,pipelines,toolsmith,log&path=<log 路徑>&offset=<n>&key=<run key>
+//
+// 契約（與前端已定案，見 frontend/src/api/transport.ts:9,173,194 與
+// plan-db-as-truth-v3.md §8.2）：
+//   - **單一**端點，topics 以逗號分隔；
+//   - 每則訊息 `event: <topic>`，`data` 是該 topic 的**完整** JSON payload，
+//     與對應 GET 端點的回應**完全同形**——因為兩邊呼叫的是同一個
+//     build*Payload()，形狀結構上不可能分岔；
+//   - 不在範圍內的低頻查詢維持 request/response，本端點不提供。
+//
+// 前置關卡（§8.2 硬性）：`bun run scripts/sse-segfault-repro.ts` 必須 PASS。
+// 2026-09-02 於 Bun 1.4.0 實測 exit 0（8 條硬斷全部觸發 cancel、server 存活）。
+// ⚠️ 該腳本只解除了「ReadableStream 斷線」這一條；**handler 內同步 spawn
+// （spawnSync / execFileSync）遇客戶端中斷會 segfault 那條並未解除**
+// （lib/ingest.ts:99-103），本端點推的每一個 payload 都只走
+// 快取（getLastProbes / listRunningPipelineProcs）、檔案讀取與 async execFile，
+// 全鏈路沒有任何 *Sync spawn——動這裡時務必維持這條。
+
+const SSE_HEARTBEAT_MS = 15_000
+// 對應前端的兩條既有輪詢迴圈：全域心跳 5000ms、log 跟隨 1500ms
+// （frontend/src/api/transport.ts 的 POLL_INTERVAL_MS / LOG_FOLLOW_INTERVAL_MS）。
+const SSE_DEFAULT_INTERVAL_MS = 5000
+const SSE_LOG_INTERVAL_MS = 1500
+
+type StreamTopic = 'overview' | 'pipelines' | 'toolsmith' | 'pipeline-run' | 'log'
+const STREAM_TOPICS: StreamTopic[] = ['overview', 'pipelines', 'toolsmith', 'pipeline-run', 'log']
+
+app.get('/api/stream', c => {
+  const q = c.req.query()
+  const requested = (q.topics ?? '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean)
+  if (requested.length === 0) return c.json({ error: 'missing topics' }, 400)
+  const unknown = requested.filter(t => !(STREAM_TOPICS as string[]).includes(t))
+  if (unknown.length) return c.json({ error: `unknown topics: ${unknown.join(',')}` }, 400)
+  const topics = [...new Set(requested)] as StreamTopic[]
+
+  // 參數化 topic 的前置檢查：在建立串流「之前」就把錯誤用一般 HTTP 回應講清楚，
+  // 不要開了串流才在裡面發錯誤事件（EventSource 那側看不到 body，只會看到 open）。
+  const runKey = q.key ?? ''
+  if (topics.includes('pipeline-run') && !runKey) return c.json({ error: 'topic pipeline-run 需要 key 參數' }, 400)
+  const logPath = q.path ?? ''
+  if (topics.includes('log')) {
+    // 與 /api/log/tail、/api/log/since 同一道白名單、同一個錯誤回應。
+    if (!isAllowedLogPath(logPath)) return c.text('path not allowed', 403)
+  }
+  let logOffset = Number(q.offset ?? 0)
+  if (!Number.isFinite(logOffset) || logOffset < 0) logOffset = 0
+
+  const enc = new TextEncoder()
+  const timers: ReturnType<typeof setInterval>[] = []
+  let closed = false
+
+  const stream = new ReadableStream({
+    start(controller) {
+      const send = (chunk: string) => {
+        if (closed) return false
+        try {
+          controller.enqueue(enc.encode(chunk))
+          return true
+        } catch {
+          // 客戶端已斷線但 cancel() 還沒被呼叫到的短暫視窗
+          closed = true
+          return false
+        }
+      }
+      const emit = (topic: string, payload: unknown) => send(`event: ${topic}\ndata: ${JSON.stringify(payload)}\n\n`)
+      // 註解行（`:` 開頭）EventSource 會直接忽略——拿來當心跳與錯誤紀錄，
+      // 不必為了報錯而新增契約外的 event 名稱。
+      const note = (msg: string) => send(`: ${msg.replace(/[\r\n]+/g, ' ')}\n\n`)
+
+      // 每個 topic 各一條迴圈，且各自帶 inFlight 旗標：某次 build 比 interval 慢
+      // 時只會略過這一拍，不會愈疊愈多（同一個 topic 永遠最多一個 build 在飛）。
+      const loop = (topic: StreamTopic, intervalMs: number, tick: () => Promise<void>) => {
+        let inFlight = false
+        const run = () => {
+          if (closed || inFlight) return
+          inFlight = true
+          tick()
+            .catch(err => {
+              console.error(`tg-monitor: /api/stream topic=${topic} 產生 payload 失敗：${err}`)
+              note(`error ${topic}`)
+            })
+            .finally(() => {
+              inFlight = false
+            })
+        }
+        run() // 連上就先推一份，前端不必等第一個 interval
+        timers.push(setInterval(run, intervalMs))
+      }
+
+      for (const topic of topics) {
+        if (topic === 'overview') {
+          loop(topic, SSE_DEFAULT_INTERVAL_MS, async () => {
+            emit(topic, await buildOverviewPayload())
+          })
+        } else if (topic === 'pipelines') {
+          loop(topic, SSE_DEFAULT_INTERVAL_MS, async () => {
+            emit(topic, await buildPipelinesPayload())
+          })
+        } else if (topic === 'toolsmith') {
+          loop(topic, SSE_DEFAULT_INTERVAL_MS, async () => {
+            emit(topic, buildToolsmithPayload())
+          })
+        } else if (topic === 'pipeline-run') {
+          loop(topic, SSE_DEFAULT_INTERVAL_MS, async () => {
+            const payload = await buildPipelineRunPayload(runKey)
+            // 查無此 key：GET 端點回 404，串流這側沒有狀態碼可用，
+            // 推 `{ error: 'not found' }`——與該端點 404 的 body 同形。
+            emit(topic, payload ?? { error: 'not found' })
+          })
+        } else if (topic === 'log') {
+          loop(topic, SSE_LOG_INTERVAL_MS, async () => {
+            // 與 /api/log/since 同一份語意：檔案不見回 missing、被截斷/輪替
+            // 就把 offset 歸零讓前端清空、沒有新內容就整拍不推（省頻寬，
+            // 前端的 `if (res.offset < offsetRef.current)` 判斷不受影響）。
+            if (!existsSync(logPath)) {
+              logOffset = 0
+              emit(topic, { text: '', offset: 0, missing: true })
+              return
+            }
+            const size = statSync(logPath).size
+            if (size < logOffset) logOffset = 0
+            if (size === logOffset) return
+            const fd = openSync(logPath, 'r')
+            try {
+              const buf = Buffer.alloc(Math.min(size - logOffset, 2 * 1024 * 1024))
+              readSync(fd, buf, 0, buf.length, logOffset)
+              logOffset += buf.length
+              emit(topic, { text: buf.toString('utf8'), offset: logOffset })
+            } finally {
+              closeSync(fd)
+            }
+          })
+        }
+      }
+
+      timers.push(setInterval(() => note('ping'), SSE_HEARTBEAT_MS))
+    },
+    cancel() {
+      closed = true
+      for (const t of timers) clearInterval(t)
+      timers.length = 0
+    },
+  })
+
+  return new Response(stream, {
+    headers: {
+      'content-type': 'text/event-stream; charset=utf-8',
+      'cache-control': 'no-cache, no-transform',
+      connection: 'keep-alive',
+      // 本 server 只綁 127.0.0.1、前面沒有 nginx，但寫上不吃虧、也表明意圖。
+      'x-accel-buffering': 'no',
+    },
+  })
 })
 
 console.error(`tg-monitor ready on http://127.0.0.1:${PORT}`)

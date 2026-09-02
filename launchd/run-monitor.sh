@@ -9,13 +9,18 @@
 # （見 telegram-dispatcher/deploy/monitor-db/README.md）。全部 5 個 key
 # 皆非必要變數，缺了／MON_DB_ENABLED 非 '1' 一律視同監控 DB 功能關閉，
 # 不擋伺服器啟動、行為與遷移前相同。
+#
+# MON_READ_SOURCE（Phase 8，plan §8.1）：讀取面資料源 sqlite|mysql，預設 sqlite。
+# 它與寫入面的 MON_DB_ENABLED **各自獨立**——讀取面可以在寫入面還關著時先切。
+# 「回滾＝改 .env 一個字 + launchctl kickstart -k com.aladdin.tg-monitor」這顆
+# 按鈕成立的前提就是這個 key 有被逐一匯出，漏了它 launchd 起的行程永遠讀不到。
 set -u
 TG_MONITOR_DIR="/Users/user/aladdin/tg-monitor"
 ENV_FILE="$TG_MONITOR_DIR/.env"
 BUN="/Users/user/.bun/bin/bun"
 
 if [ -f "$ENV_FILE" ]; then
-  for KEY in MON_DB_ENABLED MON_DB_HOST MON_DB_PORT MON_DB_SCHEMA MON_DB_USER MON_DB_PASSWORD; do
+  for KEY in MON_DB_ENABLED MON_READ_SOURCE MON_DB_HOST MON_DB_PORT MON_DB_SCHEMA MON_DB_USER MON_DB_PASSWORD; do
     VALUE=$(grep "^${KEY}=" "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n')
     export "${KEY}=${VALUE}"
   done
