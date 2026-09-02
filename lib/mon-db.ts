@@ -1,4 +1,4 @@
-// lib/mon-db.ts — mon_ui 監控 DB 最小寫入模組（cancel 專用）。
+// lib/mon-db.ts — mon_ui 監控 DB 最小寫入模組（cancel 旗標 + rounds 兩欄）。
 //
 // 依據 plan-db-as-truth-v3.2.md 裁定 3（BL-E3）＋【G:BL-G2】＋
 // impl-errata-g2.md MJ-H1 指揮官裁定，與 telegram-dispatcher 端的
@@ -6,17 +6,21 @@
 // 演算法的兩份獨立實作——**這不是疏漏，是既有慣例**：tg-monitor 是獨立 git
 // repo，與 telegram-dispatcher 沒有 import 關係（見 lib/ingest.ts 既有的
 // CREATE_MR_TIMEOUT_SECONDS 註解：「兩個 repo 各自獨立、沒有 import 關係，
-// 這裡只能複製常數，改動時要同步調整」）。本檔複製的是「cancel 路徑」用得到
+// 這裡只能複製常數，改動時要同步調整」）。本檔複製的是這兩條寫入路徑用得到
 // 的最小子集：mon_ui pool、五段 run_id 解析、W4a/W4b 兩段寫、cancel 旗標寫入
-// 失敗時的 spool 落地。**兩邊改動時要同步調整**（尤其：SQL 文字、
-// cancel_resolved_by 值域、legacy_key 格式）。
+// 失敗時的 spool 落地；rounds 兩欄（review_rounds/final_review_rounds，
+// migration 004 就位，Phase 8 讀取面 a4 消費）則是 tg-monitor 獨有、
+// telegram-dispatcher 端沒有對應實作——rounds 只在 tg-monitor 這一側算得出來
+// （transcript 掃描），沒有「兩份獨立實作」的同步負擔。**cancel 相關改動仍要
+// 兩邊同步**（尤其：SQL 文字、cancel_resolved_by 值域、legacy_key 格式）。
 //
-// 職責邊界（§2.2 mon_ui 授權）：唯讀九張表（本檔完全不碰）＋ `runs` 的 cancel
-// 欄位級 INSERT/UPDATE。`outcome` / `outcome_tier` 不在本檔任何 SQL 的欄位
-// 清單內。
+// 職責邊界（§2.2 mon_ui 授權）：唯讀九張表（本檔完全不碰）＋ `runs` 的
+// cancel 欄位級 INSERT/UPDATE ＋ rounds 兩欄的 UPDATE。`outcome` /
+// `outcome_tier` 不在本檔任何 SQL 的欄位清單內。
 //
 // 全部功能都在 isMonitorDbEnabled() 之後才會被呼叫——旗標關閉時本檔的任何
-// 函式都不會被呼叫到（見 lib/ingest.ts cancelPipeline 的守衛），import 本身
+// 函式都不會被呼叫到（見 lib/ingest.ts cancelPipeline / persistReviewRounds
+// 的守衛，以及 persistReviewRoundsToMonDb 自己的深度防禦），import 本身
 // 零副作用（不建 pool，不做任何 I/O）。
 import { createPool, type Pool, type ResultSetHeader, type RowDataPacket } from 'mysql2/promise'
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, statSync, writeSync } from 'node:fs'
@@ -360,6 +364,155 @@ export async function writeCancelFlag(pool: MonitorDbExecutor, input: WriteCance
     const matched2 = parseMatched((header2 as ResultSetHeader).info)
     return { ok: matched2 !== null && matched2 > 0 }
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Rounds 寫入（Phase 8 讀取面 a4 唯一的 rounds 資料來源；本節是唯一的寫入端，
+// 2026-09-02 新增）。與 cancel 不同：沒有殺行程語境、沒有 pid/marker 可用，
+// 對位只能靠 legacy_key/stdout_path（與 cancel R3 同一組查詢欄位，共用
+// idx_legacy_key、idx_host_stdout_path 兩個既有索引），且不篩 lifecycle_rank/
+// outcome——rounds 在 run 執行中與剛結束的最後一次掃描都要能寫入，兩種狀態的
+// 列都得對得到。對不到 → 呼叫端 skip，不猜、不鑄新列（rounds 沒有「一定要有
+// 一列」的硬約束，不同於 cancel 的 R4/R5 placeholder 退路）。
+// ─────────────────────────────────────────────────────────────────────────
+
+const ROUNDS_RESOLVE_SQL = `
+SELECT run_id FROM runs
+ WHERE host = ? AND ticket = ? AND (legacy_key = ? OR stdout_path = ?)
+`.trim()
+
+/** 由 legacy_key/stdout_path 對位 mon_ui 的 run_id；0 或 >1 列命中一律回
+ * null（歧義不猜）。呼叫端負責 cache（見 persistReviewRoundsToMonDb，key 含
+ * runStartedAt）。 */
+export async function resolveRunIdForRounds(
+  pool: MonitorDbExecutor,
+  ticket: string,
+  legacyKey: string | null,
+  stdoutPath: string | null,
+): Promise<string | null> {
+  if (!legacyKey && !stdoutPath) return null
+  return selectSingleRunId(pool, ROUNDS_RESOLVE_SQL, [RUNS_HOST, ticket, legacyKey ?? null, stdoutPath ?? null])
+}
+
+const WRITE_ROUNDS_SQL = `
+UPDATE runs
+   SET review_rounds = ?, final_review_rounds = ?
+ WHERE run_id = ? AND host = ?
+   AND (review_rounds IS NULL OR review_rounds <= ?)
+   AND (final_review_rounds IS NULL OR final_review_rounds <= ?)
+`.trim()
+
+export interface WriteRunRoundsInput {
+  runId: string
+  reviewRounds: number
+  finalReviewRounds: number
+}
+
+export interface WriteRunRoundsResult {
+  ok: boolean
+}
+
+/**
+ * 單調不回退守衛全在 WHERE：任一欄新值比既有值小就不 matched，整段 UPDATE
+ * no-op（ok=false）——兩欄綁在同一次 UPDATE 要嘛都寫要嘛都不寫，tg-monitor
+ * 每次算出的兩個值本就是同一次 transcript 掃描的產物，沒有「只有一欄有進展」
+ * 時仍要求另一欄單獨寫入的情境。與 sqlite 側 bumpReviewRounds（逐欄 CASE
+ * WHEN、可各自獨立前進）語意不同，是刻意的差異，不是疏漏。
+ */
+export async function writeRunRounds(pool: MonitorDbExecutor, input: WriteRunRoundsInput): Promise<WriteRunRoundsResult> {
+  const [header] = await pool.execute<ResultSetHeader>(WRITE_ROUNDS_SQL, [
+    input.reviewRounds,
+    input.finalReviewRounds,
+    input.runId,
+    RUNS_HOST,
+    input.reviewRounds,
+    input.finalReviewRounds,
+  ])
+  const matched = parseMatched((header as ResultSetHeader).info)
+  return { ok: matched !== null && matched > 0 }
+}
+
+const ROUNDS_DB_BUDGET_MS = 1000
+
+export interface PersistRunRoundsInput {
+  /** pipeline_runs.key（`<ticket>.<file-ts>`），同時是本函式兩個內部 cache 的鍵。 */
+  key: string
+  ticket: string
+  /** BUG_RE 命中的 stdout log 絕對路徑；deriveLegacyKey 由此反推 legacy_key，
+   * 對不到 legacy_key 時原始路徑仍可直接拿去比對 stdout_path。 */
+  stdoutPath: string
+  reviewRounds: number
+  finalReviewRounds: number
+}
+
+// mon_ui 側「上次成功寫入」的輪數，與 ingest.ts 的 sqlite 側 lastPersistedRounds
+// 各自獨立追蹤——同一教訓見 ingest.ts 的 lastWrittenServiceStatus 註解：只在
+// 這一側真的寫成功後才推進這一側的 cache，任一邊失敗都不影響另一邊的重試。
+const lastWrittenRounds = new Map<string, { review: number; final: number }>()
+// run_id 只 cache 命中；找不到不 cache（mon_ui 那一列可能是 telegram-dispatcher
+// 稍晚才寫入，不能一次找不到就永久放棄，下一輪自然重試）。
+const roundsRunIdCache = new Map<string, string>()
+// 對不到 run_id 的行程內計數（不落 DB、不告警風暴）。
+let roundsUnresolvedCount = 0
+
+export function getRoundsUnresolvedCountForTest(): number {
+  return roundsUnresolvedCount
+}
+
+/** 測試專用：清空本節兩個 cache 與計數，避免跨測試互相污染（模組級狀態）。 */
+export function __resetRoundsMonDbStateForTest(): void {
+  lastWrittenRounds.clear()
+  roundsRunIdCache.clear()
+  roundsUnresolvedCount = 0
+}
+
+/**
+ * 掛在 ingest.ts persistReviewRounds 既有 tick 之後：值有進展才寫、run_id
+ * 對位失敗只 skip+計數、整段套 budgetMs 預算（比照 cancelPipeline 的
+ * Promise.race 慣例，避免 mysql2 對已建立但對端卡死連線沒有 per-query 逾時的
+ * 已知限制拖住 collector tick）。budgetMs 預設 1000ms，測試可覆寫成很小的值
+ * 以確定性驗證逾時分支，不需要真的等待。
+ *
+ * 失敗/逾時只 WARN——不落 spool（與 cancel 旗標不同）：rounds 每個 ingest
+ * tick 都會重算，下一輪自然重試，自癒；沒有「這次沒寫就永久遺失」的風險，
+ * 落 spool 反而多一套要重放的機制，不成比例。
+ */
+export async function persistReviewRoundsToMonDb(
+  pool: MonitorDbExecutor,
+  input: PersistRunRoundsInput,
+  budgetMs: number = ROUNDS_DB_BUDGET_MS,
+): Promise<{ wrote: boolean }> {
+  // 深度防禦：呼叫端（ingest.ts）已在旗標關閉時完全不建 pool、不呼叫到這裡，
+  // 這裡自己再擋一次，比照 appendStatusLogToSpool 的慣例。
+  if (!isMonitorDbEnabled()) return { wrote: false }
+  const last = lastWrittenRounds.get(input.key)
+  if (last && input.reviewRounds <= last.review && input.finalReviewRounds <= last.final) return { wrote: false }
+
+  const attempt = (async (): Promise<WriteRunRoundsResult> => {
+    let runId = roundsRunIdCache.get(input.key)
+    if (runId === undefined) {
+      const legacyKey = deriveLegacyKey(input.stdoutPath)
+      const resolved = await resolveRunIdForRounds(pool, input.ticket, legacyKey, input.stdoutPath)
+      if (resolved === null) {
+        roundsUnresolvedCount += 1
+        return { ok: false }
+      }
+      runId = resolved
+      roundsRunIdCache.set(input.key, runId)
+    }
+    return writeRunRounds(pool, { runId, reviewRounds: input.reviewRounds, finalReviewRounds: input.finalReviewRounds })
+  })()
+  const budget = new Promise<WriteRunRoundsResult>(resolve => setTimeout(() => resolve({ ok: false }), budgetMs))
+  // attempt 若晚於 budget 完成，讓它繼續在背景跑完（不取消，mysql2 沒有內建
+  // query cancel）；race 只決定這次呼叫要不要等它推進 cache。
+  const raced = await Promise.race([attempt.catch((): WriteRunRoundsResult => ({ ok: false })), budget])
+
+  if (raced.ok) {
+    lastWrittenRounds.set(input.key, { review: input.reviewRounds, final: input.finalReviewRounds })
+    return { wrote: true }
+  }
+  console.warn(`mon-db: rounds 寫入未成功（ticket=${input.ticket} key=${input.key}），下一輪自然重試`)
+  return { wrote: false }
 }
 
 // ─────────────────────────────────────────────────────────────────────────

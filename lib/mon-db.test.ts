@@ -1,10 +1,12 @@
-// lib/mon-db.test.ts — mon_ui 最小寫入模組（cancel 專用）結構性測試。
+// lib/mon-db.test.ts — mon_ui 最小寫入模組（cancel 旗標 + rounds 兩欄）結構性測試。
 //
 // 不打真實 mon-mysql（沒有 mysql2 real client），注入假 pool（同 telegram-
-// dispatcher/lib/monitor-db/cancel-resolve.test.ts 的手法）。這裡的目的是
+// dispatcher/lib/monitor-db/cancel-resolve.test.ts 的手法）。cancel 相關測試
 // 驗證 tg-monitor 這一份「複製過來的演算法」與 telegram-dispatcher 端的
 // lib/monitor-db/cancel-resolve.ts 行為一致（次序、R2 自我驗證、markerMismatch），
-// 不是重新驗證 MySQL 語意本身。
+// 不是重新驗證 MySQL 語意本身；rounds 相關測試（resolveRunIdForRounds /
+// writeRunRounds / persistReviewRoundsToMonDb）是 tg-monitor 獨有邏輯，沒有
+// telegram-dispatcher 對應實作可比對，直接驗證本檔自己的行為契約。
 import { afterEach, describe, expect, test } from 'bun:test'
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -17,6 +19,11 @@ import {
   readActiveMarker,
   resolveRunId,
   writeCancelFlag,
+  resolveRunIdForRounds,
+  writeRunRounds,
+  persistReviewRoundsToMonDb,
+  getRoundsUnresolvedCountForTest,
+  __resetRoundsMonDbStateForTest,
   type ResolveRunIdInput,
 } from './mon-db.ts'
 
@@ -297,4 +304,246 @@ describe('isoToMysqlDatetime3', () => {
   test('轉換格式與 telegram-dispatcher 端一致', () => {
     expect(isoToMysqlDatetime3('2026-09-02T00:01:02.345Z')).toBe('2026-09-02 00:01:02.345')
   })
+})
+
+// ---------- resolveRunIdForRounds（legacy_key/stdout_path 對位，無 lifecycle 篩選） ----------
+
+interface FakeRoundsRow {
+  run_id: string
+  host: string
+  ticket: string
+  legacy_key: string | null
+  stdout_path: string | null
+}
+
+class FakeRoundsResolvePool {
+  rows: FakeRoundsRow[] = []
+  calls: unknown[][] = []
+  async execute(sql: string, params: unknown[] = []): Promise<[unknown, unknown]> {
+    this.calls.push(params)
+    if (!sql.includes('legacy_key = ? OR stdout_path = ?')) throw new Error(`FakeRoundsResolvePool: 未預期的 SQL：${sql}`)
+    const [host, ticket, legacyKey, stdoutPath] = params as [string, string, string | null, string | null]
+    const matched = this.rows.filter(r => r.host === host && r.ticket === ticket && (sqlEq(r.legacy_key, legacyKey) || sqlEq(r.stdout_path, stdoutPath)))
+    return [matched.map(r => ({ run_id: r.run_id })), []]
+  }
+}
+
+describe('resolveRunIdForRounds', () => {
+  test('legacy_key 命中 → run_id', async () => {
+    const pool = new FakeRoundsResolvePool()
+    pool.rows.push({ run_id: 'run-1', host: 'head', ticket: 'FAQ-1', legacy_key: 'FAQ-1.2026-09-02T00:00:00.000Z', stdout_path: null })
+    const runId = await resolveRunIdForRounds(pool, 'FAQ-1', 'FAQ-1.2026-09-02T00:00:00.000Z', null)
+    expect(runId).toBe('run-1')
+  })
+
+  test('legacy_key 對不上但 stdout_path 對得上 → run_id（OR 語意）', async () => {
+    const pool = new FakeRoundsResolvePool()
+    pool.rows.push({ run_id: 'run-2', host: 'head', ticket: 'FAQ-1', legacy_key: null, stdout_path: '/logs/FAQ-1.2026-09-02T00-00-00-000Z.stdout.log' })
+    const runId = await resolveRunIdForRounds(pool, 'FAQ-1', 'FAQ-1.2026-09-02T00:00:00.000Z', '/logs/FAQ-1.2026-09-02T00-00-00-000Z.stdout.log')
+    expect(runId).toBe('run-2')
+  })
+
+  test('legacy_key、stdout_path 皆為 null → 不查詢，直接回 null', async () => {
+    const pool = new FakeRoundsResolvePool()
+    const runId = await resolveRunIdForRounds(pool, 'FAQ-1', null, null)
+    expect(runId).toBeNull()
+    expect(pool.calls.length).toBe(0)
+  })
+
+  test('找不到任何列 → null（不猜、不鑄新列）', async () => {
+    const pool = new FakeRoundsResolvePool()
+    const runId = await resolveRunIdForRounds(pool, 'FAQ-1', 'FAQ-1.no-such', null)
+    expect(runId).toBeNull()
+  })
+
+  test('命中多列（歧義）→ null，不猜', async () => {
+    const pool = new FakeRoundsResolvePool()
+    pool.rows.push({ run_id: 'run-a', host: 'head', ticket: 'FAQ-1', legacy_key: 'k', stdout_path: null })
+    pool.rows.push({ run_id: 'run-b', host: 'head', ticket: 'FAQ-1', legacy_key: 'k', stdout_path: null })
+    const runId = await resolveRunIdForRounds(pool, 'FAQ-1', 'k', null)
+    expect(runId).toBeNull()
+  })
+})
+
+// ---------- writeRunRounds（單調不回退守衛全在 WHERE） ----------
+
+interface FakeRoundsWriteRow {
+  run_id: string
+  host: string
+  review_rounds: number | null
+  final_review_rounds: number | null
+}
+
+class FakeRoundsWritePool {
+  rows = new Map<string, FakeRoundsWriteRow>()
+  calls: { sql: string; params: unknown[] }[] = []
+  async execute(sql: string, params: unknown[] = []): Promise<[unknown, unknown]> {
+    this.calls.push({ sql, params })
+    if (!sql.startsWith('UPDATE runs')) throw new Error(`FakeRoundsWritePool: 未預期的 SQL：${sql}`)
+    // 守衛 SQL 形狀斷言（測試檔直接檢查文字，確保 WHERE 子句真的把兩欄的
+    // 單調不回退檢查都包進去，不是只在應用層做）。
+    expect(sql).toContain('review_rounds = ?')
+    expect(sql).toContain('final_review_rounds = ?')
+    expect(sql).toContain('review_rounds IS NULL OR review_rounds <=')
+    expect(sql).toContain('final_review_rounds IS NULL OR final_review_rounds <=')
+    const [reviewRounds, finalReviewRounds, runId, host] = params as [number, number, string, string]
+    const row = this.rows.get(runId)
+    if (!row || row.host !== host) return [{ info: 'Rows matched: 0  Changed: 0  Warnings: 0' }, []]
+    const reviewOk = row.review_rounds === null || row.review_rounds <= reviewRounds
+    const finalOk = row.final_review_rounds === null || row.final_review_rounds <= finalReviewRounds
+    if (!reviewOk || !finalOk) return [{ info: 'Rows matched: 0  Changed: 0  Warnings: 0' }, []]
+    row.review_rounds = reviewRounds
+    row.final_review_rounds = finalReviewRounds
+    return [{ info: 'Rows matched: 1  Changed: 1  Warnings: 0' }, []]
+  }
+}
+
+describe('writeRunRounds', () => {
+  test('既有值皆為 NULL → 直寫，ok=true', async () => {
+    const pool = new FakeRoundsWritePool()
+    pool.rows.set('run-1', { run_id: 'run-1', host: 'head', review_rounds: null, final_review_rounds: null })
+    const r = await writeRunRounds(pool, { runId: 'run-1', reviewRounds: 2, finalReviewRounds: 1 })
+    expect(r.ok).toBe(true)
+    expect(pool.rows.get('run-1')).toEqual({ run_id: 'run-1', host: 'head', review_rounds: 2, final_review_rounds: 1 })
+  })
+
+  test('新值皆大於既有值 → 更新，ok=true', async () => {
+    const pool = new FakeRoundsWritePool()
+    pool.rows.set('run-1', { run_id: 'run-1', host: 'head', review_rounds: 1, final_review_rounds: 0 })
+    const r = await writeRunRounds(pool, { runId: 'run-1', reviewRounds: 2, finalReviewRounds: 1 })
+    expect(r.ok).toBe(true)
+    expect(pool.rows.get('run-1')!.review_rounds).toBe(2)
+  })
+
+  test('review_rounds 回退 → 整段不寫，ok=false（final_review_rounds 即使前進也不救）', async () => {
+    const pool = new FakeRoundsWritePool()
+    pool.rows.set('run-1', { run_id: 'run-1', host: 'head', review_rounds: 3, final_review_rounds: 0 })
+    const r = await writeRunRounds(pool, { runId: 'run-1', reviewRounds: 1, finalReviewRounds: 5 })
+    expect(r.ok).toBe(false)
+    expect(pool.rows.get('run-1')).toEqual({ run_id: 'run-1', host: 'head', review_rounds: 3, final_review_rounds: 0 })
+  })
+
+  test('run_id 對不到列 → ok=false', async () => {
+    const pool = new FakeRoundsWritePool()
+    const r = await writeRunRounds(pool, { runId: 'run-nope', reviewRounds: 1, finalReviewRounds: 0 })
+    expect(r.ok).toBe(false)
+  })
+})
+
+// ---------- persistReviewRoundsToMonDb（cache + 1000ms 預算，budgetMs 可覆寫供測試） ----------
+
+class FakeRoundsFullPool {
+  resolveRows: FakeRoundsRow[] = []
+  writeRows = new Map<string, FakeRoundsWriteRow>()
+  calls: { kind: 'resolve' | 'write'; params: unknown[] }[] = []
+  async execute(sql: string, params: unknown[] = []): Promise<[unknown, unknown]> {
+    if (sql.includes('legacy_key = ? OR stdout_path = ?')) {
+      this.calls.push({ kind: 'resolve', params })
+      const [host, ticket, legacyKey, stdoutPath] = params as [string, string, string | null, string | null]
+      const matched = this.resolveRows.filter(r => r.host === host && r.ticket === ticket && (sqlEq(r.legacy_key, legacyKey) || sqlEq(r.stdout_path, stdoutPath)))
+      return [matched.map(r => ({ run_id: r.run_id })), []]
+    }
+    if (sql.startsWith('UPDATE runs')) {
+      this.calls.push({ kind: 'write', params })
+      const [reviewRounds, finalReviewRounds, runId, host] = params as [number, number, string, string]
+      const row = this.writeRows.get(runId)
+      if (!row || row.host !== host) return [{ info: 'Rows matched: 0  Changed: 0  Warnings: 0' }, []]
+      const reviewOk = row.review_rounds === null || row.review_rounds <= reviewRounds
+      const finalOk = row.final_review_rounds === null || row.final_review_rounds <= finalReviewRounds
+      if (!reviewOk || !finalOk) return [{ info: 'Rows matched: 0  Changed: 0  Warnings: 0' }, []]
+      row.review_rounds = reviewRounds
+      row.final_review_rounds = finalReviewRounds
+      return [{ info: 'Rows matched: 1  Changed: 1  Warnings: 0' }, []]
+    }
+    throw new Error(`FakeRoundsFullPool: 未預期的 SQL：${sql}`)
+  }
+}
+
+function setMonDbFlag(v: string | undefined): () => void {
+  const orig = process.env.MON_DB_ENABLED
+  if (v === undefined) delete process.env.MON_DB_ENABLED
+  else process.env.MON_DB_ENABLED = v
+  return () => {
+    if (orig === undefined) delete process.env.MON_DB_ENABLED
+    else process.env.MON_DB_ENABLED = orig
+  }
+}
+
+describe('persistReviewRoundsToMonDb', () => {
+  let restoreFlag: () => void
+  afterEach(() => {
+    __resetRoundsMonDbStateForTest()
+    restoreFlag?.()
+  })
+
+  test('MON_DB_ENABLED 關閉（深度防禦）→ 零呼叫零副作用', async () => {
+    restoreFlag = setMonDbFlag(undefined)
+    const pool = new FakeRoundsFullPool()
+    const r = await persistReviewRoundsToMonDb(pool, { key: 'FAQ-1.a', ticket: 'FAQ-1', stdoutPath: '/logs/FAQ-1.a.stdout.log', reviewRounds: 1, finalReviewRounds: 0 })
+    expect(r.wrote).toBe(false)
+    expect(pool.calls.length).toBe(0)
+  })
+
+  test('值變化 → 對位 + 寫入，成功才推進 cache；同 key 再次相同/更小的值不再呼叫 pool', async () => {
+    restoreFlag = setMonDbFlag('1')
+    const pool = new FakeRoundsFullPool()
+    pool.resolveRows.push({ run_id: 'run-1', host: 'head', ticket: 'FAQ-1', legacy_key: null, stdout_path: '/logs/FAQ-1.a.stdout.log' })
+    pool.writeRows.set('run-1', { run_id: 'run-1', host: 'head', review_rounds: null, final_review_rounds: null })
+
+    const r1 = await persistReviewRoundsToMonDb(pool, { key: 'FAQ-1.a', ticket: 'FAQ-1', stdoutPath: '/logs/FAQ-1.a.stdout.log', reviewRounds: 1, finalReviewRounds: 0 })
+    expect(r1.wrote).toBe(true)
+    expect(pool.calls.map(c => c.kind)).toEqual(['resolve', 'write'])
+    expect(pool.writeRows.get('run-1')).toEqual({ run_id: 'run-1', host: 'head', review_rounds: 1, final_review_rounds: 0 })
+
+    pool.calls = []
+    const r2 = await persistReviewRoundsToMonDb(pool, { key: 'FAQ-1.a', ticket: 'FAQ-1', stdoutPath: '/logs/FAQ-1.a.stdout.log', reviewRounds: 1, finalReviewRounds: 0 })
+    expect(r2.wrote).toBe(false)
+    expect(pool.calls.length).toBe(0) // 值沒進展 → 不呼叫 pool，也不必重解 run_id
+
+    pool.calls = []
+    const r3 = await persistReviewRoundsToMonDb(pool, { key: 'FAQ-1.a', ticket: 'FAQ-1', stdoutPath: '/logs/FAQ-1.a.stdout.log', reviewRounds: 2, finalReviewRounds: 0 })
+    expect(r3.wrote).toBe(true)
+    // run_id 已 cache（上次成功解析過）→ 這次只有 write，不再 resolve。
+    expect(pool.calls.map(c => c.kind)).toEqual(['write'])
+  })
+
+  test('對不到 run_id → skip（wrote=false）、計數 +1、不猜不鑄新列；下一輪重新嘗試解析（不永久放棄）', async () => {
+    restoreFlag = setMonDbFlag('1')
+    const pool = new FakeRoundsFullPool() // resolveRows 空 → 永遠對不到
+    const before = getRoundsUnresolvedCountForTest()
+
+    const r1 = await persistReviewRoundsToMonDb(pool, { key: 'FAQ-2.a', ticket: 'FAQ-2', stdoutPath: '/logs/FAQ-2.a.stdout.log', reviewRounds: 1, finalReviewRounds: 0 })
+    expect(r1.wrote).toBe(false)
+    expect(getRoundsUnresolvedCountForTest()).toBe(before + 1)
+    expect(pool.calls.map(c => c.kind)).toEqual(['resolve']) // 對不到就不會有 write
+
+    // 下一輪（值又進展了）再試一次仍然對不到 → 計數再 +1（沒有把「對不到」錯誤 cache 成永久放棄）。
+    const r2 = await persistReviewRoundsToMonDb(pool, { key: 'FAQ-2.a', ticket: 'FAQ-2', stdoutPath: '/logs/FAQ-2.a.stdout.log', reviewRounds: 2, finalReviewRounds: 0 })
+    expect(r2.wrote).toBe(false)
+    expect(getRoundsUnresolvedCountForTest()).toBe(before + 2)
+  })
+
+  test('write 失敗（單調守衛擋下）→ cache 不推進，下一輪同值仍會重試', async () => {
+    restoreFlag = setMonDbFlag('1')
+    const pool = new FakeRoundsFullPool()
+    pool.resolveRows.push({ run_id: 'run-3', host: 'head', ticket: 'FAQ-3', legacy_key: null, stdout_path: '/logs/FAQ-3.a.stdout.log' })
+    // mon_ui 既有值已經比本次算出的值大（例如另一輪已經寫過更大的值）→ UPDATE 會被 WHERE 擋下。
+    pool.writeRows.set('run-3', { run_id: 'run-3', host: 'head', review_rounds: 9, final_review_rounds: 9 })
+
+    const r1 = await persistReviewRoundsToMonDb(pool, { key: 'FAQ-3.a', ticket: 'FAQ-3', stdoutPath: '/logs/FAQ-3.a.stdout.log', reviewRounds: 1, finalReviewRounds: 0 })
+    expect(r1.wrote).toBe(false)
+
+    pool.calls = []
+    // cache 沒推進（因為上次沒成功）→ 同樣的值這次還是會再打一次 pool，而不是被「值未變化」短路跳過。
+    const r2 = await persistReviewRoundsToMonDb(pool, { key: 'FAQ-3.a', ticket: 'FAQ-3', stdoutPath: '/logs/FAQ-3.a.stdout.log', reviewRounds: 1, finalReviewRounds: 0 })
+    expect(r2.wrote).toBe(false)
+    expect(pool.calls.length).toBeGreaterThan(0) // 沒有被「值未變化」短路跳過
+  })
+
+  // 註：budgetMs 逾時分支（Promise.race 對 setTimeout）不在此檔用真實延遲測試
+  // ——「禁 sleep」硬規則明文「測試碼不得靠等待時間成立」，逾時競態若要確定性
+  // 驗證，需要真的讓一條路徑比另一條慢，等同於靠等待時間成立，不划算也不合規。
+  // 這裡只驗證邏輯分支本身（成功/失敗兩種 raced.ok 結果都會正確處理 cache），
+  // Promise.race + setTimeout 的機制與 cancelPipeline 已驗證過的 writeCancelFlag
+  // 完全同構，不重複驗證同一個機制。
 })

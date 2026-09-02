@@ -30,6 +30,7 @@ import {
   readActiveMarker,
   deriveLegacyKey,
   RUNS_HOST,
+  persistReviewRoundsToMonDb,
 } from './mon-db.ts'
 
 // ---------- 1) audit.jsonl tail ----------
@@ -434,16 +435,35 @@ const lastPersistedRounds = new Map<string, { review: number; final: number }>()
  * 結束的最後一次掃描都會呼叫到（見呼叫處註解），確保 run 結束、transcript
  * 停止增長後，DB 欄位仍留著最終輪數。
  */
-function persistReviewRounds(key: string, ticket: string, startedAt: string): void {
+function persistReviewRounds(key: string, ticket: string, startedAt: string, stdoutPath: string): void {
   const counts = getReviewRoundCounts(ticket, startedAt)
   if (!counts) return
   const last = lastPersistedRounds.get(key)
-  if (last && counts.reviewRounds <= last.review && counts.finalReviewRounds <= last.final) return
-  bumpReviewRounds(key, counts.reviewRounds > 0 ? counts.reviewRounds : null, counts.finalReviewRounds > 0 ? counts.finalReviewRounds : null)
-  lastPersistedRounds.set(key, {
-    review: Math.max(counts.reviewRounds, last?.review ?? 0),
-    final: Math.max(counts.finalReviewRounds, last?.final ?? 0),
-  })
+  if (!last || counts.reviewRounds > last.review || counts.finalReviewRounds > last.final) {
+    bumpReviewRounds(key, counts.reviewRounds > 0 ? counts.reviewRounds : null, counts.finalReviewRounds > 0 ? counts.finalReviewRounds : null)
+    lastPersistedRounds.set(key, {
+      review: Math.max(counts.reviewRounds, last?.review ?? 0),
+      final: Math.max(counts.finalReviewRounds, last?.final ?? 0),
+    })
+  }
+  // mon_ui 側（Phase 8 讀取面 a4 的唯一 rounds 來源，migration 004 就位）：
+  // 獨立於上面的 sqlite bump——sqlite 那段可能因為值沒進展而跳過，mon_ui 這
+  // 邊仍要跑（它有自己獨立的 last-written cache，見 persistReviewRoundsToMonDb
+  // 註解），兩邊各自只在自己那次寫入成功才推進自己的 cache。fire-and-forget：
+  // 這裡是同步函式、掛在 scanPipelineRuns 的同步迴圈裡，不能為了一次 DB 寫入
+  // 拖住整個 collector tick；失敗只 WARN，下一輪自然重試。
+  if (isMonitorDbEnabled()) {
+    const pool = getMonitorPool()
+    void persistReviewRoundsToMonDb(pool, {
+      key,
+      ticket,
+      stdoutPath,
+      reviewRounds: counts.reviewRounds,
+      finalReviewRounds: counts.finalReviewRounds,
+    }).catch(err => {
+      console.warn(`mon-db: rounds 寫入例外（ticket=${ticket} key=${key}）：${err}`)
+    })
+  }
 }
 
 export function scanPipelineRuns() {
@@ -519,7 +539,7 @@ export function scanPipelineRuns() {
           // 才寫下最後幾筆派工事件（例如最後一輪 reviewer 或 Step 6.5），確保
           // 這些也被算進去再持久化一次——之後 pending 就此不再增長，這是最後
           // 機會。
-          persistReviewRounds(key, ticket, startedAt)
+          persistReviewRounds(key, ticket, startedAt, stdoutPath)
         }
       } catch {}
     } else if (kind === 'bug') {
@@ -536,7 +556,7 @@ export function scanPipelineRuns() {
       // 審查輪數持久化（2026-09-02）：掛在既有 collector tick 上，不新增
       // timer；跟 finish 分支共用同一個 persistReviewRounds（只增不減，值沒變
       // 就不寫），run 結束前每個 tick 都有機會把最新輪數落地。
-      persistReviewRounds(key, ticket, startedAt)
+      persistReviewRounds(key, ticket, startedAt, stdoutPath)
     }
   }
   reconcileStaleOutcomes()
