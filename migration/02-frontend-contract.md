@@ -205,11 +205,16 @@ export function subscribe<T, P>(
 
 分頁**不要直接呼叫 `subscribe()`**，用 `useResource()`。這裡列出來是為了說明語意。
 
-**目前是輪詢**。後端已定案未來會加 `GET /api/stream?topics=a,b`（`event: <topic>`，
-`data` 為該 topic 的完整 JSON，形狀與現有 GET 端點**完全一致**），範圍是
-overview / pipelines / toolsmith / log 四類。接上時**只需要改 `transport.ts`**，
-`endpoints.ts` / `useResource` / 11 個分頁都不用動——切換點與步驟寫在該檔最下方的
-「SSE 接入點」註解裡。現在刻意不寫 `EventSource` 程式碼（端點還不存在，寫了就是死碼）。
+**目前仍是輪詢，尚未切換。** 後端的 `GET /api/stream?topics=a,b` 契約已定案並寫進
+`00-api-inventory.md`（`event: <topic>`，`data` 為該 topic 的完整 JSON，形狀與現有 GET 端點
+**完全一致**；同 topic 連續 3 次失敗會 `controller.error()` 收場串流，連線上限 32、超過回 503，
+log topic 有背壓上限）。streamable 範圍是 **overview / pipelines / pipeline-run / toolsmith / log
+五類**，其中 `pipeline-run` 與 `log` 是**參數化** topic。
+
+切換時**只需要改 `transport.ts`**，`endpoints.ts` / `useResource` / 11 個分頁都不用動——步驟與
+**連線身分必須包含 params** 的警告寫在該檔最下方的「SSE 接入點」註解裡（只用 topic key 聯集當
+連線身分會導致換 log 檔／換票時推錯資料）。現在刻意不寫 `EventSource` 程式碼（尚未部署，寫了
+就是無法驗證的死碼）。
 
 ### 2.5 預定義主題（`topics.ts`）
 

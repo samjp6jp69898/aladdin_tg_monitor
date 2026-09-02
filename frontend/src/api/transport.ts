@@ -172,9 +172,21 @@ export function subscribe<T, P>(
 /**
  * 未來要把 streamable 的 topic 改走 `GET /api/stream?topics=...` 時，**只改這個檔案**：
  *
- * 1. 在本檔加一個模組層級的單例連線管理器（多個 topic 共用同一條 EventSource，
- *    topics 參數是所有目前被訂閱、且 `streamable === true` 的 topic key 聯集；
- *    有人訂閱/退訂造成聯集改變時重建連線）。
+ * 1. 在本檔加一個模組層級的連線管理器。
+ *
+ *    ⚠️ **連線身分必須包含 params，不能只用 topic key 聯集**（2026-09-02 修正）：
+ *    五個 streamable topic 裡有兩個是**參數化**的——`pipeline-run`（`{ key }`）與
+ *    `log`（`{ path, offset }`）。若連線身分只取 key 聯集，使用者換 log 檔案或換一張票時
+ *    聯集不變 → 不重建連線 → 伺服器繼續推舊 path / 舊 key 的資料，畫面會顯示成別的檔案
+ *    或別張票。SSE 是單向的，params 只能經 URL 傳給伺服器，所以連線身分由客戶端決定，
+ *    後端無法補救。
+ *
+ *    **建議連線切分方式**（避免每次換 log 檔就把所有串流一起斷掉重建）：
+ *    - 一條共用連線給**無參數**的 streamable topic（overview / pipelines / toolsmith），
+ *      身分 = 這些 key 的聯集，只有訂閱/退訂才重建。
+ *    - **每個參數化 topic 的每組 params 各開一條**（如 `?topics=log&path=...`、
+ *      `?topics=pipeline-run&key=...`），身分 = `key + 序列化後的 params`，params 一變就重建。
+ *      實務上同時最多一兩條（使用者一次看一個 log 檔、一張票），遠低於後端 32 條連線上限。
  * 2. `subscribe()` 改成：
  *    - `topic.streamable !== true` → 維持現在的輪詢分支，完全不變。
  *    - `topic.streamable === true` → 先用 `topic.fetch()` 打一次拿初始畫面（SSE 只推增量事件，
@@ -183,7 +195,8 @@ export function subscribe<T, P>(
  *      `onData` 的型別不用改。
  *    - 連線失敗 / `onerror` → 呼叫 `onError`，並降級回輪詢（EventSource 自帶重連，
  *      但降級可以避免長時間白畫面）。
- * 3. `unsubscribe()` 移除該 listener，若某個 topic 已無人訂閱就更新連線的 topics 聯集。
+ * 3. `unsubscribe()` 移除該 listener；無參數那條連線在某 topic 已無人訂閱時更新 topics 聯集，
+ *    參數化那條在最後一個訂閱者退訂時直接關閉。
  *
  * 其他層完全不用動：endpoints.ts 照樣提供 fetch 函式（初次載入與 fallback 都需要），
  * useResource 與 11 個分頁看到的介面不變。
@@ -193,6 +206,10 @@ export function subscribe<T, P>(
  */
 export const SSE_ENDPOINT_PATH = '/api/stream'
 
-/** 後端定案會走 SSE 的四類 topic key。目前僅作為文件與 defineTopic 的參考值。 */
-export const STREAMABLE_TOPICS = ['overview', 'pipelines', 'toolsmith', 'log'] as const
+/**
+ * 後端定案會走 SSE 的 topic key。目前僅作為文件與 defineTopic 的參考值。
+ * `pipeline-run` 與 `log` 是**參數化** topic——見上方連線身分的警告。
+ * （2026-09-02 補上原本漏列的 `pipeline-run`，與 topics.ts 的 `streamable: true` 標記對齊。）
+ */
+export const STREAMABLE_TOPICS = ['overview', 'pipelines', 'pipeline-run', 'toolsmith', 'log'] as const
 export type StreamableTopicKey = (typeof STREAMABLE_TOPICS)[number]

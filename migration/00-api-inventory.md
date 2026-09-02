@@ -7,12 +7,12 @@
 來源：`/Users/user/aladdin/tg-monitor/server.ts`（809 行，讀於 2026-09-02）。
 輔助讀取（僅為確認回傳欄位）：`lib/services.ts`、`lib/db.ts`、`lib/ingest.ts`、`lib/tg-users.ts`、`lib/webhook-status.ts`、`lib/pipeline-queue-state.ts`、`lib/cluster-state.ts`、`lib/toolsmith.ts`；前端 tab 名稱對照讀 `public/index.html`。
 
-**端點總數：32**（`grep -cE "app\.(get|post)\(" server.ts` = 32，與下列小節數一致，含 `GET /` 靜態首頁與 3 個 `handleWorkerAction` 共用 handler 的獨立路由）。
+**端點總數：36**（`grep -cE "app\.(get|post)\(" server.ts` = 36，2026-09-02 實測）。下面的小節數是 **32**——差額是本檔盤點之後才加的四條，各自的契約寫在檔尾：`GET /next`、`GET /next/*`（React 前端靜態路由）、`GET /api/stream`（SSE）、`GET /api/read-source`（讀取面資料源自述）。**原有 32 個端點的路徑、參數、回應形狀一律未變。**
 
 **SSE：有一支**（2026-09-02 Phase 8 新增 `GET /api/stream`，見本檔末的「SSE 端點」節）。**原有 32 個端點的路徑、參數、回應形狀一律不變**，`/api/stream` 是**額外**加的一條，不取代任何既有端點；不打它的客戶端行為與遷移前完全相同。
 
 > 本節原文（保留作為脈絡）：「SSE：無。`/api/events` 只是普通 GET + `c.json()`，一次性回傳陣列，不是串流。專案本身刻意不用 SSE——`server.ts:787-788` 明確寫『輪詢，不用 SSE——Bun 1.2.9 的 ReadableStream 在客戶端中斷連線時會 segfault，實測踩到』，即時跟隨改用 `/api/log/since` 的 offset 輪詢模式（見該端點小節）。」
-> 該踩坑已於 2026-09-02 在 Bun 1.4.0 用 `scripts/sse-segfault-repro.ts` 實測解除（exit 0）。**另一條踩坑「handler 內同步 spawn 遇客戶端中斷會 segfault」並未解除**（`lib/ingest.ts:99-103`），`/api/stream` 的 handler 內因此禁用一切 `*Sync` spawn。
+> 該踩坑已於 2026-09-02 在 Bun 1.4.0 用 `scripts/sse-segfault-repro.ts` 實測解除（exit 0）。**另一條踩坑「handler 內同步 spawn 遇客戶端中斷會 segfault」並未解除**（`lib/ingest.ts:113-117`），`/api/stream` 的 handler 內因此禁用一切 `*Sync` spawn。
 
 ---
 
@@ -487,16 +487,55 @@ app.get('/', c => c.html(Bun.file(new URL('./public/index.html', import.meta.url
   | `overview` | `{ now, activeWindowMin, services, webhook, tgUsers, pipelines }` | `GET /api/overview` |
   | `pipelines` | `{ rows, queued, remote }` | `GET /api/pipelines` |
   | `toolsmith` | `{ rows }` | `GET /api/toolsmith` |
-  | `pipeline-run` | `{ run, progress, stages }`；查無此 key 時推 `{ error: 'not found' }`（串流沒有狀態碼可用，body 與該端點 404 的 body 同形） | `GET /api/pipelines/run` |
+  | `pipeline-run` | `{ run, progress, stages }`。**查無此 key 時不推任何 payload**，改讓串流以錯誤收場 → 前端降級回輪詢後從 GET 端點拿到真正的 404。（早期版本推 `{ error: 'not found' }`，那會讓前端 `notFound = Boolean(error) && !data` 因為 data 是 truthy 而判成 false，畫出一頁語意全錯的空白詳情。） | `GET /api/pipelines/run` |
   | `log` | `{ text, offset }`；檔案不存在時 `{ text: '', offset: 0, missing: true }` | `GET /api/log/since` |
-- `log` 的增量語意與 `/api/log/since` 一字不差：伺服器端自己記住 offset 往前推；**沒有新內容的那一拍整拍不推**
-  （省頻寬）；檔案被截斷／輪替時 offset 歸零，前端既有的 `if (res.offset < offsetRef.current) setText('')`
-  判斷照樣成立。
-- 心跳：每 15 秒送一行 `: ping` 註解列（EventSource 規範會忽略 `:` 開頭的行）。某個 topic 產 payload
-  失敗時也送註解列 `: error <topic>`（同時寫 stderr）——**刻意不新增契約外的 event 名稱**。
-- 客戶端斷線：`ReadableStream.cancel()` 觸發後清掉該連線的所有 timer。實測 8 條連線硬斷後
-  server 存活且可繼續服務。
+- `log` 的增量語意對齊 `/api/log/since`：伺服器端自己記住 offset 往前推；**沒有新內容的那一拍整拍不推**
+  （省頻寬）——**唯一的例外是「剛被截斷」那一拍**：檔案被清成 0 bytes 時 `size === offset === 0`，
+  若整拍不推，前端的 `if (res.offset < offsetRef.current) setText('')` 永遠沒機會執行、畫面會卡在舊內容，
+  所以這一拍一定會推一個 `{ text: '', offset: 0 }`。截斷成非 0 大小時則照常送新內容（offset 變小，
+  前端同樣會清空）。
+  兩處**刻意與 `/api/log/since` 不同**（本端點較嚴謹，已知偏離）：`offset=abc` 在這裡夾成 0，在
+  `/api/log/since` 會走進 `Buffer.alloc(NaN)` 直接 500；`offset=-3` 在這裡夾成 0，在該端點會用負數
+  position 去 `readSync`。
+- **背壓**：每次送出前檢查 `controller.desiredSize`，佇列已滿就整拍不送；log 那側因此**不推進 offset**，
+  下一拍會重送同一段，內容不會被跳過。（沒有這道檢查的話，客戶端休眠／分頁被節流時，
+  log topic 每 1500ms 最多 2MB 會一路堆到 OOM。）
+- 心跳：每 15 秒送一行 `: ping` 註解列（EventSource 規範會忽略 `:` 開頭的行）。
+- **錯誤語意（重要）**：`:` 開頭的註解列 EventSource **一定會忽略**，`onerror` 只在連線層失敗時觸發——
+  所以「連線活著、每一拍都失敗」在前端看起來會是一條健康的連線配上永遠不更新的畫面。因此本端點
+  **不拿註解列當錯誤通道**：某個 topic **連續 3 次**產 payload 失敗就直接讓整條串流以錯誤收場
+  （`controller.error()`），前端的 `onerror` 才會觸發、才會依 `transport.ts` 的既定計畫降級回輪詢，
+  然後從一般 GET 端點拿到真正的錯誤。註解列 `: error <topic>` 仍然會送，但只當人工排查的痕跡。
+- **連線數上限**：同時最多 `32` 條，超過回 `503 { error: … }`。每條連線常駐 1–6 個 timer、每 5 秒觸發
+  一輪查詢（`pipeline-run` 還會 spawn 一次 `tracker.sh`），沒有上限的話開太多分頁就能拖垮讀取面。
+  這是既有「只綁 127.0.0.1」安全論證沒有涵蓋的新資源模型（那個論證是針對一次性請求建立的）。
+- 客戶端斷線：`ReadableStream.cancel()` 觸發後清掉該連線的所有 timer 並放回連線名額；
+  `enqueue` 拋錯（斷線但 `cancel()` 還沒被呼叫到的視窗）走同一條收尾路徑。
+  驗收腳本 `scripts/verify-stream.ts` 涵蓋 8 條硬斷後 server 仍存活。
 
 > ⚠️ `pipeline-run` 這個 topic 是**額外**支援的：`transport.ts` 的 `STREAMABLE_TOPICS` 只列了四個，
 > 但 `topics.ts:66` 的 `pipelineRun` 已經標了 `streamable: true`（前端自身不一致）。後端兩邊都支援，
 > 前端要用哪個由前端決定。
+
+---
+
+## GET /api/read-source（2026-09-02 Phase 8 新增）
+
+讀取面實際生效的資料源。存在的理由：`MON_READ_SOURCE=mysql` 但啟動探針失敗時，
+tg-monitor 會**退回 sqlite 並繼續服務**（見 `lib/read/index.ts`：plist 是
+`KeepAlive=true`，啟動時 throw 會變成無窮重啟迴圈，而且監控面板自己掛掉會讓人
+看不到「監控 DB 有問題」這件事）。那個退回原本只寫在 stderr，從外面完全看不出來——
+操作者會以為在跑 mysql、面板還一切正常。
+
+- Query／Body：無
+- 回傳：
+  ```
+  {
+    requested: string | null,        // MON_READ_SOURCE 的原始值（未設為 null）
+    effective: 'sqlite' | 'mysql',   // 實際生效的
+    degraded: boolean,               // true = 要的是 mysql，實際退回了 sqlite
+  }
+  ```
+- **刻意不把這幾個欄位塞進 `/api/overview`**：那會改到既有回應的形狀，破壞
+  「sqlite 模式 byte-level 不變」這條硬驗收。
+- 服務分頁：無（維運/巡檢用；`doctor-monitor.sh` 之類的檢查可以直接打它）

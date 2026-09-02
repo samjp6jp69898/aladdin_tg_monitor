@@ -9,7 +9,7 @@
 
 import { describe, expect, test } from 'bun:test'
 import { readFileSync } from 'node:fs'
-import { AGENT_RUNS_SELECT, RUNS_SELECT, iso, jnum, jstr, toDatetimeParam } from './mysql.ts'
+import { AGENT_RUNS_SELECT, RUNS_SELECT, exact, iso, jnum, jstr, likeable, limitClause, toDatetimeParam, tsCompare } from './mysql.ts'
 
 const MYSQL_SRC = readFileSync(new URL('./mysql.ts', import.meta.url).pathname, 'utf8')
 
@@ -49,6 +49,11 @@ describe('jstr() / jnum()：raw JSON 取值', () => {
 
   test('jnum 只認真正的 JSON 數字（對齊 insertAuditLine 的 typeof === number）', () => {
     expect(jnum('e', 'durationMs')).toContain("IN ('INTEGER', 'DOUBLE', 'DECIMAL')")
+  })
+
+  test('jnum 用 AS DOUBLE 不是 AS SIGNED（sqlite 是動態型別，12.7 存進去就是 12.7，不會截成 12）', () => {
+    expect(jnum('e', 'durationMs')).toContain('AS DOUBLE')
+    expect(jnum('e', 'durationMs')).not.toContain('AS SIGNED')
   })
 
   test('alias 有帶進去——相關子查詢裡取的必須是 e2/e3 自己的 raw，不是外層的', () => {
@@ -96,9 +101,13 @@ describe('形狀對映：runs → sqlite pipeline_runs', () => {
     expect(RUNS_SELECT).toContain('r.cancel_requested_at')
   })
 
-  test('三個 schema 缺口欄位明確回 NULL（不是漏寫）', () => {
+  test('migration 004 之後三欄讀真欄位，不再是硬寫 NULL', () => {
+    // 落地前這三欄在 runs 表根本不存在，只能 `NULL AS ...`；004（2026-09-02 套用）
+    // 補上後就該讀真的。**值**仍可能是 NULL（rounds 兩欄的寫入端還沒接），
+    // 那是可接受的降級，與這條斷言無關。
     for (const col of ['stderr_path', 'review_rounds', 'final_review_rounds']) {
-      expect(RUNS_SELECT).toMatch(new RegExp(`NULL\\s+AS ${col}`))
+      expect(RUNS_SELECT).toContain(`r.${col}`)
+      expect(RUNS_SELECT).not.toMatch(new RegExp(`NULL\\s+AS ${col}`))
     }
   })
 })
@@ -143,30 +152,110 @@ describe('紀律', () => {
     expect(MYSQL_SRC).toContain('readChain')
   })
 
-  test('使用者輸入的等值比較釘死 utf8mb4_bin（schema 預設 collation 大小寫不敏感，sqlite 的 = 不是）', () => {
-    expect(MYSQL_SRC).toContain('e.service = ? COLLATE utf8mb4_bin')
-    expect(MYSQL_SRC).toContain('e.identity = ? COLLATE utf8mb4_bin')
-  })
-
   test('session 串接的 ORDER BY 也釘 utf8mb4_bin（不然同名不同大小寫會交錯、把一段 session 切碎）', () => {
     expect(MYSQL_SRC).toContain('ORDER BY e.service COLLATE utf8mb4_bin, e.identity COLLATE utf8mb4_bin, e.ts')
   })
+
+  test('讀取面查詢有 I/O 期限與佇列上限（一條卡死的查詢不得堵死整條鏈）', () => {
+    expect(MYSQL_SRC).toContain('READ_QUERY_TIMEOUT_MS')
+    expect(MYSQL_SRC).toContain('READ_QUEUE_MAX')
+  })
 })
 
-describe('SSE handler 的踩坑禁令（lib/ingest.ts:99-103 未解除的那一條）', () => {
-  const SERVER_SRC = readFileSync(new URL('../../server.ts', import.meta.url).pathname, 'utf8')
-  const start = SERVER_SRC.indexOf("app.get('/api/stream'")
-  const end = SERVER_SRC.indexOf('console.error(`tg-monitor ready', start)
-
-  test('/api/stream handler 找得到（下面的斷言才有意義）', () => {
-    expect(start).toBeGreaterThan(0)
-    expect(end).toBeGreaterThan(start)
+describe('collation：兩個方向都必須釘死（本輪對抗審查抓到的 BLOCKER）', () => {
+  test('exact()＝utf8mb4_bin，likeable()＝utf8mb4_0900_ai_ci', () => {
+    expect(exact('e.service')).toBe('e.service COLLATE utf8mb4_bin')
+    expect(likeable('x')).toBe('(x) COLLATE utf8mb4_0900_ai_ci')
   })
 
-  test('handler 內沒有任何同步 spawn', () => {
+  test('每一個進 LIKE 的 JSON 取值都包了 likeable()', () => {
+    // JSON_UNQUOTE 的結果 collation 是 utf8mb4_bin（實測），而 sqlite 的 LIKE
+    // 對 ASCII 大小寫不敏感 —— 不校正會讓 /api/events?q=Admin 靜默回 0 筆。
+    // 掃全檔：任何 `... LIKE` 的左運算元只要含 JSON_EXTRACT，就必須先過 likeable。
+    const likeOperands = [...MYSQL_SRC.matchAll(/\$\{([^}]*(?:jstr|source_ip)[^}]*)\}\s*LIKE/g)].map(m => m[1])
+    expect(likeOperands.length).toBeGreaterThan(0)
+    for (const op of likeOperands) expect(op).toContain('likeable(')
+  })
+
+  test('等值／分組一律走 exact()，檔案裡不該再有裸寫的 COLLATE utf8mb4_bin 等值片段', () => {
+    expect(MYSQL_SRC).not.toContain("= ? COLLATE utf8mb4_bin'")
+    expect(MYSQL_SRC).toContain("exact('e.service')")
+    expect(MYSQL_SRC).toContain("exact('e.identity')")
+  })
+})
+
+describe('與 sqlite 的退化輸入語意對齊（本輪對抗審查抓到的 MAJOR）', () => {
+  test('limit 為負數 → 不加 LIMIT（sqlite 把負數 LIMIT 當不限筆數）', () => {
+    expect(limitClause(-1)).toBe('')
+  })
+
+  test('limit 為 NaN → 丟錯（對齊 sqlite 綁定 NaN 時的 datatype mismatch → HTTP 500）', () => {
+    expect(() => limitClause(Number('abc'))).toThrow()
+  })
+
+  test('limit 正常值 → 一般 LIMIT 片段', () => {
+    expect(limitClause(300)).toBe(' LIMIT 300')
+  })
+
+  test('合法 ISO 的時間比較走 DATETIME（吃得到索引）', () => {
+    const c = tsCompare('e.ts', '>=', '2026-08-26T03:23:44.751Z')
+    expect(c.frag).toBe('e.ts >= ?')
+    expect(c.param).toBe('2026-08-26 03:23:44.751')
+  })
+
+  test('垃圾輸入退化成字典序字串比較（sqlite 的 ts 是文字欄，to=garbage 會命中全部）', () => {
+    const c = tsCompare('e.ts', '<=', 'garbage')
+    expect(c.frag).toContain('DATE_FORMAT')
+    expect(c.frag.endsWith('<= ?')).toBe(true)
+    expect(c.param).toBe('garbage')
+  })
+})
+
+describe('同步 spawn 禁令（lib/ingest.ts:113-117，未解除的那一條）', () => {
+  // 對抗審查指出：只掃 `/api/stream` handler 的字面字串等於沒守門——真正的風險
+  // 全在**傳遞層**（有人把 readTrackerStatusAsync 改回同步版、或在某個
+  // build*Payload() 鏈上加一支會 spawn 的函式，字面掃描照樣全綠）。
+  // 這裡改守兩件更硬的事：
+  //   (1) server.ts **整支**不得出現任何同步 spawn；
+  //   (2) server.ts 不得 import lib/ingest.ts 的同步版 readTrackerStatus。
+  // 這兩條擋得住上面那兩個具體的回歸路徑。剩下「別人的函式內部偷偷 spawn」
+  // 這一類，靠 scripts/verify-stream.ts 的實跑（8 條硬斷後 server 必須存活）兜底。
+  const SERVER_SRC = readFileSync(new URL('../../server.ts', import.meta.url).pathname, 'utf8')
+
+  // 比對的是「呼叫形狀」（識別字後面緊接左括號），不是單純的字串出現——
+  // 檔案裡本來就有幾處註解在**講**這條禁令（例如「非同步版本（execFile 非
+  // execFileSync）」），那些不該讓測試變紅。
+  const SYNC_SPAWN_CALL = /\b(spawnSync|execFileSync|execSync)\s*\(/
+
+  test('server.ts 整支沒有任何同步 spawn 呼叫', () => {
+    expect(SERVER_SRC).not.toMatch(SYNC_SPAWN_CALL)
+  })
+
+  test('server.ts 只 import 非同步的 execFile', () => {
+    expect(SERVER_SRC).toContain("import { execFile } from 'node:child_process'")
+  })
+
+  test('server.ts 用的是 readTrackerStatusAsync，不是同步版 readTrackerStatus', () => {
+    expect(SERVER_SRC).toContain('readTrackerStatusAsync')
+    expect(SERVER_SRC).not.toMatch(/\breadTrackerStatus\b(?!Async)/)
+  })
+
+  test('/api/stream handler 存在且 handler 內同樣乾淨', () => {
+    const start = SERVER_SRC.indexOf("app.get('/api/stream'")
+    const end = SERVER_SRC.indexOf("app.get('/api/read-source'", start)
+    expect(start).toBeGreaterThan(0)
+    expect(end).toBeGreaterThan(start)
     const body = SERVER_SRC.slice(start, end)
-    expect(body).not.toContain('spawnSync')
-    expect(body).not.toContain('execFileSync')
-    expect(body).not.toContain('execSync')
+    expect(body).not.toMatch(SYNC_SPAWN_CALL)
+  })
+
+  test('SSE 失敗語意：連續失敗要讓串流以錯誤收場，不能只送被 EventSource 忽略的註解列', () => {
+    expect(SERVER_SRC).toContain('SSE_MAX_CONSECUTIVE_FAILURES')
+    expect(SERVER_SRC).toContain('controller.error(')
+  })
+
+  test('SSE 有背壓檢查與連線數上限', () => {
+    expect(SERVER_SRC).toContain('controller.desiredSize')
+    expect(SERVER_SRC).toContain('SSE_MAX_CONNECTIONS')
   })
 })

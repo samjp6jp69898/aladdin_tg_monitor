@@ -13,6 +13,30 @@ import type { MonitorReader } from './types.ts'
 let reader: MonitorReader = sqliteReader
 
 /**
+ * 啟動探針的期限。
+ *
+ * server.ts 是用 **top-level await** 呼叫 initReader() 的，模組沒跑完就不會
+ * `export default { fetch, port }`，Bun 也就不會開始 listen。而 pool 的
+ * `connectTimeout: 500`（lib/mon-db.ts）只約束連線＋握手——握手成功、查詢卻
+ * 掛住的話，這支探針會無限期不回，tg-monitor 變成「行程活著但一個請求都不服務」，
+ * `KeepAlive=true` 完全救不了（它只重啟死掉的行程）。那正是本函式的 fallback
+ * 想避免的情況，所以探針自己一定要有期限。
+ */
+const PROBE_TIMEOUT_MS = 3_000
+
+function withDeadline<T>(p: Promise<T>, ms: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  return Promise.race([
+    p,
+    new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(message)), ms)
+    }),
+  ]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer)
+  }) as Promise<T>
+}
+
+/**
  * 啟動時呼叫一次（server.ts 頂層 await）。
  *
  * - sqlite 模式：什麼都不做，連 mysql2 都不會被 import（lazy import 是
@@ -33,7 +57,7 @@ export async function initReader(): Promise<ReadSource> {
   }
   try {
     const m = await import('./mysql.ts')
-    await m.probeMysqlReadable()
+    await withDeadline(m.probeMysqlReadable(), PROBE_TIMEOUT_MS, `監控 DB 探針超過 ${PROBE_TIMEOUT_MS}ms 未回應`)
     reader = m.mysqlReader
     console.error('tg-monitor: MON_READ_SOURCE=mysql —— 讀取面已切到監控 DB（pipeline_monitor）')
     return 'mysql'

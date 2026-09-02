@@ -14,6 +14,7 @@ import { SERVICES, DISPATCHER_LOG_DIR, isAllowedLogPath, isAllowedTracePath, res
 // server.ts 只認識這個介面，不再直接碰 sqlite——所有 SQL 都在 lib/read/ 底下，
 // 兩個資料源交出同一個形狀，**回應組裝一律留在本檔**（單一來源、形狀不分岔）。
 import { getReader, initReader } from './lib/read/index.ts'
+import { resolveReadSource } from './lib/read/source.ts'
 import type { AgentRunRow } from './lib/read/types.ts'
 import { startCollectors, getLastProbes, listRunningPipelineProcs, listBugLocks, loadRoster, cancelPipeline, summarizeEvents, computeBugStages, readTrackerStatusAsync, isBugOutcomeRetryable, parseClaudeEvents, getReviewRoundCounts } from './lib/ingest.ts'
 import { loadConnectedUsers, loadPendingSenders, loadAllTechUsers, assignChatId, unsetChatId, sendTestMessage } from './lib/tg-users.ts'
@@ -218,8 +219,15 @@ function attachAgentRuns(rows: any[], agents: AgentRunRow[]) {
   for (const r of rows) if (typeof r.run_id === 'string' && r.run_id) byRunId.set(r.run_id, r)
   for (const r of rows) { r.agents = []; }
   for (const a of agents as any[]) {
-    const exact = typeof a.run_id === 'string' && a.run_id ? byRunId.get(a.run_id) : undefined
-    if (exact) { exact.agents.push(a); continue }
+    // 有 run_id 就**只信 run_id**：命中就掛上，沒命中代表那個 run 不在本次視野內
+    // （例如 /api/pipelines 只取最新 300 筆，或該 run 被 lifecycle 過濾掉），
+    // 這時要直接略過。掉回下面的時間視窗分支會把它掛到「同票、開始時間在它之前
+    // 的最後一個 run」上，把別人的 agent_count / total_* 灌大——那是猜的，而
+    // run_id 明明是確定的答案。sqlite 模式兩邊都沒有 run_id，這一段完全不會進來。
+    if (typeof a.run_id === 'string' && a.run_id) {
+      byRunId.get(a.run_id)?.agents.push(a)
+      continue
+    }
     const runs = (byKey.get(`${a.kind}:${a.ticket}`) ?? []).slice().sort((x, y) => (x.started_at < y.started_at ? -1 : 1))
     let owner: any = null
     for (const r of runs) if (r.started_at <= a.started_at) owner = r
@@ -868,7 +876,7 @@ app.get('/api/log/since', c => {
 // 2026-09-02 於 Bun 1.4.0 實測 exit 0（8 條硬斷全部觸發 cancel、server 存活）。
 // ⚠️ 該腳本只解除了「ReadableStream 斷線」這一條；**handler 內同步 spawn
 // （spawnSync / execFileSync）遇客戶端中斷會 segfault 那條並未解除**
-// （lib/ingest.ts:99-103），本端點推的每一個 payload 都只走
+// （lib/ingest.ts:113-117），本端點推的每一個 payload 都只走
 // 快取（getLastProbes / listRunningPipelineProcs）、檔案讀取與 async execFile，
 // 全鏈路沒有任何 *Sync spawn——動這裡時務必維持這條。
 
@@ -877,6 +885,19 @@ const SSE_HEARTBEAT_MS = 15_000
 // （frontend/src/api/transport.ts 的 POLL_INTERVAL_MS / LOG_FOLLOW_INTERVAL_MS）。
 const SSE_DEFAULT_INTERVAL_MS = 5000
 const SSE_LOG_INTERVAL_MS = 1500
+// 同一個 topic 連續失敗幾次就把整條串流關掉。
+// 為什麼要關而不是繼續送註解列：`:` 開頭的註解列 EventSource **一定會忽略**，
+// `onerror` 只在連線層失敗時才觸發，所以「連線活著、每一拍都失敗」在前端看起來
+// 是一條健康的連線配上永遠不更新的畫面——對一個監控面板來說這是最糟的失敗模式
+// （輪詢版同樣的失敗會走 ApiError → transport.ts 的 onError → 分頁顯示錯誤）。
+// 主動 error 掉串流，前端的 onerror 才會觸發、才會依 transport.ts 的既定計畫
+// 降級回輪詢，然後從一般 GET 端點拿到真正的錯誤。
+const SSE_MAX_CONSECUTIVE_FAILURES = 3
+// 同時允許的 /api/stream 連線數上限。每條連線都常駐 1~6 個 timer、每 5 秒觸發
+// 一輪查詢（`pipeline-run` 還會 spawn 一次 tracker.sh），沒有上限的話開太多分頁
+// 就能把這台機器的讀取面拖垮。超過就回 503，不是靜默排隊。
+const SSE_MAX_CONNECTIONS = 32
+let sseConnections = 0
 
 type StreamTopic = 'overview' | 'pipelines' | 'toolsmith' | 'pipeline-run' | 'log'
 const STREAM_TOPICS: StreamTopic[] = ['overview', 'pipelines', 'toolsmith', 'pipeline-run', 'log']
@@ -904,39 +925,79 @@ app.get('/api/stream', c => {
   let logOffset = Number(q.offset ?? 0)
   if (!Number.isFinite(logOffset) || logOffset < 0) logOffset = 0
 
+  if (sseConnections >= SSE_MAX_CONNECTIONS) {
+    return c.json({ error: `/api/stream 連線數已達上限（${SSE_MAX_CONNECTIONS}）` }, 503)
+  }
+
   const enc = new TextEncoder()
   const timers: ReturnType<typeof setInterval>[] = []
   let closed = false
+  sseConnections++
+
+  /** 唯一的收尾路徑：清 timer、放掉連線名額。重複呼叫安全。 */
+  const shutdown = () => {
+    if (closed) return
+    closed = true
+    for (const t of timers) clearInterval(t)
+    timers.length = 0
+    sseConnections--
+  }
 
   const stream = new ReadableStream({
     start(controller) {
       const send = (chunk: string) => {
         if (closed) return false
+        // 背壓：ReadableStream 的 enqueue 不會阻塞，消費端不讀時 Bun 會一直往
+        // 內部佇列堆。log topic 每 1500ms 最多 2MB，客戶端休眠／分頁被節流／
+        // TCP 視窗塞住但連線未斷時，這條連線的佇列會一路長到 OOM。
+        // desiredSize <= 0 代表佇列已滿——這一拍整拍不送（log 那側也因此不會
+        // 推進 offset，下一拍會重送同一段，不會遺漏內容）。
+        if (controller.desiredSize !== null && controller.desiredSize <= 0) return false
         try {
           controller.enqueue(enc.encode(chunk))
           return true
         } catch {
-          // 客戶端已斷線但 cancel() 還沒被呼叫到的短暫視窗
-          closed = true
+          // 客戶端已斷線但 cancel() 還沒被呼叫到的短暫視窗。這條路徑同樣要
+          // 收尾——只靠 cancel() 的話（stream 是 error 而非 cancel 收場時）
+          // 這條連線的 timer 會永遠留在事件迴圈裡空轉。
+          shutdown()
           return false
         }
       }
       const emit = (topic: string, payload: unknown) => send(`event: ${topic}\ndata: ${JSON.stringify(payload)}\n\n`)
-      // 註解行（`:` 開頭）EventSource 會直接忽略——拿來當心跳與錯誤紀錄，
-      // 不必為了報錯而新增契約外的 event 名稱。
+      // 註解行（`:` 開頭）EventSource 會直接忽略——只拿來當心跳與人工排查用的
+      // 痕跡，**不拿它當錯誤通道**（見 SSE_MAX_CONSECUTIVE_FAILURES 的說明）。
       const note = (msg: string) => send(`: ${msg.replace(/[\r\n]+/g, ' ')}\n\n`)
+
+      /** 讓整條串流以錯誤收場，觸發前端 EventSource 的 onerror → 降級回輪詢。 */
+      const fail = (reason: string) => {
+        if (closed) return
+        console.error(`tg-monitor: /api/stream 中止：${reason}`)
+        shutdown()
+        try {
+          controller.error(new Error(reason))
+        } catch {}
+      }
 
       // 每個 topic 各一條迴圈，且各自帶 inFlight 旗標：某次 build 比 interval 慢
       // 時只會略過這一拍，不會愈疊愈多（同一個 topic 永遠最多一個 build 在飛）。
       const loop = (topic: StreamTopic, intervalMs: number, tick: () => Promise<void>) => {
         let inFlight = false
+        let consecutiveFailures = 0
         const run = () => {
           if (closed || inFlight) return
           inFlight = true
           tick()
+            .then(() => {
+              consecutiveFailures = 0
+            })
             .catch(err => {
-              console.error(`tg-monitor: /api/stream topic=${topic} 產生 payload 失敗：${err}`)
+              consecutiveFailures++
+              console.error(`tg-monitor: /api/stream topic=${topic} 產生 payload 失敗（連續第 ${consecutiveFailures} 次）：${err}`)
               note(`error ${topic}`)
+              if (consecutiveFailures >= SSE_MAX_CONSECUTIVE_FAILURES) {
+                fail(`topic=${topic} 連續 ${consecutiveFailures} 次失敗：${err}`)
+              }
             })
             .finally(() => {
               inFlight = false
@@ -962,29 +1023,44 @@ app.get('/api/stream', c => {
         } else if (topic === 'pipeline-run') {
           loop(topic, SSE_DEFAULT_INTERVAL_MS, async () => {
             const payload = await buildPipelineRunPayload(runKey)
-            // 查無此 key：GET 端點回 404，串流這側沒有狀態碼可用，
-            // 推 `{ error: 'not found' }`——與該端點 404 的 body 同形。
-            emit(topic, payload ?? { error: 'not found' })
+            // 查無此 key **不能**當成一份成功的 payload 推出去：GET 端點是回
+            // 404（走前端的 ApiError → onError → 顯示「找不到紀錄」），而 SSE
+            // 若把同一個 body 塞進 onData，前端的
+            // `notFound = Boolean(error) && !data` 會因為 data 是 truthy 而判成
+            // false，畫出一頁語意全錯的空白詳情。改成讓這條串流以錯誤收場，
+            // 前端降級回輪詢後就會拿到真正的 404。
+            if (!payload) throw new Error(`pipeline run not found: ${runKey}`)
+            emit(topic, payload)
           })
         } else if (topic === 'log') {
           loop(topic, SSE_LOG_INTERVAL_MS, async () => {
-            // 與 /api/log/since 同一份語意：檔案不見回 missing、被截斷/輪替
-            // 就把 offset 歸零讓前端清空、沒有新內容就整拍不推（省頻寬，
-            // 前端的 `if (res.offset < offsetRef.current)` 判斷不受影響）。
+            // 與 /api/log/since 同一份語意。
             if (!existsSync(logPath)) {
               logOffset = 0
               emit(topic, { text: '', offset: 0, missing: true })
               return
             }
             const size = statSync(logPath).size
-            if (size < logOffset) logOffset = 0
-            if (size === logOffset) return
+            const prevOffset = logOffset
+            if (size < logOffset) logOffset = 0 // 被截斷 / 輪替
+            if (size === logOffset) {
+              // 沒有新內容就整拍不推（省頻寬）——**但剛剛被截斷的那一拍例外**。
+              // log 被清成 0 bytes 時 size === logOffset === 0，如果這裡直接
+              // return，前端的 `if (res.offset < offsetRef.current) setText('')`
+              // 永遠沒機會執行，畫面會卡在舊內容上（可能很久，或永遠）。
+              // /api/log/since 在同樣情況下是會回 `{text:'', offset:0}` 的。
+              if (logOffset < prevOffset) emit(topic, { text: '', offset: logOffset })
+              return
+            }
             const fd = openSync(logPath, 'r')
             try {
               const buf = Buffer.alloc(Math.min(size - logOffset, 2 * 1024 * 1024))
               readSync(fd, buf, 0, buf.length, logOffset)
-              logOffset += buf.length
-              emit(topic, { text: buf.toString('utf8'), offset: logOffset })
+              // 只有真的送出去才推進 offset：背壓擋掉這一拍時 offset 不動，
+              // 下一拍會重送同一段，內容不會被跳過。
+              if (emit(topic, { text: buf.toString('utf8'), offset: logOffset + buf.length })) {
+                logOffset += buf.length
+              }
             } finally {
               closeSync(fd)
             }
@@ -995,9 +1071,7 @@ app.get('/api/stream', c => {
       timers.push(setInterval(() => note('ping'), SSE_HEARTBEAT_MS))
     },
     cancel() {
-      closed = true
-      for (const t of timers) clearInterval(t)
-      timers.length = 0
+      shutdown()
     },
   })
 
@@ -1009,6 +1083,19 @@ app.get('/api/stream', c => {
       // 本 server 只綁 127.0.0.1、前面沒有 nginx，但寫上不吃虧、也表明意圖。
       'x-accel-buffering': 'no',
     },
+  })
+})
+
+// 目前生效的讀取面資料源。**新增的唯讀端點**：`MON_READ_SOURCE=mysql` 但探針
+// 失敗時會退回 sqlite（見 lib/read/index.ts），那件事原本只寫在 stderr，從外面
+// 完全看不出來——操作者會以為在跑 mysql，其實在跑 sqlite，面板還一切正常。
+// 刻意不把它塞進 /api/overview：那會改到既有回應的形狀，破壞「sqlite 模式
+// byte-level 不變」的硬驗收。
+app.get('/api/read-source', c => {
+  return c.json({
+    requested: process.env.MON_READ_SOURCE ?? null,
+    effective: getReader().source,
+    degraded: READ_SOURCE !== resolveReadSource(process.env.MON_READ_SOURCE),
   })
 })
 

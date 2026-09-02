@@ -47,7 +47,9 @@ function compare(name: string, a: any[], b: any[], keyOf: (r: any) => string, ig
   for (const [k, ra] of ma) {
     const rb = mb.get(k)
     if (!rb) { onlyA.push(k); continue }
-    for (const col of Object.keys(ra)) {
+    // 兩邊 key 的聯集，不是只看 sqlite 的——只看 sqlite 的話，mysql 側多長出來的
+    // 欄位永遠不會被回報（形狀驗收就漏了一半）。
+    for (const col of new Set([...Object.keys(ra), ...Object.keys(rb)])) {
       if (ignore.includes(col)) continue
       const va = ra[col]
       const vb = rb[col]
@@ -138,6 +140,12 @@ function compareSet(name: string, a: any[], b: any[]) {
 /** 對照時一律取全量（server.ts 的 Math.min(limit,1000) 是端點層的事，不在 reader）。 */
 const FULL = 1_000_000
 
+// migration 004（2026-09-02 套用）已把 stderr_path / review_rounds /
+// final_review_rounds 三欄補進 runs，讀取面改讀真欄位，所以 stderr_path 進入正常
+// 對照。rounds 兩欄的**寫入端還沒接**（排在 health-monitor 批之後），mysql 側目前
+// 一律是 NULL，留在忽略清單裡避免刷屏；寫入端接上後這個陣列要清空。
+const RUNS_KNOWN_GAPS = ['review_rounds', 'final_review_rounds']
+
 const now = Date.now()
 const days30 = new Date(now - 30 * 86400_000).toISOString()
 const days7 = new Date(now - 7 * 86400_000).toISOString()
@@ -149,11 +157,21 @@ console.log('=== 讀取面雙軌對照（sqlite ↔ mysql）===\n')
 // limit 一律開到全量。**不要用 1000 對照**：兩軌的 id 是各自獨立的
 // AUTOINCREMENT，`ORDER BY id DESC LIMIT 1000` 在兩邊會切在資料集的不同位置，
 // 比出來的「只在 sqlite / 只在 mysql」全是視窗邊界，不是資料差異。
+// `q=` 的大小寫案例是本輪對抗審查抓到的 BLOCKER 的**回歸案例**：
+// `JSON_UNQUOTE(JSON_EXTRACT(...))` 的 collation 是 utf8mb4_bin，而 sqlite 的 LIKE
+// 對 ASCII 大小寫不敏感——沒有 likeable() 校正的話，`q=Admin` 在 mysql 模式會靜默
+// 回 0 筆而 sqlite 回 7 筆。這幾行如果變紅，就是那個修法被人改掉了。
 for (const [label, f] of [
   ['events(全量)', { errorsOnly: false, toolOnly: false, limit: FULL }],
   ['events(toolOnly)', { errorsOnly: false, toolOnly: true, limit: FULL }],
   ['events(errors)', { errorsOnly: true, toolOnly: false, limit: FULL }],
   ['events(30 天內)', { from: days30, errorsOnly: false, toolOnly: false, limit: FULL }],
+  ['events(q=admin 小寫)', { q: 'admin', errorsOnly: false, toolOnly: false, limit: FULL }],
+  ['events(q=Admin 混寫)', { q: 'Admin', errorsOnly: false, toolOnly: false, limit: FULL }],
+  ['events(q=ADMIN 大寫)', { q: 'ADMIN', errorsOnly: false, toolOnly: false, limit: FULL }],
+  ['events(q=/mcp 路徑)', { q: '/mcp', errorsOnly: false, toolOnly: false, limit: FULL }],
+  ['events(to=garbage 退化輸入)', { to: 'garbage', errorsOnly: false, toolOnly: false, limit: FULL }],
+  ['events(limit=-1 負數)', { errorsOnly: false, toolOnly: false, limit: -1 }],
 ] as const) {
   // 以「內容」當鍵而不是 id（見 compareOrdered 的 drop 說明）。
   const k = (r: any) => `${r.service}|${r.ts}|${r.event}|${r.identity}|${r.tool}|${r.path}|${r.result}`
@@ -197,14 +215,33 @@ compare('statusLog', await sqliteReader.statusLog(), await mysqlReader.statusLog
 }
 
 // ── pipeline_runs / agent_runs ─────────────────────────────────────────────
-// stderr_path / review_rounds / final_review_rounds 是已知的 schema 缺口
-// （runs 表沒有這三欄，見 lib/read/mysql.ts 檔頭），對照時列為已知差異、不重複刷屏。
-const RUNS_KNOWN_GAPS = ['stderr_path', 'review_rounds', 'final_review_rounds']
 compare('pipelineRuns(300)', await sqliteReader.pipelineRuns(300), await mysqlReader.pipelineRuns(300), r => r.key, [...RUNS_KNOWN_GAPS, 'host', 'run_id'])
-compare('allAgentRuns', await sqliteReader.allAgentRuns(), await mysqlReader.allAgentRuns(), r => r.path, ['file_mtime', 'run_id', 'host'])
+// 鍵要含 run_id：mysql 側 agent_runs 的 PK 是 (run_id, path)，只用 path 當鍵會被
+// Map 靜默併掉重複列，比對就漏了。sqlite 側沒有 run_id，鍵退化成 path，行為不變。
+compare('allAgentRuns', await sqliteReader.allAgentRuns(), await mysqlReader.allAgentRuns(), r => `${r.run_id ?? ''} | ${r.path}`, ['file_mtime', 'run_id', 'host'])
+
+// ── 逐票 / 逐 key 的查詢（審查指出這三支語意最刁鑽卻完全沒被覆蓋）──────────
+{
+  const sample = await sqliteReader.pipelineRuns(5)
+  if (sample.length === 0) console.log('SKIP pipelineRunByKey / pipelineRunsByTicket / latestBugRunKey（sqlite 沒有 run 可取樣）')
+  for (const r of sample) {
+    const [a, b] = [await sqliteReader.pipelineRunByKey(r.key), await mysqlReader.pipelineRunByKey(r.key)]
+    compareOrdered(`pipelineRunByKey(${r.ticket})`, a ? [a] : [], b ? [b] : [], [...RUNS_KNOWN_GAPS, 'host', 'run_id'])
+    compare(
+      `pipelineRunsByTicket(${r.kind}/${r.ticket})`,
+      await sqliteReader.pipelineRunsByTicket(r.kind, r.ticket),
+      await mysqlReader.pipelineRunsByTicket(r.kind, r.ticket),
+      x => x.key,
+      [...RUNS_KNOWN_GAPS, 'host', 'run_id'],
+    )
+  }
+  for (const t of [...new Set(sample.filter(r => r.kind === 'bug').map(r => r.ticket))]) {
+    compareOrdered(`latestBugRunKey(${t})`, [{ key: await sqliteReader.latestBugRunKey(t) }], [{ key: await mysqlReader.latestBugRunKey(t) }])
+  }
+}
 
 // ── token-grants 的用量彙總 ────────────────────────────────────────────────
-compare('identityUsage', await sqliteReader.identityUsage(), await mysqlReader.identityUsage(), r => `${r.identity} ${r.service}`)
+compare('identityUsage', await sqliteReader.identityUsage(), await mysqlReader.identityUsage(), r => `${r.identity} | ${r.service}`)
 
 console.log(`\n共 ${sections} 節，${mismatched} 節有差異。`)
 console.log(mismatched === 0 ? 'RESULT: PASS —— 兩軌一致' : 'RESULT: DIFF —— 見上方逐節明細（可能是回填/collector 進度，不必然是程式問題）')
