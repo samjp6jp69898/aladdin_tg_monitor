@@ -82,7 +82,9 @@ frontend/
 **1. 跟隨開啟時按重新載入會有短暫文字閃爍**（`useLogFollow`）
 `follow=true` 時按 reload，階段 2 的新訂閱可能在階段 1 的 tail 完成前、用舊 offset 打一次 `/api/log/since`，
 造成畫面短暫閃爍。由最終複驗 agent 發現，判定**非阻斷性**：不影響最終捲動行為，也不構成訊號繞過。
-未修原因：屬本次 parity 範圍外的新發現，且修法會再動一次共用 hook。**要不要修請裁示。**
+未修原因：屬本次 parity 範圍外的新發現，且修法會再動一次共用 hook。
+**2026-09-02 使用者裁示：先不修。** 保留此紀錄，日後若造成困擾再處理（修法方向：讓階段 2 的
+`/api/log/since` 訂閱以 `loadId` 為依賴，確保階段 1 的 tail 完成後才開始增量抓取）。
 
 **2. events / sessions 表格右側的「耗時」與操作連結欄，新舊兩版都沒顯示**
 兩版一致，屬既有特性，非本次重寫造成的迴歸，故未動。
@@ -104,6 +106,13 @@ frontend/
 | `review/shots-v3/` | 最終版新舊截圖（22 張，已 gitignore，僅存於本機） |
 | `review/shot.ts` | 截圖工具：`bun run migration/review/shot.ts [old\|new]` |
 
-## 七、審核通過後才做的事
+## 七、日常使用
 
-**舊版 `public/index.html` 的刪除，必須由使用者明確指示後才執行。** 在那之前一律保留。
+**日常只需開 http://127.0.0.1:8799/next/**（新版），功能完整、不依賴舊版。
+已 grep 確認全 repo（telegram-dispatcher / aladdin_ai / tg-monitor）**沒有任何通知或腳本會產生指向舊版
+UI 的連結**（唯一命中是 `server.ts:4` 的註解），所以不會發生「從別處跳轉又回到舊版」的情形。
+
+舊版 `/` 保留作為對照用途。**它的刪除必須由使用者明確指示後才執行**，在那之前一律保留。
+
+維護提醒：改動 `frontend/` 底下的程式碼後要 `cd frontend && bun run build`（server 每次請求直讀
+`frontend/dist`，不必重啟服務）。純瀏覽不需要任何額外動作。
