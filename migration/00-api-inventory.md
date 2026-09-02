@@ -562,3 +562,27 @@ tg-monitor 會**退回 sqlite 並繼續服務**（見 `lib/read/index.ts`：plis
 - **刻意不把這幾個欄位塞進 `/api/overview`**：那會改到既有回應的形狀，破壞
   「sqlite 模式 byte-level 不變」這條硬驗收。
 - 服務分頁：無（維運/巡檢用；`doctor-monitor.sh` 之類的檢查可以直接打它）
+
+> **⚠️ 待部署變更（2026-09-02 通報，尚未部署）**
+> 純新增一欄 **`requestedValid: boolean`**，既有三欄 `requested` / `effective` / `degraded`
+> **完全不變**，前端不需要改動即可繼續運作。
+>
+> **語意（依實作讀出，非依描述）**——`server.ts:1125`：
+> ```ts
+> requestedValid: (raw ?? '').trim() === '' || resolveReadSource(raw) === (raw ?? '').trim().toLowerCase()
+> ```
+> 即「`MON_READ_SOURCE` 的原始值是否解析得出合法來源」，但**未設（空字串）也算 `true`**——
+> 因為未設等於合法地採用預設 sqlite，不是設定錯誤。消費端不要把「未設」當成無效值處理。
+>
+> **這欄為什麼存在**：原本的告警條件是裸字串比對 `degraded || effective !== requested`，
+> 它在三種**完全健康**的設定下也會成立而誤報：未設（wrapper 匯出空字串）、`MySQL` 大小寫、
+> `'mysql '` 尾隨空白（`.env` 的 `grep|cut` 匯出常帶尾隨空白）。七格測試誤報三格。
+> 新條件 `degraded === true || requestedValid === false` 把兩個訊號分開——
+> `degraded` 是「要 mysql 卻退回 sqlite（探針失敗）」，`requestedValid` 是「這字串根本不認得
+> （打錯字，fail-safe 成 sqlite）」——實測七格 0 誤報，且仍抓得到 `mysq` 這種真打錯字。
+>
+> **部署狀態查證（2026-09-02 實測）**：程式碼已在工作區（`server.ts:1125`），但 live 服務
+> `GET /api/read-source` 回 **404**（同時 `/api/overview` 回 200，服務本身健康），常駐行程
+> 啟動時間早於 `server.ts` 最後修改時間 → 確認是「已實作、未部署」，不是故障。
+> 部署完成後再把本欄移進上方正式清單。
+
