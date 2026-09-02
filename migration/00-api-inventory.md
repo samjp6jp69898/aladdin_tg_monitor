@@ -113,6 +113,27 @@ app.get('/', c => c.html(Bun.file(new URL('./public/index.html', import.meta.url
 - 特殊行為：**非 SSE**，一次性回傳最多 `limit` 筆、依 `id DESC` 排序。前端要做「即時」效果需自行輪詢並用 `before_id`/`limit`分頁。
 - 服務分頁：即時序列（events）
 
+
+> **⚠️ 排序與分頁游標語意（2026-09-02 記載）——此處有一個已知的未來破壞性變更**
+> 同上：**前端無客戶端排序**，完全依賴後端回傳順序。
+>
+> - **排序**：`ts DESC, id DESC`（`lib/read/mysql.ts:457`/`:461`/`:496`）
+> - **分頁游標**：query 參數 `before_id`（數字），後端轉成 `e.id < ?`（`server.ts:174`、
+>   `lib/read/mysql.ts:590`）。**`id` 在此同時是排序鍵與游標。**
+>
+> **已知未來變更（尚未實作，切換 mysql 前必須完成）**：`mcp_usage` 與 status_log 有同型曝險
+> （`BACKFILL_TABLES` 含 `events`）。但**不能只改 `ORDER BY`**——排序改成 `(ts, id)` 而游標仍是
+> 單欄 `id`，會造成**跳頁與重複列**。正解是複合游標 `(ts, id)`，而**游標形狀屬於 API 契約**，
+> 所以那是一次真正的破壞性變更。
+>
+> **屆時前端要改的確切位置（已盤點）**：
+> 1. `frontend/src/api/types.ts:186-187` — `before_id?: number` 的型別與註解
+> 2. `frontend/src/pages/EventsPage.tsx:116-125` — 「載入更早」目前傳 `before_id: oldestId`，
+>    需改為同時帶 ts 與 id
+>
+> 時程：降為「切換前置」而非「回填前置」——`MON_READ_SOURCE=sqlite` 期間讀 sqlite 軌、顯示
+> 正確，錯序只在切到 mysql 後可見。
+
 ### GET /api/sessions — server.ts:182
 
 - Query：`days`（預設 7）、`service`（選填）、`identity`（選填）
@@ -143,6 +164,22 @@ app.get('/', c => c.html(Bun.file(new URL('./public/index.html', import.meta.url
 - 回傳：`{ rows: StatusLogRow[] }`，上限 200 筆，依 `id DESC`
   `StatusLogRow`（`lib/db.ts:38-46`）：`{ id, service, ts, status: 'up'|'down', pid: number|null, detail: string|null }`
 - 服務分頁：（推測）總覽的服務狀態變化歷史／服務詳情面板
+
+
+> **⚠️ 排序語意（2026-09-02 記載）+ 待部署變更**
+> **前端對回傳順序是有依賴的**：React 前端全域**沒有任何客戶端排序**（grep 確認 `src/` 內無
+> `.sort(`），一律照後端回傳順序渲染。**排序改變會直接改變畫面內容，即使欄位一個都沒變。**
+>
+> - **現行**：`ORDER BY id DESC`
+> - **待部署**：`ORDER BY ts DESC, id DESC`（`lib/read/mysql.ts:721`，未部署）
+> - **當下資料上是 no-op**（實測輸出逐位元組相同），差異只在 Phase 6 回填後顯現
+>
+> **為什麼要改**：`service_status_log.id` 是 `AUTO_INCREMENT`＝寫入順序而非事件時間順序，
+> 實測 695 列已有 16 處「id 較大但 ts 較早」。回填會把歷史列以更大的 id 寫入，於是最老的資料
+> 會被排到最前當成最新。`ORDER BY id` 是從 sqlite 繼承的假設——sqlite 側單一寫入者、事件當下
+> 寫入，`id 序 ≡ ts 序` 成立；搬到 mysql 後不再成立。**不是當初選錯，是假設隨環境失效。**
+> 同檔 events 查詢（`:457`/`:461`/`:496`）一直是 `ts DESC, id DESC`，此修法是讓 status_log
+> 跟上同檔既有慣例，不是引進新慣例。
 
 ### GET /api/pipelines — server.ts:300
 
