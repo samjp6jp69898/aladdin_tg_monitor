@@ -228,7 +228,9 @@
       <div class="card" style="margin-top:12px"><h3>目前指派在這台的票</h3><div class="scroll" id="wkd-tickets"></div></div>
       <div class="card" style="margin-top:12px"><h3>查詢任一票在這台的 GET /jobs/:ticket</h3>
         <div class="bar"><input id="wkd-ticket-input" placeholder="FAQ-1234 或 ALDREQ-1234" style="width:220px"><button class="btn" id="wkd-ticket-query">查詢</button></div>
-        <pre class="log" style="height:auto;max-height:30vh" id="wkd-ticket-result"></pre>
+        <div id="wkd-ticket-summary" class="mute" style="margin:8px 0"></div>
+        <div class="scroll" id="wkd-ticket-stages"></div>
+        <details style="margin-top:8px"><summary class="mute">原始回應</summary><pre class="log" style="height:auto;max-height:30vh" id="wkd-ticket-result"></pre></details>
       </div>
     </div>
   </section>
@@ -714,7 +716,14 @@ async function queryWorkerTicket(){
   const ticket = $('#wkd-ticket-input').value.trim()
   if (!ticket || !curWorkerName) return
   const d = await api('/api/cluster/worker?name='+encodeURIComponent(curWorkerName)+'&ticket='+encodeURIComponent(ticket))
+  const st = d.ticketStatus && d.ticketStatus.status
   $('#wkd-ticket-result').textContent = d.ticketStatus ? JSON.stringify(d.ticketStatus, null, 2) : '（查詢失敗：worker 連不上，或票號格式不對，或 CLUSTER_SHARED_SECRET 未設定）'
+  if (!st) { $('#wkd-ticket-summary').textContent = ''; $('#wkd-ticket-stages').innerHTML = ''; return }
+  $('#wkd-ticket-summary').innerHTML = `鎖：${st.locked?'<span class="pill ok">locked</span>':'<span class="pill">未鎖</span>'}　佇列狀態：${st.queueState?'<span class="pill warn">'+esc(st.queueState)+'</span>':'<span class="mute">-</span>'}`
+  const stages = st.stages || []
+  $('#wkd-ticket-stages').innerHTML = stages.length ? '<table><thead><tr><th>階段</th><th>狀態</th><th>時間</th></tr></thead><tbody>'+
+    stages.map(s=>`<tr${s.current?' class="stage-running"':''}><td>${esc(s.label)}</td><td>${s.done?(s.current?'<span class="pill warn">進行中</span>':'<span class="pill ok">done</span>'):'<span class="pill">pending</span>'}</td><td class="mono">${fmt(s.at)}</td></tr>`).join('')+
+    '</tbody></table>' : (st.locked ? '<div class="mute">已鎖但查無 stage 產物（可能剛起步）</div>' : '<div class="mute">未鎖：本機無此單活動</div>')
 }
 $('#wkd-ticket-query').onclick = queryWorkerTicket
 window.openWorkerTicket = async (name, ticket) => { curWorkerName = name; showTab('workers'); $('#wk-list-view').hidden=true; $('#wk-detail').hidden=false; await loadWorkerDetail(); $('#wkd-ticket-input').value = ticket; await queryWorkerTicket() }
@@ -770,9 +779,24 @@ window.unsetTgUser = async (email, name) => {
 
 // ---- tg-users：待處理（可手動指定技術人員）----
 let techUserOptions = []
+// 可搜尋的人員選擇：<input list> + 共用 <datalist>，瀏覽器原生依輸入文字過濾選項。
+// 選項文字固定為「姓名 <email>」，送出時由 resolveTechUserEmail 還原成 email。
+const techUserLabel = u => `${u.name} <${u.email}>${u.chat_id?'（現有 chat_id：'+u.chat_id+'）':''}`
 function techUserSelectHtml(chatId){
-  const opts = techUserOptions.map(u=>`<option value="${esc(u.email)}">${esc(u.name)}${u.chat_id?'（現有 chat_id：'+esc(u.chat_id)+'）':''}</option>`).join('')
-  return `<select id="tup-sel-${esc(chatId)}"><option value="">-- 選技術人員 --</option>${opts}</select> <button class="btn" onclick="assignTgUser('${esc(chatId)}')">指定</button>`
+  return `<input list="tup-techusers" id="tup-sel-${esc(chatId)}" placeholder="輸入姓名或 email 搜尋" style="min-width:260px" autocomplete="off"> <button class="btn" onclick="assignTgUser('${esc(chatId)}')">指定</button>`
+}
+function techUserDatalistHtml(){
+  return `<datalist id="tup-techusers">${techUserOptions.map(u=>`<option value="${esc(techUserLabel(u))}"></option>`).join('')}</datalist>`
+}
+// 輸入框內容 → email：先比完整選項文字，再比 email 全等，最後以姓名/email 子字串比對（僅唯一命中才採用）。
+function resolveTechUserEmail(text){
+  const t = text.trim(); if (!t) return { email:'' }
+  const exact = techUserOptions.find(u => techUserLabel(u) === t || u.email === t)
+  if (exact) return { email: exact.email }
+  const q = t.toLowerCase()
+  const hits = techUserOptions.filter(u => u.name.toLowerCase().includes(q) || u.email.toLowerCase().includes(q))
+  if (hits.length === 1) return { email: hits[0].email }
+  return { email:'', reason: hits.length ? `「${t}」符合 ${hits.length} 位技術人員，請從下拉清單選一位` : `找不到符合「${t}」的技術人員` }
 }
 // 輪詢重繪會清掉選到一半的下拉值：重繪前記下各列已選的值、重繪後還原；
 // 下拉正在操作（focus）時由 refresh loop 跳過該次刷新。
@@ -783,14 +807,14 @@ async function loadTgPending(){
   $('#tup-n').textContent = d.pending.length
   const prevSel = {}
   document.querySelectorAll('[id^="tup-sel-"]').forEach(s => { if (s.value) prevSel[s.id] = s.value })
-  $('#tup-list').innerHTML = d.pending.length ?'<table><tr><th>chat_id</th><th>first_name</th><th>username</th><th>最後訊息</th><th>指定技術人員</th></tr>'+d.pending.map(p=>`<tr><td class="mono">${esc(p.chat_id)}</td><td>${esc(p.first_name)}${p.last_name?' '+esc(p.last_name):''}</td><td class="mono">${p.username?'@'+esc(p.username):''}</td><td class="mono mute">${fmt(p.last_ts)} <span class="mute">${ago(p.last_ts)}</span></td><td>${techUserSelectHtml(p.chat_id)}</td></tr>`).join('')+'</table>' : '<div class="mute">目前沒有待處理的新 DM</div>'
+  $('#tup-list').innerHTML = d.pending.length ?'<table><tr><th>chat_id</th><th>first_name</th><th>username</th><th>最後訊息</th><th>指定技術人員</th></tr>'+d.pending.map(p=>`<tr><td class="mono">${esc(p.chat_id)}</td><td>${esc(p.first_name)}${p.last_name?' '+esc(p.last_name):''}</td><td class="mono">${p.username?'@'+esc(p.username):''}</td><td class="mono mute">${fmt(p.last_ts)} <span class="mute">${ago(p.last_ts)}</span></td><td>${techUserSelectHtml(p.chat_id)}</td></tr>`).join('')+'</table>'+techUserDatalistHtml() : '<div class="mute">目前沒有待處理的新 DM</div>'
   Object.entries(prevSel).forEach(([id, v]) => { const s = document.getElementById(id); if (s) s.value = v })
 }
 $('#tup-reload').onclick = loadTgPending
 window.assignTgUser = async (chatId, force) => {
   const sel = $(`#tup-sel-${chatId}`)
-  const email = sel ? sel.value : ''
-  if (!email) { alert('請先選一位技術人員'); return }
+  const { email, reason } = resolveTechUserEmail(sel ? sel.value : '')
+  if (!email) { alert(reason || '請先選一位技術人員'); return }
   const r = await fetch('/api/tg-users/assign', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ chat_id: chatId, email, force: !!force }) }).then(x=>x.json()).catch(e=>({ok:false, result:String(e)}))
   if (r.ok) { alert(`指定成功：${r.result}`); loadTgPending(); return }
   if (String(r.result).startsWith('SET_CONFLICT') && confirm(`${r.result}\n\n這位技術已經有不同的 chat_id，要覆蓋嗎？`)) { await assignTgUser(chatId, true); return }

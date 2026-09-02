@@ -83,7 +83,8 @@ const CLUSTER_TOKEN_HEADER = 'x-cluster-token'
 export type QueueStats = { limit: number; running: number; queued: number }
 export type CapacityReport = { worker: string; bug: QueueStats; demand: QueueStats; ticket?: { ticket: string; active: boolean } }
 export type WorkerHealth = { status: string; uptime_seconds: number }
-export type JobStatus = { locked: boolean; queueState: 'running' | 'queued' | null; progress: string | null }
+export type ProgressStage = { key: string; label: string; done: boolean; current: boolean; at: string | null }
+export type JobStatus = { locked: boolean; queueState: 'running' | 'queued' | null; progress: string | null; stages?: ProgressStage[] }
 
 /** 未帶認證（worker-agent.ts /health 比照 dispatcher 本體，不驗證）。 */
 export async function fetchWorkerHealth(url: string, timeoutMs = 2_500): Promise<WorkerHealth | null> {
