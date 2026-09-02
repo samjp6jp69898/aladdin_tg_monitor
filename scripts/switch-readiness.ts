@@ -72,6 +72,39 @@ const REPO = new URL('..', import.meta.url).pathname.replace(/\/$/, '')
 export const STARTED_AT_TOLERANCE_MS = 2000
 
 /**
+ * `agent_runs.cost_usd` 的兩軌比對。
+ *
+ * **為什麼兩軌本來就不相等**（讀過原始碼與實測，不是推測）：
+ *   - sqlite 的 `cost_usd` 是 `REAL`（`lib/db.ts:75`）＝ float64，值是把每則
+ *     訊息的成本**累加**出來的，於是帶浮點累積誤差：實測
+ *     `47.138961899999984`、`27.718337399999992`。
+ *   - 監控 DB 的 `cost_usd` 是 `DECIMAL(12,6)`（`003-agent-runs-payload.sql:19`），
+ *     寫入當下就被量化到小數第 6 位：`47.138962`、`27.718337`。
+ *
+ * 所以差異不是「雜訊」，是**已知且確定的量化**：mysql 值 ＝ round(sqlite 值, 6)。
+ * 實測兩筆皆 `Number(s.toFixed(6)) === m` 成立。
+ *
+ * **為什麼用正規化而不是容差**（這是刻意的選擇，不要改成 epsilon）：
+ *   1. 機制已知就不該用容差。容差是在「不知道差多少才算對」時的退路；這裡
+ *      知道確切的變換，直接套用同一個變換再比是**精確**的，不放寬任何窗口。
+ *   2. `1e-6` 這個數字是錯的。`DECIMAL(12,6)` 的量化誤差上界是半個量子
+ *      ＝ `5e-7`，`1e-6` 是它的兩倍；而且 `1e-6` 正好是該欄**能表示的最小差**，
+ *      拿它當容差等於把「真的差一個最小單位」的情況一起吞掉。
+ *   3. 邊界誠實說明：`toFixed` 與 MySQL 的 half-up 在「剛好落在半個量子」時
+ *      理論上可能取不同方向。float64 累加值精確落在該邊界屬測度零事件，且
+ *      **萬一發生是判 FAIL（偏保守）而不是誤判為相等**，方向安全、且會被歸因看見。
+ *
+ * null 語意不放寬：一邊 null 一邊有值 → 不相等（那是真缺口，不是捨入）。
+ */
+export function costUsdEqual(sqliteVal: unknown, mysqlVal: unknown): boolean {
+  const s = sqliteVal === null || sqliteVal === undefined ? null : Number(sqliteVal)
+  const m = mysqlVal === null || mysqlVal === undefined ? null : Number(mysqlVal)
+  if (s === null || m === null) return s === m
+  if (!Number.isFinite(s) || !Number.isFinite(m)) return false
+  return Number(s.toFixed(6)) === Number(m.toFixed(6))
+}
+
+/**
  * 寫入端的已知缺口清單（D 組）。每一項補齊之前都判 FAIL——
  * 這些欄位一旦切過去就是畫面上真的看不到的東西，不是可以「之後再說」的。
  */
@@ -274,9 +307,13 @@ let observedMaxDelta = Number.NEGATIVE_INFINITY
     if (!o) continue
     for (const col of Object.keys(r)) {
       if (IGNORE.has(col)) continue
-      if (JSON.stringify((r as any)[col] ?? null) !== JSON.stringify((o as any)[col] ?? null)) {
-        diffs.push(`${r.path.split('/').pop()}.${col}`)
-      }
+      // cost_usd 走 DECIMAL(12,6) 正規化：兩軌型別不同（sqlite REAL vs
+      // mysql DECIMAL），逐字比會把已知的量化差報成資料不一致（實測假陽性）。
+      const equal =
+        col === 'cost_usd'
+          ? costUsdEqual((r as any)[col], (o as any)[col])
+          : JSON.stringify((r as any)[col] ?? null) === JSON.stringify((o as any)[col] ?? null)
+      if (!equal) diffs.push(`${r.path.split('/').pop()}.${col}`)
     }
   }
   judge(diffs.length === 0, 'C6 agent_runs 逐欄相等（file_mtime 不比：collector 私有游標，刻意不進權威表）',
