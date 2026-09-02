@@ -466,10 +466,10 @@ app.get('/', c => c.html(Bun.file(new URL('./public/index.html', import.meta.url
 
 不是 API，是 React 前端的靜態檔案服務；列在此處是為了讓本檔涵蓋 server.ts 的全部 36 條路由。
 
-### GET /next
+### GET /next — server.ts:64
 302 導向 `/next/`（補斜線），讓少打一個斜線也能進站。
 
-### GET /next/*
+### GET /next/* — server.ts:65
 服務 `frontend/dist` 的 build 產物。
 - 路徑正規化後必須仍在 `frontend/dist` 底下，否則回 404（目錄穿越防護）
 - 檔案不存在時回退 `index.html`（SPA fallback；hash routing 其實走不到，保險用）
@@ -483,7 +483,7 @@ app.get('/', c => c.html(Bun.file(new URL('./public/index.html', import.meta.url
 
 ## SSE 端點（2026-09-02 Phase 8 新增）
 
-### GET /api/stream
+### GET /api/stream — server.ts:905
 
 單一串流端點，取代前端對 overview / pipelines / toolsmith / log 跟隨這四類的定期輪詢。
 **契約與前端已定案**（`frontend/src/api/transport.ts:9,173,194`）：`event: <topic>`，`data` 是該 topic
@@ -542,7 +542,7 @@ app.get('/', c => c.html(Bun.file(new URL('./public/index.html', import.meta.url
 
 ---
 
-## GET /api/read-source（2026-09-02 Phase 8 新增）
+## GET /api/read-source — server.ts:1094（2026-09-02 Phase 8 新增）
 
 讀取面實際生效的資料源。存在的理由：`MON_READ_SOURCE=mysql` 但啟動探針失敗時，
 tg-monitor 會**退回 sqlite 並繼續服務**（見 `lib/read/index.ts`：plist 是
