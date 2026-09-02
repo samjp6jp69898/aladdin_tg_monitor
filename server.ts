@@ -43,6 +43,21 @@ const app = new Hono()
 
 app.get('/', c => c.html(Bun.file(new URL('./public/index.html', import.meta.url).pathname).text()))
 
+// 新版 React 前端（frontend/）的 build 產物掛在 /next/ 底下，與舊版 public/index.html
+// 並存，方便新舊對照驗收；舊版路徑與所有既有 API 端點行為完全不變。
+const NEXT_DIST = new URL('./frontend/dist/', import.meta.url).pathname
+app.get('/next', c => c.redirect('/next/'))
+app.get('/next/*', async c => {
+  const rel = decodeURIComponent(c.req.path.slice('/next/'.length))
+  const target = rel === '' ? join(NEXT_DIST, 'index.html') : join(NEXT_DIST, rel)
+  if (!target.startsWith(NEXT_DIST)) return c.text('not found', 404)
+  const file = Bun.file(target)
+  if (await file.exists()) return new Response(file)
+  const index = Bun.file(join(NEXT_DIST, 'index.html'))
+  if (await index.exists()) return new Response(index)
+  return c.text('新前端尚未 build：cd frontend && bun run build', 404)
+})
+
 // ---------- 總覽 ----------
 const activeUsersStmt = db.prepare(`
   SELECT identity, COUNT(*) AS n, MAX(ts) AS last_ts, MIN(ts) AS first_ts,
@@ -784,8 +799,11 @@ app.get('/api/log/tail', c => {
   return c.json(tailFile(path, kb * 1024))
 })
 
-// 即時跟隨：客戶端帶上次看到的 offset 來拿新增部分（輪詢，不用 SSE——Bun 1.2.9 的
-// ReadableStream 在客戶端中斷連線時會 segfault，實測踩到）。
+// 即時跟隨：客戶端帶上次看到的 offset 來拿新增部分。輪詢是當年 Bun 1.2.9 的
+// ReadableStream 客戶端斷線 segfault 逼出來的；2026-09-02 於 Bun 1.4.0 以最小
+// repro（多條 SSE 連線硬斷 + cancel callback）實測已修復，SSE 不再是禁區——
+// 但「handler 內同步 spawn 遇斷線 segfault」是另一個踩坑（見 lib/ingest.ts
+// 檔頭），未隨之解除，SSE handler 內仍禁 *Sync spawn。
 app.get('/api/log/since', c => {
   const path = c.req.query('path') ?? ''
   if (!isAllowedLogPath(path)) return c.text('path not allowed', 403)
