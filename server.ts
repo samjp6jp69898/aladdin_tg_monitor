@@ -16,6 +16,7 @@ import { SERVICES, DISPATCHER_LOG_DIR, isAllowedLogPath, isAllowedTracePath, res
 import { getReader, initReader } from './lib/read/index.ts'
 import { resolveReadSource } from './lib/read/source.ts'
 import type { AgentRunRow } from './lib/read/types.ts'
+import { decodeEventsCursor, encodeEventsCursor } from './lib/events-cursor.ts'
 import { startCollectors, getLastProbes, listRunningPipelineProcs, listBugLocks, loadRoster, cancelPipeline, summarizeEvents, computeBugStages, readTrackerStatusAsync, isBugOutcomeRetryable, parseClaudeEvents, getReviewRoundCounts } from './lib/ingest.ts'
 import { loadConnectedUsers, loadPendingSenders, loadAllTechUsers, assignChatId, unsetChatId, sendTestMessage } from './lib/tg-users.ts'
 import { getWebhookStatus } from './lib/webhook-status.ts'
@@ -157,6 +158,20 @@ app.post('/api/services/restart', async c => {
 // ---------- 事件序列 / 歷史 ----------
 app.get('/api/events', async c => {
   const q = c.req.query()
+
+  // 分頁游標（a7-D46）。`cursor` 是 opaque 字串；`before_id` 是 deprecated 的舊參數，
+  // 保留一個發版週期——前後端同 repo 同次 kickstart 一起上，沒有版本錯配窗口，
+  // **除了瀏覽器裡開著的舊分頁**，而這是一個會被開著好幾天的監控面板。
+  let cursorFilter: { beforeId?: number; beforeTs?: string } = {}
+  if (q.cursor) {
+    const cur = decodeEventsCursor(q.cursor)
+    // 解不開就 400，不靜默當成第一頁：靜默會讓分頁的客戶端看起來「跳回最上面」
+    // 甚至無限繞圈，而那種失敗沒有人會發現。
+    if (!cur) return c.json({ error: 'invalid cursor' }, 400)
+    cursorFilter = { beforeTs: cur.ts, beforeId: cur.id }
+  } else if (q.before_id) {
+    cursorFilter = { beforeId: Number(q.before_id) }
+  }
   const limit = Math.min(Number(q.limit ?? 200), 1000)
   const rows = await getReader().queryEvents({
     service: q.service,
@@ -171,10 +186,17 @@ app.get('/api/events', async c => {
     // 設計 tool 欄固定 null，屬預期行為而非漏記，這裡只是給前端一個濾掉它們的開關）
     toolOnly: q.toolOnly === '1',
     q: q.q,
-    beforeId: q.before_id ? Number(q.before_id) : undefined,
+    ...cursorFilter,
     limit,
   })
-  return c.json({ rows, limit })
+  // next_cursor（a7-D46）：客戶端不得自行構造游標（opaque），所以「下一頁從哪裡開始」
+  // 必須由伺服器給。`null` ＝ 沒有更早的資料了——這個訊號同時解掉既有缺陷
+  // 「0 筆時前端不更新 oldestId，之後『載入更早』永遠 0 筆且沒有已到底提示」。
+  // 判準用 `rows.length < limit`：剛好整頁時仍給游標，客戶端會多發一次拿到 0 筆、
+  // 那一次回 null 而終止。多一次請求換「不會漏資料」，這個取捨是刻意的。
+  const last = rows[rows.length - 1] as any
+  const nextCursor = rows.length < limit || !last ? null : encodeEventsCursor({ ts: last.ts, id: last.id })
+  return c.json({ rows, limit, next_cursor: nextCursor })
 })
 
 // 「序列」：把同一人在同一服務上的連續請求（間隔 < SESSION_GAP_MIN）串成一段 session，

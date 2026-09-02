@@ -150,6 +150,13 @@ export interface EventsFilter {
   toolOnly: boolean
   q?: string
   beforeId?: number
+  /**
+   * 游標的 `ts` 分量（a7-D46）。**只有 mysql 軌使用**，配合 `beforeId` 做
+   * row-value 比較 `(ts, id) < (beforeTs, beforeId)`；sqlite 軌刻意忽略它，
+   * 沿用既有的 `id < ?`，好讓 `lib/read/sqlite.ts` 的 SQL 逐位元不變
+   * （那是 `MON_READ_SOURCE=sqlite` 這唯一回滾槓桿的可信度來源）。
+   */
+  beforeTs?: string
   limit: number
 }
 

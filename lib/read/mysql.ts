@@ -587,7 +587,20 @@ export const mysqlReader: MonitorReader = {
       const like = `%${f.q}%`
       params.push(like, like, like, like, like)
     }
-    if (f.beforeId !== undefined) { where.push('e.id < ?'); params.push(f.beforeId) }
+    // 分頁游標（a7-D46）。排序是 `ts DESC, id DESC`，所以游標也必須是 (ts, id)
+    // 的 row-value 比較——只比 id 會在 id 序 ≠ ts 序時跳頁與重複列，而
+    // `mcp_usage` 經 spool 寫入、Phase 6 回填更會把歷史事件以更大的 id 寫進來，
+    // id 序 ≠ ts 序正是常態。
+    if (f.beforeTs !== undefined && f.beforeId !== undefined) {
+      where.push('(e.ts, e.id) < (?, ?)')
+      params.push(isoToMysqlDatetime3(f.beforeTs), f.beforeId)
+    } else if (f.beforeId !== undefined) {
+      // deprecated 的 `before_id`（保留一個發版週期，給瀏覽器裡開著的舊分頁）。
+      // **不沿用舊語意**——舊語意（純 id 比較）正是錯的東西；這裡把 id 翻譯成
+      // 該列的 (ts, id) 再走同一條 row-value 路徑，語意與新游標完全一致。
+      where.push('(e.ts, e.id) < ((SELECT ts FROM mcp_usage WHERE id = ?), ?)')
+      params.push(f.beforeId, f.beforeId)
+    }
     // LIMIT 片段要在下 SQL 之前算好：limit 是 NaN 時 limitClause 會丟錯，
     // 那是刻意對齊 sqlite 的行為（見該函式註解），不能吞掉。
     const limitFrag = limitClause(f.limit)
@@ -600,7 +613,7 @@ export const mysqlReader: MonitorReader = {
               ${jnum('e', 'durationMs')} AS duration_ms, ${jstr('e', 'reason')} AS reason
          FROM mcp_usage e
         ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
-        ORDER BY e.id DESC${limitFrag}`,
+        ORDER BY e.ts DESC, e.id DESC${limitFrag}`,
       params,
     )
     return rows.map(r => ({
