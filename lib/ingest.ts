@@ -24,6 +24,8 @@ import {
   resolveRunIdLocalOnly,
   writeCancelFlag,
   appendCancelFlagToSpool,
+  appendStatusLogToSpool,
+  isoToMysqlDatetime3,
   readActiveMarker,
   deriveLegacyKey,
   RUNS_HOST,
@@ -1078,6 +1080,38 @@ function lsofPids(): Map<number, number> {
   return map
 }
 
+/** service_status_log 落地：粒度比照 sqlite 既有語意（recordStatusIfChanged
+ * 只在狀態翻轉時寫一筆，第一次觀測也算翻轉）——呼叫端傳入
+ * recordStatusIfChanged 的回傳值，兩邊落地與否完全同步，不重新定義一套
+ * 「有沒有變化」的判準。詳見 phase4-taskB-report.md 的粒度裁定與依據。
+ * 表沒有 pid/latencyMs/uptimeSeconds 欄，比照 sqlite 的 status_log（只存
+ * service/host/ts/status/detail），把 pid 與 detail 一併塞進 detail_json，
+ * latency/uptime 兩者 sqlite 本來就不存，本函式同樣不存。 */
+export function appendServiceStatusIfChanged(
+  changed: boolean,
+  id: string,
+  status: 'up' | 'down',
+  pid: number | null,
+  detail: string | null,
+  checkedAt: string,
+  /** 測試用覆寫 spool 目錄；正式路徑不傳，落在 mon-db.ts 的 SPOOL_DIR。 */
+  spoolDir?: string,
+): void {
+  if (!changed || !isMonitorDbEnabled()) return
+  try {
+    appendStatusLogToSpool(
+      {
+        table: 'service_status_log',
+        columns: ['service', 'host', 'ts', 'status', 'detail_json'],
+        values: [id, RUNS_HOST, isoToMysqlDatetime3(checkedAt), status, JSON.stringify({ pid, detail })],
+      },
+      spoolDir,
+    )
+  } catch (err) {
+    console.error(`mon-db: service_status_log spool 寫入失敗（service=${id}）: ${err}`)
+  }
+}
+
 async function probeOne(s: ServiceDef, pid: number | null): Promise<ProbeResult> {
   const t0 = performance.now()
   let status: 'up' | 'down' = 'down'
@@ -1110,7 +1144,8 @@ async function probeOne(s: ServiceDef, pid: number | null): Promise<ProbeResult>
     detail,
     checkedAt: new Date().toISOString(),
   }
-  recordStatusIfChanged(s.id, status, pid, detail)
+  const changed = recordStatusIfChanged(s.id, status, pid, detail)
+  appendServiceStatusIfChanged(changed, s.id, status, pid, detail, res.checkedAt)
   lastProbe.set(s.id, res)
   return res
 }

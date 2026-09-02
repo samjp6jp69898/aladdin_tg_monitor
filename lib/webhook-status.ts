@@ -6,6 +6,7 @@
 // 沒有那麼即時的必要，快取避免對 Telegram API 灌爆。
 
 import { readFileSync } from 'node:fs'
+import { isMonitorDbEnabled, appendStatusLogToSpool, isoToMysqlDatetime3 } from './mon-db.ts'
 
 // TG_DISPATCH_BOT_TOKEN 唯一來源（2026-09-01 起，根目錄 .env 已退役）。
 const ENV_FILE = '/Users/user/aladdin/telegram-dispatcher/.env'
@@ -37,7 +38,56 @@ function readBotToken(): string | null {
 
 let cache: WebhookStatus | null = null
 
+/** tg_webhook_status_log 落地（新——webhook 探測本來就沒有 sqlite 先例）。
+ * 粒度裁定：比照 lib/db.ts 的 recordStatusIfChanged（service probe 既有語意）
+ * ——只在 up/down 翻轉時落一筆，第一次觀測也算翻轉；理由見
+ * phase4-taskB-report.md 的粒度裁定與依據。 */
+let lastWrittenWebhookStatus: 'up' | 'down' | null = null
+
+/** 測試專用：重置「上次落地狀態」，避免跨測試互相污染（同一個 bun test
+ * process 內模組級狀態共用）。 */
+export function __resetWebhookStatusTrackerForTest(): void {
+  lastWrittenWebhookStatus = null
+}
+
+export function recordWebhookStatusIfChanged(s: WebhookStatus, spoolDir?: string): void {
+  if (!isMonitorDbEnabled()) return
+  const status: 'up' | 'down' = s.ok ? 'up' : 'down'
+  if (lastWrittenWebhookStatus === status) return
+  lastWrittenWebhookStatus = status
+  try {
+    appendStatusLogToSpool(
+      {
+        table: 'tg_webhook_status_log',
+        columns: ['ts', 'status', 'detail_json'],
+        values: [
+          isoToMysqlDatetime3(s.checkedAt),
+          status,
+          JSON.stringify({
+            url: s.url,
+            pendingUpdateCount: s.pendingUpdateCount,
+            lastErrorDate: s.lastErrorDate,
+            lastErrorMessage: s.lastErrorMessage,
+            ipAddress: s.ipAddress,
+            maxConnections: s.maxConnections,
+            error: s.error,
+          }),
+        ],
+      },
+      spoolDir,
+    )
+  } catch (err) {
+    console.error(`mon-db: tg_webhook_status_log spool 寫入失敗: ${err}`)
+  }
+}
+
 async function fetchFresh(): Promise<WebhookStatus> {
+  const result = await fetchFreshRaw()
+  recordWebhookStatusIfChanged(result)
+  return result
+}
+
+async function fetchFreshRaw(): Promise<WebhookStatus> {
   const checkedAt = new Date().toISOString()
   const token = readBotToken()
   if (!token) return { ok: false, url: null, pendingUpdateCount: null, lastErrorDate: null, lastErrorMessage: null, ipAddress: null, maxConnections: null, error: 'TG_DISPATCH_BOT_TOKEN 讀不到', checkedAt }

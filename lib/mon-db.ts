@@ -438,6 +438,67 @@ export function appendCancelFlagToSpool(args: CancelSpoolEntryArgs, dir: string 
   fsyncSync(fd) // 每次 append 後 fsync（cancel 是低頻路徑，不受 §6.5(a2) 批次 fsync 的熱路徑考量約束）。
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// 狀態探測落地（service probe / webhook probe → *_status_log，Phase 4 工作包
+// B 新增）。與 appendCancelFlagToSpool 共用同一份 spool fd/seq（同一個 writer
+// 身分 'tg-monitor'，一個行程一個檔——fn 欄位區分條目種類）。
+//
+// run_id 信封欄位：這兩張表（service_status_log / tg_webhook_status_log）
+// 在資料模型上不對應任何一次 pipeline run（見
+// telegram-dispatcher/deploy/monitor-db/migrations/001-init.sql 的欄位定義，
+// 兩表都沒有 run_id 欄）。原始 SpoolEntry.run_id 型別非空、writer.ts 對空字串
+// 硬性 throw（MJ-G2），無法比照 cancel 旗標塞入真實 run_id。
+// 總指揮裁定（errata，已記錄，不在本檔重複）：SpoolEntry.run_id 契約放寬為
+// `string | null`——fn 目標為 runs/agent_runs 者仍必須非空（MJ-G2 原意不變），
+// fn ∈ {insertStatusLogRow, upsertMonitorHeartbeat, upsertFileOffset,
+// insertMcpUsage, insertTgUnknownSender} 允許 run_id 為 null（列身分本在
+// args 內，不靠信封層的 run_id）。本函式對應的 fn 恆為
+// 'insertStatusLogRow'，故 run_id 一律顯式寫 null——不是省略欄位，是保持
+// SpoolEntry 形狀完整、值為 null。
+// ─────────────────────────────────────────────────────────────────────────
+
+/** tg-monitor 這一側只寫這兩張表（worker_status_log 屬於 cluster-head/worker
+ * 探測，不在本工作包範圍內，見 plan-db-as-truth-v3.md §11.1）。 */
+export const STATUS_LOG_TABLES = ['service_status_log', 'tg_webhook_status_log'] as const
+export type StatusLogTable = (typeof STATUS_LOG_TABLES)[number]
+
+export interface StatusLogSpoolEntryArgs {
+  table: StatusLogTable
+  /** 欄位名，不含 id（auto_increment）。呼叫端負責與實際表結構對齊
+   * （見 001-init.sql）；本函式只把白名單之外的表名擋下。 */
+  columns: string[]
+  /** 與 columns 一一對應的值。時間欄一律由呼叫端先轉成絕對值（
+   * isoToMysqlDatetime3），不得是相對時間或執行時求值的表達式（§6.5(a) 硬
+   * 規則）。 */
+  values: unknown[]
+}
+
+/**
+ * append 一列 *_status_log 進 spool，交給 head 上的重放者（
+ * telegram-dispatcher/server.ts）以 insertStatusLogRow 落庫。
+ * args 的形狀比照 telegram-dispatcher/lib/monitor-db/apply-entry.ts 的
+ * packStatusLogArgs 慣例：`[[table, columns, values]]`（三個位置參數包成一個
+ * tuple）。
+ */
+export function appendStatusLogToSpool(args: StatusLogSpoolEntryArgs, dir: string = SPOOL_DIR): void {
+  if (!STATUS_LOG_TABLES.includes(args.table)) {
+    throw new Error(`appendStatusLogToSpool: 不在白名單內的表名：${args.table}`)
+  }
+  const { fd } = getSpoolFd(dir)
+  spoolSeq += 1
+  const record = {
+    seq: spoolSeq,
+    ts: new Date().toISOString(),
+    host: RUNS_HOST,
+    run_id: null,
+    fn: 'insertStatusLogRow',
+    args: [[args.table, args.columns, args.values]],
+  }
+  const payload = `${JSON.stringify(record)}\n`
+  writeSync(fd, payload)
+  fsyncSync(fd) // 低頻路徑（探測 tick），不受 §6.5(a2) 批次 fsync 的熱路徑考量約束，比照 appendCancelFlagToSpool 逐次 fsync。
+}
+
 /** 測試 / 行程結束時關閉 spool fd（正式路徑不需要主動呼叫，行程結束時 OS 會回收）。 */
 export function closeSpoolForTest(): void {
   if (spoolFd !== null) {
