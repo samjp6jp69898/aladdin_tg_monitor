@@ -15,3 +15,11 @@
 
 ## 基準採集時間
 舊版基準圖採集於 2026-09-02，來源 commit：見 `git log -1`（工作區當時另有未提交的 lib/ 與 public/index.html 修改）。
+
+## 2026-09-02 更新：舊版已刪除
+
+`public/index.html` 經使用者核准刪除，根路徑 `/` 改為 302 導向 `/next/`。因此：
+- `shot.ts` 已改為只截新版一側（`old` 側不再存在）
+- 改版期間的新舊對照基準圖保留在本機 `shots/`、`shots-v2/`、`shots-v3/`（gitignore，未進 repo）
+- 需要對照舊版原始碼時：`git show 624ae25:public/index.html`
+- 上面「已知的無害 console error」那條是**舊版**截圖時的量測產物，舊版已不存在，該條僅供歷史參考

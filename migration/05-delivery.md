@@ -7,10 +7,15 @@
 
 | | 網址 |
 |---|---|
-| 舊版（vanilla JS，原封不動） | http://127.0.0.1:8799/ |
-| **新版（React）** | **http://127.0.0.1:8799/next/** |
+| **前端（React）** | **http://127.0.0.1:8799/next/** |
+| 根路徑 `/` | 302 導向 `/next/`（舊書籤仍可用） |
 
-兩版並存，共用同一組後端 API。服務由 launchd 常駐（`com.aladdin.tg-monitor`）。
+**2026-09-02：舊版 `public/index.html` 已經使用者核准刪除**，React 版成為唯一前端。
+舊版最後狀態可從 git 取回：`git show 624ae25:public/index.html`。
+本文件與 `tabs/*.md`、各 review 報告中對 `public/index.html` 的引用屬**歷史記錄**（規格即由該檔逐行拆解而來），
+刻意保留不改寫，需要對照時用上面的 git 指令取出原檔。
+
+服務由 launchd 常駐（`com.aladdin.tg-monitor`）。
 新版改動後要重新 build：`cd frontend && bun run build`（server 每次請求直接讀 `frontend/dist`，不必重啟服務）。
 開發模式：`cd frontend && bun run dev`（port 8798，`/api` 自動 proxy 到 8799）。
 
@@ -108,11 +113,12 @@ frontend/
 
 ## 七、日常使用
 
-**日常只需開 http://127.0.0.1:8799/next/**（新版），功能完整、不依賴舊版。
+**日常只需開 http://127.0.0.1:8799/next/**；根路徑 `/` 會 302 導向過去，舊書籤不會壞。
 已 grep 確認全 repo（telegram-dispatcher / aladdin_ai / tg-monitor）**沒有任何通知或腳本會產生指向舊版
 UI 的連結**（唯一命中是 `server.ts:4` 的註解），所以不會發生「從別處跳轉又回到舊版」的情形。
 
-舊版 `/` 保留作為對照用途。**它的刪除必須由使用者明確指示後才執行**，在那之前一律保留。
+舊版已於 2026-09-02 依使用者指示刪除；刪除前確認過工作區乾淨（無他人未提交改動會被毀），
+刪除後全 11 條 route 實跑回歸、0 console error。
 
 維護提醒：改動 `frontend/` 底下的程式碼後要 `cd frontend && bun run build`（server 每次請求直讀
 `frontend/dist`，不必重啟服務）。純瀏覽不需要任何額外動作。

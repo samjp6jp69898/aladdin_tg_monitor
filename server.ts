@@ -41,7 +41,11 @@ console.error(`tg-monitor: pipeline 併發上限 bug=${PIPELINE_LIMITS.bug} dema
 
 const app = new Hono()
 
-app.get('/', c => c.html(Bun.file(new URL('./public/index.html', import.meta.url).pathname).text()))
+// 舊版 vanilla JS 前端（public/index.html）已於 2026-09-02 經使用者核准刪除，React 版
+// 成為唯一前端。根路徑導向 /next/，讓既有書籤與手感仍可用（React 版的 build base 是
+// '/next/'，資產路徑都帶這個前綴，所以維持該路徑而非搬到根目錄）。
+// 舊版最後狀態可從 git 取回：git show 624ae25:public/index.html
+app.get('/', c => c.redirect('/next/'))
 
 // 新版 React 前端（frontend/）的 build 產物掛在 /next/ 底下，與舊版 public/index.html
 // 並存，方便新舊對照驗收；舊版路徑與所有既有 API 端點行為完全不變。

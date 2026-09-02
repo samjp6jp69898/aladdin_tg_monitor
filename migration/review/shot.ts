@@ -1,6 +1,5 @@
 // 新舊前端逐分頁截圖比對工具（給 review agent 用）
 //   bun run migration/review/shot.ts            → 兩版都截
-//   bun run migration/review/shot.ts old|new    → 只截一版
 // 產物：migration/review/shots/<old|new>-<route>.png
 import { chromium } from '/Users/user/aladdin/cqa-e2e/node_modules/playwright/index.js'
 
@@ -10,7 +9,10 @@ const ROUTES = [
   'pipelines', 'toolsmith', 'workers', 'logs',
 ]
 const BASE = 'http://127.0.0.1:8799'
-const SIDES: Record<string, string> = { old: `${BASE}/`, new: `${BASE}/next/` }
+// 舊版 public/index.html 已於 2026-09-02 經使用者核准刪除（根路徑改導向 /next/），
+// 所以這裡只剩新版一側。改版期間的新舊對照基準圖保留在 shots-v3/（本機，未進 repo），
+// 舊版最後狀態可從 git 取回：git show 624ae25:public/index.html
+const SIDES: Record<string, string> = { new: `${BASE}/next/` }
 
 const only = process.argv[2]
 const sides = only ? { [only]: SIDES[only]! } : SIDES
