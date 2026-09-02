@@ -105,6 +105,42 @@ export function costUsdEqual(sqliteVal: unknown, mysqlVal: unknown): boolean {
 }
 
 /**
+ * 列表回傳順序必須是嚴格的「時間新→舊」：`ts DESC`，同 `ts` 以 `id DESC` 破平手。
+ *
+ * **為什麼要單軌自檢，而不是拿兩軌比**（a7-D46）：
+ *   - 兩軌的 `id` 是各自獨立的 AUTO_INCREMENT，逐列比對會因為**合法的**插入順序
+ *     差異而紅（sqlite 側實測有 333 處相鄰對違反 ts 遞減，那不是 bug，是它的
+ *     攝取順序）。所以「跟另一軌一樣」不是正確性的定義。
+ *   - 正確性的定義是**這一軌自己對不對**：監控畫面的事件列表語意就是「最新在
+ *     最上面」，那是使用者預期，與另一軌無關。
+ *   - 附帶好處：這個判準**不依賴 sqlite**，Phase 9 退役 sqlite collector 之後
+ *     仍然有效——正是 a7-D38 核定的單軌自洽方向。
+ *
+ * **為什麼需要它**：`queryEvents` 的 `ORDER BY e.id DESC`（lib/read/mysql.ts）
+ * 假設 `id` 序 ≡ ts 序。`mcp_usage` 經 spool 寫入，該假設不成立；Phase 6 回填
+ * 把歷史事件以更大的 id 寫進來之後會更嚴重。實測 mysql 側第一筆比內容上最新
+ * 的那筆舊了約 19 小時，而 C1（`setEqual` 建 Set）對順序完全不敏感、判綠。
+ *
+ * 回傳違規的相鄰對描述（空陣列 ＝ 順序正確）。
+ */
+export function findOrderViolations(rows: { ts: string; id?: number }[]): string[] {
+  const out: string[] = []
+  for (let i = 1; i < rows.length; i++) {
+    const prev = rows[i - 1]
+    const cur = rows[i]
+    const tp = Date.parse(prev.ts)
+    const tc = Date.parse(cur.ts)
+    if (Number.isNaN(tp) || Number.isNaN(tc)) { out.push(`[${i}] ts 無法解析：${prev.ts} → ${cur.ts}`); continue }
+    if (tc > tp) { out.push(`[${i}] ts 遞增：${prev.ts} → ${cur.ts}`); continue }
+    // 同 ts 時要求 id 遞減（穩定破平手）；id 缺席就不判這一格。
+    if (tc === tp && prev.id !== undefined && cur.id !== undefined && cur.id > prev.id) {
+      out.push(`[${i}] 同 ts(${cur.ts}) 但 id 遞增：${prev.id} → ${cur.id}`)
+    }
+  }
+  return out
+}
+
+/**
  * 寫入端的已知缺口清單（D 組）。每一項補齊之前都判 FAIL——
  * 這些欄位一旦切過去就是畫面上真的看不到的東西，不是可以「之後再說」的。
  */
@@ -217,6 +253,22 @@ for (const q of ['admin', 'Admin', 'ADMIN']) {
   const f = { q, errorsOnly: false, toolOnly: false, limit: FULL } as any
   const [a, b] = [await sqliteReader.queryEvents(f), await mysqlReader.queryEvents(f)]
   judge(a.length === b.length, `C1b events?q=${q} 筆數一致`, `sqlite=${a.length} mysql=${b.length}`)
+}
+
+// C1c events 回傳順序自洽（單軌：mysql 軌自己必須是嚴格 ts DESC, id DESC）
+// C1 是集合比對（setEqual 建 Set），對順序與重複列都不敏感——這一格補的正是它。
+{
+  const f = { errorsOnly: false, toolOnly: false, limit: FULL } as any
+  const mrows = await mysqlReader.queryEvents(f)
+  const bad = findOrderViolations(mrows as any)
+  // sqlite 側只印不判：它是要退役的那一軌，且其亂序不擋切換（a7-D46）。
+  const srows = await sqliteReader.queryEvents(f)
+  const sBad = findOrderViolations(srows as any)
+  judge(bad.length === 0,
+    'C1c /api/events 的 mysql 軌回傳順序是嚴格 ts DESC, id DESC',
+    (bad.length
+      ? `違規相鄰對 ${bad.length} 處（例：${bad.slice(0, 2).join('; ')}）｜第一筆 ts=${(mrows[0] as any)?.ts}`
+      : '') + `｜參考：sqlite 軌 ${sBad.length} 處（不判，該軌待退役）`)
 }
 
 // C2 sessions：順序也要一致（session 串接吃順序）
