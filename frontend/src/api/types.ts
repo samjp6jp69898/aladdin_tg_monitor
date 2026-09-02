@@ -342,6 +342,10 @@ export interface BugStage {
   started_at: string | null
   finished_at: string | null
   detail?: string | null
+  /** 審查輪數。掛在 `review`（Step 6 三重平行審查）與 `final-review`（Step 6.5）兩筆上，
+   *  `status` 變成 done/reused 後仍保留，供 run 結束後回頭查詢；0 或無資料時欄位缺席。
+   *  與 `detail` 是兩回事：`detail` 只描述「當前正在跑的是誰」，run 結束就沒了。 */
+  rounds?: number
 }
 
 export interface DemandProgressEntry {

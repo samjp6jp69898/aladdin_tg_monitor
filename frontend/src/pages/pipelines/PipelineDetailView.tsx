@@ -66,6 +66,13 @@ export function PipelineDetailView({ runKey }: { runKey: string }) {
       render: s => (
         <>
           {s.label}
+          {/* 審查輪數：後端持久化欄位，run 結束後仍在，所以放在 detail 前面—— */}
+          {/* detail 只在階段執行中出現，兩者可能同時顯示（如「第 2 輪的第 3 位 reviewer 正在跑」）。 */}
+          {/* 後端尚未提供該欄位時整段不渲染，畫面與現況完全相同。 */}
+          {/* 全形括號自帶字身空隙，前面不補半形空格（detail 用的是半形括號才需要） */}
+          {typeof s.rounds === 'number' && s.rounds > 0 && (
+            <span className="mute">（共 {s.rounds} 輪）</span>
+          )}
           {s.detail && (
             <>
               {' '}
