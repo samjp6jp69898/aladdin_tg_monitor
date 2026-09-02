@@ -234,19 +234,34 @@ function placeholders(n: number): string {
  * mysql 模式的 `/api/status-log` 會多出一堆「不是翻轉」的列，`lastStatusChange`
  * 的時間也會變成「最後一次重啟的時間」而不是「最後一次真的翻轉的時間」。
  *
- * 折疊規則：以 `(service, id)` 排序，只保留 `status` 與前一列不同的那些列
+ * 折疊規則：以 `(service, ts, id)` 排序，只保留 `status` 與前一列不同的那些列
  * （`<=>` 是 NULL-safe 等號，status 可為 NULL）。每一段連續相同狀態只留**最早**
  * 那一列，也就是真正發生翻轉的時刻——與 sqlite 的語意逐條對應。
  *
  * 代價：折疊要看該 service 的完整歷史，所以這個 CTE 不吃 `idx_service_ts`
  * 的範圍掃描。目前該表 35 列，之後若長大再考慮讓寫入端別寫基準列（那才是治本，
  * 這裡是讀取端的相容層）。
+ *
+ * **為什麼這裡用 `ts, id` 而 sqlite 側用 `id`——這是刻意的兩軌偏離，不是不一致**
+ * （2026-09-02，a7-D43 裁定；三處一起改：本 CTE、`lastStatusChanges`、`statusLog`）：
+ *   - sqlite 的 `status_log` 只有單一寫入者、在事件當下寫入（`lib/db.ts` 的
+ *     `recordStatusIfChanged`），所以 **id 序 ≡ ts 序 by construction**，
+ *     `lib/read/sqlite.ts:41,114,115` 用 `ORDER BY id` 完全正確。
+ *   - 監控 DB 這側收到的是**非時序寫入**：spool 重放帶原始 `ts` 但 `id` 是重放
+ *     當下才配；Phase 6 回填更會把 8/21、8/27 的歷史列以**更大的 id** 寫進來
+ *     （`backfill-sqlite.ts` 的 `BACKFILL_TABLES` 含 `status_log`）。實測回填前
+ *     就已有 16/695 列是「id 較大但 ts 較早」。
+ *   - 所以同一行 SQL 在 sqlite 是對的、在這裡是錯的，**而錯的那邊看起來完全正常**：
+ *     `ORDER BY id` 會在時間亂序的序列上算翻轉（假翻轉/漏翻轉），`ORDER BY id DESC`
+ *     取「最新」會取到回填進來**最老**的那一筆。
+ *   - 不要「為了兩軌一致」把它改回 `id`。同檔的 events 查詢（`:457`/`:461`/`:496`）
+ *     早就是 `ts DESC, id DESC`，本處是跟上既有慣例，不是引進新慣例。
  */
 const STATUS_LOG_FLIPS = `
   WITH marked AS (
     SELECT s.id AS id, ${exact('s.service')} AS service, s.ts AS ts, s.status AS status,
            s.detail_json AS detail_json,
-           CASE WHEN LAG(s.status) OVER (PARTITION BY ${exact('s.service')} ORDER BY s.id) <=> s.status
+           CASE WHEN LAG(s.status) OVER (PARTITION BY ${exact('s.service')} ORDER BY s.ts, s.id) <=> s.status
                 THEN 0 ELSE 1 END AS is_flip
       FROM service_status_log s
   )`
@@ -537,7 +552,7 @@ export const mysqlReader: MonitorReader = {
       `${STATUS_LOG_FLIPS}
        SELECT service, ts, status FROM (
          SELECT m.service AS service, ${iso('m.ts')} AS ts, m.status AS status,
-                ROW_NUMBER() OVER (PARTITION BY m.service ORDER BY m.id DESC) AS rn
+                ROW_NUMBER() OVER (PARTITION BY m.service ORDER BY m.ts DESC, m.id DESC) AS rn
            FROM marked m
           WHERE m.is_flip = 1 AND m.service IN (${placeholders(serviceIds.length)})
        ) t WHERE t.rn = 1`,
@@ -703,7 +718,7 @@ export const mysqlReader: MonitorReader = {
               ${djstr('m.detail_json', 'detail')} AS detail
          FROM marked m
         WHERE m.is_flip = 1${service ? ' AND m.service = ?' : ''}
-        ORDER BY m.id DESC LIMIT 200`,
+        ORDER BY m.ts DESC, m.id DESC LIMIT 200`,
       service ? [service] : [],
     )
     return rows.map(r => ({
