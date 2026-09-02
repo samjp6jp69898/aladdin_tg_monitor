@@ -25,6 +25,7 @@ import {
   writeCancelFlag,
   appendCancelFlagToSpool,
   appendStatusLogToSpool,
+  appendHeartbeatToSpool,
   isoToMysqlDatetime3,
   readActiveMarker,
   deriveLegacyKey,
@@ -1080,15 +1081,27 @@ function lsofPids(): Map<number, number> {
   return map
 }
 
-/** service_status_log 落地：粒度比照 sqlite 既有語意（recordStatusIfChanged
- * 只在狀態翻轉時寫一筆，第一次觀測也算翻轉）——呼叫端傳入
- * recordStatusIfChanged 的回傳值，兩邊落地與否完全同步，不重新定義一套
- * 「有沒有變化」的判準。詳見 phase4-taskB-report.md 的粒度裁定與依據。
+/** service_status_log 落地：粒度比照 lib/db.ts 的 recordStatusIfChanged 既有
+ * 語意（只在 up/down 翻轉時寫一筆，第一次觀測也算翻轉）——但 DB 側維護自己
+ * 獨立的「上次成功落地進 DB 的狀態」（lastWrittenServiceStatus），不借用
+ * recordStatusIfChanged 的回傳值：sqlite 那一份在呼叫當下就無條件寫入，不受
+ * DB append 成敗影響；若 DB 側直接依賴它的回傳值決定要不要重試，一旦這次
+ * DB append 失敗，sqlite 已經記錄「翻轉過」，下一輪同狀態的探測不會再被判定
+ * 為翻轉，這次遺失的轉變永遠補不回來。因此這裡自己追蹤，且只在 append 真的
+ * 成功後才推進；失敗時保留舊值，讓下一輪同狀態仍會判定為「與上次落地的狀態
+ * 不同」而重試。
  * 表沒有 pid/latencyMs/uptimeSeconds 欄，比照 sqlite 的 status_log（只存
  * service/host/ts/status/detail），把 pid 與 detail 一併塞進 detail_json，
  * latency/uptime 兩者 sqlite 本來就不存，本函式同樣不存。 */
+const lastWrittenServiceStatus = new Map<string, 'up' | 'down'>()
+
+/** 測試專用：清空「上次成功落地進 DB 的狀態」追蹤，避免跨測試互相污染
+ * （模組級狀態，同一個 bun test process 內所有測試共用）。 */
+export function __resetServiceStatusTrackerForTest(): void {
+  lastWrittenServiceStatus.clear()
+}
+
 export function appendServiceStatusIfChanged(
-  changed: boolean,
   id: string,
   status: 'up' | 'down',
   pid: number | null,
@@ -1097,7 +1110,8 @@ export function appendServiceStatusIfChanged(
   /** 測試用覆寫 spool 目錄；正式路徑不傳，落在 mon-db.ts 的 SPOOL_DIR。 */
   spoolDir?: string,
 ): void {
-  if (!changed || !isMonitorDbEnabled()) return
+  if (!isMonitorDbEnabled()) return
+  if (lastWrittenServiceStatus.get(id) === status) return
   try {
     appendStatusLogToSpool(
       {
@@ -1107,6 +1121,8 @@ export function appendServiceStatusIfChanged(
       },
       spoolDir,
     )
+    // 只在 append 真的成功後才推進（見上方函式註解）。
+    lastWrittenServiceStatus.set(id, status)
   } catch (err) {
     console.error(`mon-db: service_status_log spool 寫入失敗（service=${id}）: ${err}`)
   }
@@ -1144,8 +1160,8 @@ async function probeOne(s: ServiceDef, pid: number | null): Promise<ProbeResult>
     detail,
     checkedAt: new Date().toISOString(),
   }
-  const changed = recordStatusIfChanged(s.id, status, pid, detail)
-  appendServiceStatusIfChanged(changed, s.id, status, pid, detail, res.checkedAt)
+  recordStatusIfChanged(s.id, status, pid, detail)
+  appendServiceStatusIfChanged(s.id, status, pid, detail, res.checkedAt)
   lastProbe.set(s.id, res)
   return res
 }
@@ -1174,6 +1190,19 @@ export function loadRoster(s: ServiceDef): { id: string; display_name: string; i
 
 // ---------- 排程 ----------
 
+const HEARTBEAT_EVERY_MS = 60_000
+
+/** (host,'tg-monitor') 心跳 tick：appendHeartbeatToSpool 內建 isMonitorDbEnabled()
+ * 閘門（旗標關閉時直接 no-op，不建檔不做 I/O），這裡只負責 catch 失敗、
+ * WARN 不炸宿主行程——心跳失敗不該影響 collector 的其他職責。 */
+function heartbeatTick(): void {
+  try {
+    appendHeartbeatToSpool()
+  } catch (err) {
+    console.error(`mon-db: monitor_heartbeat spool 寫入失敗: ${err}`)
+  }
+}
+
 export function startCollectors(opts: { probeEveryMs: number; ingestEveryMs: number }) {
   const tick = async () => {
     try {
@@ -1188,6 +1217,8 @@ export function startCollectors(opts: { probeEveryMs: number; ingestEveryMs: num
   setInterval(tick, opts.ingestEveryMs)
   void probeAll()
   setInterval(() => void probeAll(), opts.probeEveryMs)
+  heartbeatTick()
+  setInterval(heartbeatTick, HEARTBEAT_EVERY_MS)
 }
 
 export { db }

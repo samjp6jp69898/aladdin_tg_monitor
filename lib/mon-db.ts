@@ -481,6 +481,10 @@ export interface StatusLogSpoolEntryArgs {
  * tuple）。
  */
 export function appendStatusLogToSpool(args: StatusLogSpoolEntryArgs, dir: string = SPOOL_DIR): void {
+  // 深度防禦：不只靠呼叫端（ingest.ts / webhook-status.ts）先檢查旗標——本函式
+  // 自己也擋一次，任何未來新增的呼叫端就算漏掉外層 isMonitorDbEnabled() 檢查，
+  // 也不會在旗標關閉時建出 spool 檔或做任何 I/O。
+  if (!isMonitorDbEnabled()) return
   if (!STATUS_LOG_TABLES.includes(args.table)) {
     throw new Error(`appendStatusLogToSpool: 不在白名單內的表名：${args.table}`)
   }
@@ -497,6 +501,54 @@ export function appendStatusLogToSpool(args: StatusLogSpoolEntryArgs, dir: strin
   const payload = `${JSON.stringify(record)}\n`
   writeSync(fd, payload)
   fsyncSync(fd) // 低頻路徑（探測 tick），不受 §6.5(a2) 批次 fsync 的熱路徑考量約束，比照 appendCancelFlagToSpool 逐次 fsync。
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// (host,'tg-monitor') 心跳（實機驗證發現 monitor_heartbeat 恆空後補上，總指揮
+// 追加指示）。fn='upsertMonitorHeartbeat'，唯讀查證
+// telegram-dispatcher/lib/monitor-db/writes.ts:343-366 的 upsertMonitorHeartbeat
+// 與 lib/monitor-db/apply-entry.ts:86-88 的對應 case 後對齊：
+//   - args 慣例是 `[input]`（單一物件，不是 insertStatusLogRow 那種
+//     `[[table, columns, values]]` tuple）——apply-entry.ts:87 直接把
+//     `entry.args[0]` 當 `UpsertHeartbeatInput` 用。
+//   - `input.ts` 必須是「絕對 ISO 字串」，不是 MySQL DATETIME(3) 字串：
+//     upsertMonitorHeartbeat 內部用 `dt()`（= isoToMysqlDatetime3OrNull，見
+//     mysql-datetime.ts:41-43）在 SQL 邊界才轉換，若這裡先轉成
+//     'YYYY-MM-DD HH:MM:SS.mmm' 格式，dispatcher 端的 ISO_UTC_RE 會比對失敗、
+//     dt() 直接 throw——這與 insertStatusLogRow（呼叫端自己組 SQL 值、沒有
+//     dt() 轉換）的慣例不同，不可誤用同一套轉換時機。
+//   - `host` 欄不在 UpsertHeartbeatInput 裡：upsertMonitorHeartbeat 內部固定用
+//     重放者行程（head 上的 telegram-dispatcher/server.ts）的 MON_HOST，不是
+//     呼叫端傳入的值，本函式因此不需要（也不能）在 args 裡帶 host。
+//   - `spoolDepth`/`spoolOldestTs`：tg-monitor 是「寫入者」不是「重放者」，
+//     §6.5(c) 明文「游標檔由重放者獨佔，寫入者永不碰它」——tg-monitor 沒有
+//     任何管道知道自己這一份 spool 檔已被重放到哪個 offset，因此無法算出有意
+//     義的 backlog 深度。依總指揮指示「取不到就 null/0」，本函式一律傳 null，
+//     不發明假數據。
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * append 一條 (host,'tg-monitor') 心跳進 spool，交給 head 上的重放者以
+ * upsertMonitorHeartbeat 落庫。與 appendStatusLogToSpool 同樣有內建的
+ * isMonitorDbEnabled() 深度防禦；呼叫端（lib/ingest.ts 的 60 秒 interval）
+ * 仍需自行 try/catch，本函式失敗時直接 throw，不吞例外。
+ */
+export function appendHeartbeatToSpool(dir: string = SPOOL_DIR): void {
+  if (!isMonitorDbEnabled()) return
+  const nowIso = new Date().toISOString()
+  const { fd } = getSpoolFd(dir)
+  spoolSeq += 1
+  const record = {
+    seq: spoolSeq,
+    ts: nowIso,
+    host: RUNS_HOST,
+    run_id: null,
+    fn: 'upsertMonitorHeartbeat',
+    args: [{ writer: 'tg-monitor', ts: nowIso, spoolDepth: null, spoolOldestTs: null }],
+  }
+  const payload = `${JSON.stringify(record)}\n`
+  writeSync(fd, payload)
+  fsyncSync(fd) // 低頻路徑（60 秒一次），逐次 fsync，比照 appendCancelFlagToSpool / appendStatusLogToSpool。
 }
 
 /** 測試 / 行程結束時關閉 spool fd（正式路徑不需要主動呼叫，行程結束時 OS 會回收）。 */

@@ -38,13 +38,19 @@ function readBotToken(): string | null {
 
 let cache: WebhookStatus | null = null
 
-/** tg_webhook_status_log 落地（新——webhook 探測本來就沒有 sqlite 先例）。
- * 粒度裁定：比照 lib/db.ts 的 recordStatusIfChanged（service probe 既有語意）
- * ——只在 up/down 翻轉時落一筆，第一次觀測也算翻轉；理由見
- * phase4-taskB-report.md 的粒度裁定與依據。 */
+/** tg_webhook_status_log 落地（新——webhook 探測本來就沒有 sqlite 先例，這張
+ * 表在此之前完全沒有任何持久化）。
+ * 粒度裁定：比照 lib/db.ts 的 recordStatusIfChanged（service probe 既有語意：
+ * 只在 up/down 翻轉時寫一筆，第一次觀測也算翻轉）——選擇同一種判準是為了讓
+ * 讀取面（總覽頁）對兩種探測有一致的語意（都是「翻轉序列」而非「每次探測
+ * 快照」），且 webhook 狀態每 5 秒被輪詢、又有 30 秒記憶體快取，若每次探測
+ * 都落一筆會在 DB 側產生大量重複列。
+ * 只在 append 真的成功後才推進 lastWrittenWebhookStatus：失敗時保留舊值，
+ * 讓下一輪同狀態的探測仍會判定為「與上次落地的狀態不同」而重試——否則一次
+ * append 失敗會讓這次轉變永久遺失（下次同狀態不會再觸發）。 */
 let lastWrittenWebhookStatus: 'up' | 'down' | null = null
 
-/** 測試專用：重置「上次落地狀態」，避免跨測試互相污染（同一個 bun test
+/** 測試專用：重置「上次成功落地的狀態」，避免跨測試互相污染（同一個 bun test
  * process 內模組級狀態共用）。 */
 export function __resetWebhookStatusTrackerForTest(): void {
   lastWrittenWebhookStatus = null
@@ -54,7 +60,6 @@ export function recordWebhookStatusIfChanged(s: WebhookStatus, spoolDir?: string
   if (!isMonitorDbEnabled()) return
   const status: 'up' | 'down' = s.ok ? 'up' : 'down'
   if (lastWrittenWebhookStatus === status) return
-  lastWrittenWebhookStatus = status
   try {
     appendStatusLogToSpool(
       {
@@ -76,6 +81,8 @@ export function recordWebhookStatusIfChanged(s: WebhookStatus, spoolDir?: string
       },
       spoolDir,
     )
+    // 只在 append 真的成功後才推進（見上方函式註解）。
+    lastWrittenWebhookStatus = status
   } catch (err) {
     console.error(`mon-db: tg_webhook_status_log spool 寫入失敗: ${err}`)
   }
