@@ -216,9 +216,18 @@ compare('statusLog', await sqliteReader.statusLog(), await mysqlReader.statusLog
 
 // ── pipeline_runs / agent_runs ─────────────────────────────────────────────
 compare('pipelineRuns(300)', await sqliteReader.pipelineRuns(300), await mysqlReader.pipelineRuns(300), r => r.key, [...RUNS_KNOWN_GAPS, 'host', 'run_id'])
-// 鍵要含 run_id：mysql 側 agent_runs 的 PK 是 (run_id, path)，只用 path 當鍵會被
-// Map 靜默併掉重複列，比對就漏了。sqlite 側沒有 run_id，鍵退化成 path，行為不變。
-compare('allAgentRuns', await sqliteReader.allAgentRuns(), await mysqlReader.allAgentRuns(), r => `${r.run_id ?? ''} | ${r.path}`, ['file_mtime', 'run_id', 'host'])
+// 鍵只能用 path：sqlite 側沒有 run_id，把 run_id 放進鍵會讓兩軌的鍵**永遠對不上**
+// （sqlite 是 ` | path`、mysql 是 `<uuid> | path`），整節變成「全部只在自己這邊」。
+// mysql 側 agent_runs 的 PK 是 (run_id, path)，同一個 path 理論上可以出現在多個
+// run 底下、被 Map 靜默併掉 —— 所以另外顯式檢查一次重複，不靠鍵去發現。
+{
+  const mysqlAgents = await mysqlReader.allAgentRuns()
+  const seen = new Map<string, number>()
+  for (const a of mysqlAgents) seen.set(a.path, (seen.get(a.path) ?? 0) + 1)
+  const dup = [...seen].filter(([, n]) => n > 1)
+  if (dup.length) console.log(`WARN mysql agent_runs 有 ${dup.length} 個 path 對到多個 run_id，下面的逐列比對會併掉重複：${dup.slice(0, 3).map(([p]) => p).join(', ')}`)
+  compare('allAgentRuns', await sqliteReader.allAgentRuns(), mysqlAgents, r => r.path, ['file_mtime', 'run_id', 'host'])
+}
 
 // ── 逐票 / 逐 key 的查詢（審查指出這三支語意最刁鑽卻完全沒被覆蓋）──────────
 {

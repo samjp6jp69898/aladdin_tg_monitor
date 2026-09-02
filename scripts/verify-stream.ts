@@ -11,9 +11,14 @@
 //   - sse-segfault-repro.ts：驗 **Bun 這個 runtime** 的 ReadableStream 斷線行為（前置關卡）
 //   - 本檔：驗 **tg-monitor 這個端點** 的契約與語意
 //
-// 唯讀紀律：本腳本會另起一個 server（隨機空 port）、用 `TG_MONITOR_DB` 指向暫存
-// sqlite 副本，不碰 data/monitor.sqlite；對監控 DB 只有 SELECT。log 的截斷測試寫在
-// 系統暫存目錄自己造的檔案上，不動任何真實 log。
+// 副作用邊界（誠實列出，第一版踩過一次）：
+//   - 另起一個 server（隨機空 port），`TG_MONITOR_DB` 指向 VACUUM INTO 出來的暫存
+//     sqlite 副本 → **不寫 data/monitor.sqlite**；
+//   - 對監控 DB 只有 SELECT；
+//   - log 那一節會在 `DISPATCHER_LOG_DIR` 底下造一個**自己的**檔案再刪掉
+//     （白名單只涵蓋那個目錄，所以不能放到 /tmp）。檔名刻意避開 collector 的
+//     pipeline log 規則——見該節的註解，第一版沒避開，害線上 collector 生出四筆
+//     假的 pipeline run。不動任何既有 log 檔。
 
 import { mkdtempSync, rmSync, writeFileSync, appendFileSync, truncateSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -151,9 +156,17 @@ try {
 
   // ── 4. log topic：增量、截斷歸零、與 /api/log/since 同形 ────────────────
   {
-    // 用 DISPATCHER_LOG_DIR 底下自己造的檔案（那個目錄在 isAllowedLogPath 白名單內），
-    // 跑完就刪，不動任何既有 log。
-    const logPath = join(DISPATCHER_LOG_DIR, `ZZTEST-0.${new Date().toISOString().replace(/[:.]/g, '-')}.stdout.log`)
+    // 用 DISPATCHER_LOG_DIR 底下自己造的檔案（`isAllowedLogPath` 對該目錄下任何
+    // `*.log` 都放行），跑完就刪，不動任何既有 log。
+    //
+    // ⚠️ 檔名**刻意不長得像 pipeline log**：`lib/ingest.ts:87-88` 的
+    //   BUG_RE   = /^([A-Z]+-\d+)\.(<ts>)\.stdout\.log$/
+    //   DEMAND_RE= /^([A-Z]+-\d+)\.(<ts>)\.demand-pipeline\.stdout\.log$/
+    // 是 collector 掃 pipeline run 的依據。第一版用了 `ZZTEST-0.<ts>.stdout.log`，
+    // 結果**線上那個 tg-monitor 的 collector 真的把它收進了 live monitor.sqlite**，
+    // 憑空生出四筆假的 pipeline run（已清掉）。小寫前綴 + 不帶 `-<數字>.` 就不會命中
+    // 這兩條 regex，也就不會被任何 collector 當成真的 run。
+    const logPath = join(DISPATCHER_LOG_DIR, `sse-verify-${Date.now()}.log`)
     writeFileSync(logPath, 'line-1\nline-2\n')
     try {
       const ac = new AbortController()
