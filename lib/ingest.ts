@@ -16,7 +16,7 @@ import { join } from 'node:path'
 
 const execFileAsync = promisify(execFile)
 import { SERVICES, DISPATCHER_LOG_DIR, AGENT_TRACE_DIR, BUG_LOCK_DIR, type ServiceDef } from './services.ts'
-import { db, insertMany, getOffset, setOffset, recordStatusIfChanged, upsertRun, finishRun, reopenRun, markCancelled, agentRunMtime, upsertAgentRun } from './db.ts'
+import { db, insertMany, getOffset, setOffset, recordStatusIfChanged, upsertRun, finishRun, reopenRun, markCancelled, agentRunMtime, upsertAgentRun, bumpReviewRounds } from './db.ts'
 
 // ---------- 1) audit.jsonl tail ----------
 
@@ -98,6 +98,9 @@ export type RunningProc = { pid: number; etime: string; kind: 'bug' | 'demand'; 
 
 // 只在 collector tick 裡呼叫（spawnSync）；request handler 一律讀 cachedRunning。
 // Bun 1.2.9 實測：handler 內 spawnSync 遇到客戶端中斷請求會 segfault。
+// 注意：這條與「ReadableStream/SSE 斷線 segfault」是兩個獨立踩坑——後者
+// 2026-09-02 於 Bun 1.4.0 實測已修復（見 server.ts /api/log/since 註解），
+// 本條（handler 內同步 spawn）未隨之驗證解除，繼續遵守。
 let cachedRunning: RunningProc[] = []
 let cachedPpid = new Map<number, number>() // pid → ppid（與 cachedRunning 同一次 ps 快照）
 export function listRunningPipelineProcs(): RunningProc[] {
@@ -322,6 +325,30 @@ function demandOutcomeFromLog(ticket: string, startedAt: string, nextStart: stri
   return { finishedAt: last.ts, outcome: last.msg.length > 80 ? last.msg.slice(0, 80) + '…' : last.msg }
 }
 
+// key（<ticket>.<ts>，即 pipeline_runs.key）→ 上次已持久化的輪數，避免每個
+// tick 都對 DB 送一次沒有實際變化的 UPDATE（bumpReviewRounds 本身雖冪等，
+// 但省一次 I/O）。in-memory、行程重啟會清空——不影響正確性：DB 值不會被清掉，
+// 下個 tick 重算出同樣或更大的值，NOOP 或再 bump 一次而已。
+const lastPersistedRounds = new Map<string, { review: number; final: number }>()
+
+/**
+ * 把目前累計的審查輪數（見 getReviewRoundCounts）持久化到該 run 列，值沒有
+ * 進展就不寫 DB。掛在 scanPipelineRuns 的既有 tick 上呼叫，run 執行中與剛
+ * 結束的最後一次掃描都會呼叫到（見呼叫處註解），確保 run 結束、transcript
+ * 停止增長後，DB 欄位仍留著最終輪數。
+ */
+function persistReviewRounds(key: string, ticket: string, startedAt: string): void {
+  const counts = getReviewRoundCounts(ticket, startedAt)
+  if (!counts) return
+  const last = lastPersistedRounds.get(key)
+  if (last && counts.reviewRounds <= last.review && counts.finalReviewRounds <= last.final) return
+  bumpReviewRounds(key, counts.reviewRounds > 0 ? counts.reviewRounds : null, counts.finalReviewRounds > 0 ? counts.finalReviewRounds : null)
+  lastPersistedRounds.set(key, {
+    review: Math.max(counts.reviewRounds, last?.review ?? 0),
+    final: Math.max(counts.finalReviewRounds, last?.final ?? 0),
+  })
+}
+
 export function scanPipelineRuns() {
   if (!existsSync(DISPATCHER_LOG_DIR)) { cachedRunning = scanRunningPipelineProcs(); return }
   cachedRunning = scanRunningPipelineProcs()
@@ -391,6 +418,11 @@ export function scanPipelineRuns() {
           }
           finishRun(key, finishedAt, outcome)
           ingestBugStdout(ticket, startedAt, stdoutPath)
+          // run 剛結束這一刻的最後一次掃描：transcript 可能在行程結束前一瞬間
+          // 才寫下最後幾筆派工事件（例如最後一輪 reviewer 或 Step 6.5），確保
+          // 這些也被算進去再持久化一次——之後 pending 就此不再增長，這是最後
+          // 機會。
+          persistReviewRounds(key, ticket, startedAt)
         }
       } catch {}
     } else if (kind === 'bug') {
@@ -404,6 +436,10 @@ export function scanPipelineRuns() {
       try {
         ingestBugStdout(ticket, startedAt, stdoutPath, true)
       } catch {}
+      // 審查輪數持久化（2026-09-02）：掛在既有 collector tick 上，不新增
+      // timer；跟 finish 分支共用同一個 persistReviewRounds（只增不減，值沒變
+      // 就不寫），run 結束前每個 tick 都有機會把最新輪數落地。
+      persistReviewRounds(key, ticket, startedAt)
     }
   }
   reconcileStaleOutcomes()
@@ -458,6 +494,11 @@ export type BugStage = {
   started_at: string | null
   finished_at: string | null
   detail?: string | null
+  // 審查輪數（2026-09-02，見 getReviewRoundCounts）：review 筆帶三位 reviewer
+  // 的完整輪數（三位全被派工過才算一輪，全員 min）、final-review 筆帶
+  // final-adversarial-reviewer 累計派工次數；0 或無值不帶這個欄位。與既有
+  // detail 語意分開，detail 不因此改變。
+  rounds?: number
 }
 
 function fileMtimeIso(p: string): string | null {
@@ -489,18 +530,50 @@ const BUG_AGENT_STAGE: Record<string, string> = {
   'solution-reviewer': 'review',
   'adversarial-solution-reviewer': 'review',
   'tdd-fidelity-reviewer': 'review',
+  'final-adversarial-reviewer': 'final-review',
   'drive-uploader': 'solution',
   'drive-uploader-mr': 'solution',
   'mr-pusher': 'exit',
 }
-const BUG_STAGE_ORDER = ['analytics', 'grounding', 'analysis-notes', 'worktree', 'fixer', 'review', 'solution', 'exit']
+const BUG_STAGE_ORDER = ['analytics', 'grounding', 'analysis-notes', 'worktree', 'fixer', 'review', 'final-review', 'solution', 'exit']
 
-export type CurrentBugStage = { stageKey: string; agent: string; since: string }
+export type CurrentBugStage = { stageKey: string; agent: string; since: string; reviewRound?: number }
+
+// Step 6 三重平行審查的三位 reviewer——審查被否決會回 Step 5 fixer 重做，
+// 再重新派工這三位，派工次數即「第幾輪」。
+// 註：三位計數不一定同步前進——create-mr.md Step 6 合議規則（2026-09-02 查證
+// HEAD deb1f79 line 266）：「任一位缺契約尾行 → 該位重派 1 次」是只重派那一位
+// 的選擇性重派，只有 Step 6.5 FAILED 回 Step 5 重做後才是「三位全部重新派工」
+// （line 300）。輪數語意（使用者 2026-09-02 裁定，取代同日稍早的 max 上界版）：
+// **精確輪次＝三位全部都被派工過才算一輪**，即 rounds = 三位計數的 min（缺席
+// 者計 0，必須遍歷本集合、不能只看有記錄的 key）。選擇性重派單獨一位不進位；
+// 例：{A:2, B:2, C:1} → 1 輪。
+const REVIEW_AGENTS = new Set(['solution-reviewer', 'adversarial-solution-reviewer', 'tdd-fidelity-reviewer'])
+
+/** 精確完整輪次：REVIEW_AGENTS 全員計數的 min（缺席=0）。見上方語意註解。 */
+function fullReviewRounds(counts: Map<string, number>): number {
+  let min = Infinity
+  for (const a of REVIEW_AGENTS) min = Math.min(min, counts.get(a) ?? 0)
+  return Number.isFinite(min) ? min : 0
+}
+// Step 6.5 最終對抗性驗證——與三位 reviewer 是完全獨立的計數（見
+// getReviewRoundCounts），不混入 reviewCounts。
+const FINAL_REVIEW_AGENT = 'final-adversarial-reviewer'
 
 // path 找到才快取（找不到不快取：spawn 後 transcript 建檔可能比第一次查詢晚幾秒）
 const transcriptPathCache = new Map<string, string>()
-// 逐檔增量掃描狀態：只讀新 append 的部分，pending = 已派工未回結果的 tool_use
-const transcriptScanState = new Map<string, { offset: number; carry: string; pending: Map<string, { agent: string; ts: string }> }>()
+// 逐檔增量掃描狀態：只讀新 append 的部分，pending = 已派工未回結果的 tool_use；
+// reviewCounts = 三位 reviewer 各自累計被派工次數（不論有沒有回結果），只增不減，
+// 用來推定審查跑到第幾輪；finalReviewCount = final-adversarial-reviewer 累計
+// 被派工次數，獨立計數。
+type TranscriptScanState = {
+  offset: number
+  carry: string
+  pending: Map<string, { agent: string; ts: string }>
+  reviewCounts: Map<string, number>
+  finalReviewCount: number
+}
+const transcriptScanState = new Map<string, TranscriptScanState>()
 
 function findPipelineTranscript(ticket: string, runStartedAt: string): string | null {
   const cacheKey = `${ticket}|${runStartedAt}`
@@ -538,15 +611,19 @@ function findPipelineTranscript(ticket: string, runStartedAt: string): string | 
   return null
 }
 
-export function inferCurrentBugStage(ticket: string, runStartedAt: string): CurrentBugStage | null {
-  const path = findPipelineTranscript(ticket, runStartedAt)
-  if (!path) return null
+/**
+ * 增量掃描單一 transcript 檔案，更新並回傳其累積掃描狀態（pending 派工、三位
+ * reviewer 輪數、final-adversarial-reviewer 派工次數）。inferCurrentBugStage
+ * 與 getReviewRoundCounts 共用這份邏輯與同一個 transcriptScanState 快取——
+ * 呼叫順序不影響正確性，狀態只增不減、offset 只前進。
+ */
+function scanTranscriptState(path: string): TranscriptScanState | null {
   let st
   try { st = statSync(path) } catch { return null }
   if (st.size > 100 * 1024 * 1024) return null // 異常肥大就放棄推定，不拖垮輪詢
   let state = transcriptScanState.get(path)
-  if (!state) { state = { offset: 0, carry: '', pending: new Map() }; transcriptScanState.set(path, state) }
-  if (st.size < state.offset) { state.offset = 0; state.carry = ''; state.pending.clear() } // 檔案被截斷重置
+  if (!state) { state = { offset: 0, carry: '', pending: new Map(), reviewCounts: new Map(), finalReviewCount: 0 }; transcriptScanState.set(path, state) }
+  if (st.size < state.offset) { state.offset = 0; state.carry = ''; state.pending.clear(); state.reviewCounts.clear(); state.finalReviewCount = 0 } // 檔案被截斷重置
   if (st.size > state.offset) {
     const fd = openSync(path, 'r')
     try {
@@ -568,6 +645,11 @@ export function inferCurrentBugStage(ticket: string, runStartedAt: string): Curr
           if (b?.type === 'tool_use') {
             if ((b.name === 'Agent' || b.name === 'Task') && typeof b.input?.subagent_type === 'string') {
               state.pending.set(b.id, { agent: b.input.subagent_type, ts: e.timestamp ?? '' })
+              if (REVIEW_AGENTS.has(b.input.subagent_type)) {
+                state.reviewCounts.set(b.input.subagent_type, (state.reviewCounts.get(b.input.subagent_type) ?? 0) + 1)
+              } else if (b.input.subagent_type === FINAL_REVIEW_AGENT) {
+                state.finalReviewCount += 1
+              }
             } else if (b.name === 'Bash' && typeof b.input?.command === 'string' && b.input.command.includes('setup-worktree.sh')) {
               state.pending.set(b.id, { agent: 'setup-worktree.sh', ts: e.timestamp ?? '' })
             }
@@ -578,6 +660,14 @@ export function inferCurrentBugStage(ticket: string, runStartedAt: string): Curr
       }
     } finally { closeSync(fd) }
   }
+  return state
+}
+
+export function inferCurrentBugStage(ticket: string, runStartedAt: string): CurrentBugStage | null {
+  const path = findPipelineTranscript(ticket, runStartedAt)
+  if (!path) return null
+  const state = scanTranscriptState(path)
+  if (!state) return null
   // 未回結果的派工＝此刻正在跑；平行派工（Step 2 兩位 / Step 6 三位）取
   // pipeline 順序最深的一個當代表（同屬一個階段時結果相同）。
   let best: CurrentBugStage | null = null
@@ -586,7 +676,30 @@ export function inferCurrentBugStage(ticket: string, runStartedAt: string): Curr
     if (!key) continue
     if (!best || BUG_STAGE_ORDER.indexOf(key) > BUG_STAGE_ORDER.indexOf(best.stageKey)) best = { stageKey: key, agent, since: ts || runStartedAt }
   }
+  if (best?.stageKey === 'review') {
+    // 精確輪次語意（見 REVIEW_AGENTS 註解）：顯示已完成的完整輪數。輪次進行
+    // 中（三位還沒全部派到）不進位——當前是誰在跑由 detail 的 agent 名補足。
+    best.reviewRound = fullReviewRounds(state.reviewCounts)
+  }
   return best
+}
+
+/**
+ * 三位 reviewer 目前完整輪數（見 REVIEW_AGENTS 註解：三位全被派工過才算一輪，
+ * 取全員 min）與 final-adversarial-reviewer 累計派工次數——供 collector tick 與
+ * /api/pipelines/run 持久化/回傳，讓 run 結束、pending 清空、階段檢核表的
+ * detail 消失後，這頁仍看得到審查跑了幾輪。找不到 transcript（run 還沒起、
+ * 或非 bug pipeline）回 null。
+ */
+export function getReviewRoundCounts(ticket: string, runStartedAt: string): { reviewRounds: number; finalReviewRounds: number } | null {
+  const path = findPipelineTranscript(ticket, runStartedAt)
+  if (!path) return null
+  const state = scanTranscriptState(path)
+  if (!state) return null
+  return {
+    reviewRounds: fullReviewRounds(state.reviewCounts),
+    finalReviewRounds: state.finalReviewCount,
+  }
 }
 
 /**
@@ -626,6 +739,10 @@ export function computeBugStages(ticket: string, runStartedAt: string, tracker: 
     // branch ref，沒有便宜且不誤判的完成訊號（見 pd-stages-note 的 UI 說明）。
     { key: 'worktree', label: 'Step 4 隔離環境（worktree + bootstrap）', finishedAt: (() => { const m = fileMtimeIso(join('/Users/user/aladdin/worktrees', ticket, 'bootstrap.log')); return m && m >= runStartedAt ? m : null })(), reused: !!fileMtimeIso(join('/Users/user/aladdin/worktrees', ticket, 'bootstrap.log')) },
     { key: 'review', label: 'Step 6 三重平行審查', finishedAt: reviewMtimes.length === reviewFiles.length ? reviewMtimes.sort().slice(-1)[0]! : null, reused: reviewFiles.every(f => rawAt(f) !== null) },
+    // Step 6.5（2026-09-02 create-mr 新增）：三位 reviewer 全 PASSED 後的最終
+    // 對抗性驗證。注意 'adversarial-review.md' 是本檔名的子字串——at() 用精確
+    // 檔名拼接所以安全；勿改成 includes/endsWith/glob 比對，會互相誤命中。
+    { key: 'final-review', label: 'Step 6.5 最終對抗性驗證', finishedAt: at('final-adversarial-review.md'), reused: !!rawAt('final-adversarial-review.md') },
     { key: 'solution', label: 'Solution 彙整', finishedAt: at('solution.md'), reused: !!rawAt('solution.md') },
     {
       key: 'exit',
@@ -661,7 +778,10 @@ export function computeBugStages(ticket: string, runStartedAt: string, tracker: 
         stages.splice(idx < 0 ? stages.length : idx, 0, { key: 'fixer', label: 'Step 5 TDD 修復（Fixer）', status: 'running', started_at: cur.since, finished_at: null, detail: cur.agent })
       } else {
         const s = stages.find(x => x.key === cur.stageKey)
-        if (s) { s.status = 'running'; s.started_at = cur.since; s.finished_at = null; s.detail = cur.agent }
+        if (s) {
+          s.status = 'running'; s.started_at = cur.since; s.finished_at = null
+          s.detail = cur.reviewRound ? `${cur.agent}・第 ${cur.reviewRound} 輪` : cur.agent
+        }
       }
     }
   }

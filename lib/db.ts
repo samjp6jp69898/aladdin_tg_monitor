@@ -90,6 +90,13 @@ try { db.exec('ALTER TABLE pipeline_runs ADD COLUMN cancelled_at TEXT') } catch 
 // /create-mr、自動重試、tg-monitor 手動重試按鈕）就留空，不用 Notion 當前指派
 // 頂替——那正是要修掉的誤導來源。
 try { db.exec('ALTER TABLE pipeline_runs ADD COLUMN triggered_by TEXT') } catch {}
+// 審查輪數持久化（2026-09-02）：Step 6 三位 reviewer 累計輪數（取三者最大值）
+// 與 Step 6.5 final-adversarial-reviewer 累計派工次數，各自獨立一欄——執行中
+// 從 session transcript 即時推定（見 ingest.ts getReviewRoundCounts），run
+// 結束後 pending 清空、階段檢核表的 detail 也跟著消失，這兩欄是唯一在畫面上
+// 還留得住輪數的地方。
+try { db.exec('ALTER TABLE pipeline_runs ADD COLUMN review_rounds INTEGER') } catch {}
+try { db.exec('ALTER TABLE pipeline_runs ADD COLUMN final_review_rounds INTEGER') } catch {}
 
 export type EventRow = {
   id: number
@@ -188,6 +195,18 @@ export function finishRun(key: string, finishedAt: string, outcome: string) {
 const reopenRunStmt = db.prepare('UPDATE pipeline_runs SET finished_at = NULL, outcome = NULL WHERE key = ? AND finished_at IS NOT NULL')
 export function reopenRun(key: string) {
   reopenRunStmt.run(key)
+}
+
+// 只增不減：新值沒超過既有值就不動該欄位（冪等，容忍同一輪被重複呼叫多次）。
+// null 代表「這次沒有新資訊」，跳過該欄位、不會把既有值蓋成 null。
+const bumpReviewRoundsStmt = db.prepare(`
+  UPDATE pipeline_runs SET
+    review_rounds = CASE WHEN @review_rounds IS NOT NULL AND (review_rounds IS NULL OR review_rounds < @review_rounds) THEN @review_rounds ELSE review_rounds END,
+    final_review_rounds = CASE WHEN @final_review_rounds IS NOT NULL AND (final_review_rounds IS NULL OR final_review_rounds < @final_review_rounds) THEN @final_review_rounds ELSE final_review_rounds END
+  WHERE key = @key
+`)
+export function bumpReviewRounds(key: string, reviewRounds: number | null, finalReviewRounds: number | null) {
+  bumpReviewRoundsStmt.run({ key, review_rounds: reviewRounds, final_review_rounds: finalReviewRounds })
 }
 
 const agentMtimeStmt = db.prepare('SELECT file_mtime FROM agent_runs WHERE path = ?')

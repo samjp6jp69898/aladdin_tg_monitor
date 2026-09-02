@@ -11,7 +11,7 @@ import { promisify } from 'node:util'
 import { join } from 'node:path'
 import { SERVICES, DISPATCHER_LOG_DIR, isAllowedLogPath, isAllowedTracePath, restartService } from './lib/services.ts'
 import { db } from './lib/db.ts'
-import { startCollectors, getLastProbes, listRunningPipelineProcs, listBugLocks, loadRoster, cancelPipeline, summarizeEvents, computeBugStages, readTrackerStatusAsync, isBugOutcomeRetryable, parseClaudeEvents } from './lib/ingest.ts'
+import { startCollectors, getLastProbes, listRunningPipelineProcs, listBugLocks, loadRoster, cancelPipeline, summarizeEvents, computeBugStages, readTrackerStatusAsync, isBugOutcomeRetryable, parseClaudeEvents, getReviewRoundCounts } from './lib/ingest.ts'
 import { loadConnectedUsers, loadPendingSenders, loadAllTechUsers, assignChatId, unsetChatId, sendTestMessage } from './lib/tg-users.ts'
 import { getWebhookStatus } from './lib/webhook-status.ts'
 import { fetchPipelineLimits, readQueuedTickets } from './lib/pipeline-queue-state.ts'
@@ -379,6 +379,19 @@ app.get('/api/pipelines/run', async c => {
     // spawn 遇客戶端中斷會 segfault」既有踩坑（見 listRunningPipelineProcs 旁
     // 的註解）。
     stages = computeBugStages(run.ticket, run.started_at, await readTrackerStatusAsync(run.ticket), me.running)
+  }
+  // 審查輪數（2026-09-02）：跑完的 run 靠 DB 欄位（collector tick 已在最後
+  // 一次掃描時持久化，見 ingest.ts persistReviewRounds）；還在跑的 run 額外
+  // 即時掃一次 transcript，取兩者較大值——DB 值可能落後最多一個 ingest tick
+  // 間隔。0 或無值就不帶 rounds 欄位（歷史 run 沒有這兩欄，graceful degrade）。
+  if (run.kind === 'bug' && stages.length) {
+    const live = me.running ? getReviewRoundCounts(run.ticket, run.started_at) : null
+    const reviewRounds = Math.max(me.review_rounds ?? 0, live?.reviewRounds ?? 0)
+    const finalReviewRounds = Math.max(me.final_review_rounds ?? 0, live?.finalReviewRounds ?? 0)
+    for (const s of stages) {
+      if (s.key === 'review' && reviewRounds > 0) s.rounds = reviewRounds
+      else if (s.key === 'final-review' && finalReviewRounds > 0) s.rounds = finalReviewRounds
+    }
   }
   return c.json({ run: me, progress, stages })
 })
