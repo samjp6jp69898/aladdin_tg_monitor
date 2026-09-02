@@ -36,6 +36,23 @@ const PORT = Number(process.env.TG_MONITOR_PORT ?? 8799)
 const ACTIVE_WINDOW_MIN = 5
 const SESSION_GAP_MIN = 10
 
+// 讀取面來源（MON_READ_SOURCE）。預設 sqlite；切 mysql 失敗會退回 sqlite 並記
+// ERROR（見 lib/read/index.ts 的說明）。切換一律經由重啟：
+//   改 tg-monitor/.env 的一個字 + launchctl kickstart -k com.aladdin.tg-monitor
+//
+// ⚠️ **必須排在 startCollectors() 之前**（2026-09-02 實測後調整，不是風格問題）：
+// 監控 DB 的 pool 只有 4 條連線且 `waitForConnections: false`（§4.6 pool 歸屬表 +
+// lib/mon-db.ts），借不到就**立刻報錯、不排隊**。collector 一啟動就會對 MySQL
+// 灌入大量寫入（MON_DB_ENABLED=1 之後，光 rounds 寫入端開機就是數十筆），把 4 條
+// 連線瞬間佔滿；開機探針若排在後面，會搶不到連線、拿到 `No connections available`，
+// 於是**誤判成「監控 DB 連不上」而靜默退回 sqlite** —— MON_READ_SOURCE=mysql 就這樣
+// 失效了，而且只在機器忙的時候發生。實測重現：探針排在後面時，MON_READ_SOURCE
+// 給 mysql / MySQL / 'mysql ' 三種寫法都退回 sqlite，stderr 都是
+// `探針失敗：No connections available.`。
+// 排到前面之後，探針執行時 pool 還沒有任何競爭者，這是結構性的保證，不是靠等待。
+const READ_SOURCE = await initReader()
+console.error(`tg-monitor: 讀取面資料源 = ${READ_SOURCE}`)
+
 startCollectors({ probeEveryMs: 5000, ingestEveryMs: 3000 })
 
 // 2026-08-28（使用者定案）：併發上限不再複製數字寫死（先前 demand 上限漂移
@@ -44,11 +61,6 @@ startCollectors({ probeEveryMs: 5000, ingestEveryMs: 3000 })
 const PIPELINE_LIMITS = await fetchPipelineLimits()
 console.error(`tg-monitor: pipeline 併發上限 bug=${PIPELINE_LIMITS.bug} demand=${PIPELINE_LIMITS.demand}（source=${PIPELINE_LIMITS.source}）`)
 
-// 讀取面來源（MON_READ_SOURCE）。預設 sqlite；切 mysql 失敗會退回 sqlite 並記
-// ERROR（見 lib/read/index.ts 的說明）。切換一律經由重啟：
-//   改 tg-monitor/.env 的一個字 + launchctl kickstart -k com.aladdin.tg-monitor
-const READ_SOURCE = await initReader()
-console.error(`tg-monitor: 讀取面資料源 = ${READ_SOURCE}`)
 
 const app = new Hono()
 
@@ -1092,10 +1104,25 @@ app.get('/api/stream', c => {
 // 刻意不把它塞進 /api/overview：那會改到既有回應的形狀，破壞「sqlite 模式
 // byte-level 不變」的硬驗收。
 app.get('/api/read-source', c => {
+  const raw = process.env.MON_READ_SOURCE
   return c.json({
-    requested: process.env.MON_READ_SOURCE ?? null,
+    // 原始字串，未經解析——設定打錯字時要看得到打錯的那個字。
+    requested: raw ?? null,
     effective: getReader().source,
-    degraded: READ_SOURCE !== resolveReadSource(process.env.MON_READ_SOURCE),
+    // 「要的是 mysql，實際退回了 sqlite」＝探針失敗的靜默降級。
+    degraded: READ_SOURCE !== resolveReadSource(raw),
+    // 這個值本身認不認得（2026-09-02 新增，供 health-monitor 的翻轉條件使用）。
+    //
+    // 為什麼需要它、而不是讓呼叫端自己比 `effective !== requested`：那個裸字串
+    // 比對在**完全健康**的設定下也會成立，實測有三種（皆為正常狀態）：
+    //   MON_READ_SOURCE 未設 → run-monitor.sh 會匯出**空字串** → requested=""、effective="sqlite"
+    //   MON_READ_SOURCE=MySQL → resolveReadSource 大小寫不敏感 → effective="mysql"
+    //   MON_READ_SOURCE='mysql ' → .env 的 grep|cut 匯出常帶尾隨空白，解析時會 trim
+    // 拿它當告警條件會在這三種情況下狂叫。
+    // 正確的兩個訊號是分開的：
+    //   degraded === true        → 要 mysql 卻退回了 sqlite（探針失敗）
+    //   requestedValid === false → 這個字串根本不認得（打錯字，fail-safe 成 sqlite）
+    requestedValid: (raw ?? '').trim() === '' || resolveReadSource(raw) === (raw ?? '').trim().toLowerCase(),
   })
 })
 
