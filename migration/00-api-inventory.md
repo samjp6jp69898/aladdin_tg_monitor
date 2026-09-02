@@ -294,6 +294,19 @@ app.get('/', c => c.html(Bun.file(new URL('./public/index.html', import.meta.url
 - 回傳：`cancelPipeline()` 結果（`lib/ingest.ts:155-193`）`{ ok: boolean, killed: number[], wrapperPid?: number, reason?: string }`，`ok` 為 200 否則 409。`reason` 常見值如 `'not running（可能剛結束，或 ps 快照尚未更新，3 秒後再試）'`
 - 服務分頁：Pipelines（取消按鈕）
 
+
+> **⚠️ 待部署變更（2026-09-02 後端通報，尚未部署、feature flag 目前關閉）**
+> `MON_DB_ENABLED≠1`（現況與部署初期）：回應 **byte-identical，完全不變**，含 reason 文字。
+> flag 開啟後：新增三個 **optional** 欄位 `runId`(string)、`runIdResolvedBy`(string，解析來源標記)、
+> `flagWritten`(boolean)。**既有欄位形狀不變。**
+>
+> 前端不需改動——已查證 `src/lib/mutation.ts` 的 `normalizeActionResult()` 只讀 `ok`/`result`/`reason`，
+> 其餘欄位原封不動放進 `raw`，全鏈路無 schema 嚴格驗證；未知欄位不會造成錯誤，日後要顯示 `runId`
+> 直接從 `raw` 取即可。
+>
+> **本節上方的欄位清單仍是現行部署版本**，是「回應形狀不變」的驗收基準；上述三欄待後端 Phase 3
+> 部署後再併入正式清單。
+
 ### POST /api/pipelines/retry — server.ts:471
 
 - Body：`{ ticket?: string }`
