@@ -277,6 +277,32 @@ async function run(cmd: string[], cwd = REPO): Promise<number> {
   return p.exitCode ?? 1
 }
 
+/**
+ * 從 `run-monitor.sh` 的 `for KEY in <token 清單>; do` 抽出實際被逐一匯出的 key。
+ *
+ * **修的是什麼**（Reviewer B MAJOR-2）：舊判準是
+ * `wrapper.includes('MON_READ_SOURCE')`，而 `run-monitor.sh:13` 有一行**註解**
+ * 就含這個字：
+ *   `# MON_READ_SOURCE（Phase 8，plan §8.1）：讀取面資料源 sqlite|mysql，預設 sqlite。`
+ * 於是把 `:23` 迴圈裡那個 token 拿掉，這一格**仍然是綠的**——而 A 組的定位是
+ * 「這條不過，出事就退不回來，其他都不用談」。**一票否決的關卡被一行註解滿足。**
+ *
+ * 注意 a7-D25 的更正範圍：使用者補 key 之前 A 組確實紅過，那是**歷史上的負面
+ * 測試**，但它證明的是「`.env` 少 key」那一半，**不是** wrapper 白名單這一半。
+ * 這一半在本次修好之前，從來沒有被證明會紅。
+ *
+ * 回空陣列 ＝ 找不到迴圈（wrapper 結構被改過），呼叫端應視為 FAIL 而不是通過。
+ */
+export function extractExportedEnvKeys(wrapperSrc: string): string[] {
+  for (const rawLine of wrapperSrc.split('\n')) {
+    const line = rawLine.trim()
+    if (line.startsWith('#')) continue // 註解不算數——這就是本條缺陷的成因
+    const m = /^for\s+KEY\s+in\s+([^;]+?)\s*;\s*do/.exec(line)
+    if (m) return m[1].trim().split(/\s+/).filter(Boolean)
+  }
+  return []
+}
+
 // ═════════════════════ A. 回滾槓桿（一票否決）═════════════════════
 console.log('\n═══ A. 回滾槓桿（不通就不准切——出事會退不回來）═══')
 {
@@ -286,8 +312,19 @@ console.log('\n═══ A. 回滾槓桿（不通就不准切——出事會退�
     hasKey ? '' : '那份 0600、不進 git 的 .env 少了這個 key，「改一個字 + kickstart」的回滾按鈕是假的')
 
   const wrapper = readFileSync(`${REPO}/launchd/run-monitor.sh`, 'utf8')
-  judge(wrapper.includes('MON_READ_SOURCE'), 'run-monitor.sh 逐 key 匯出白名單含 MON_READ_SOURCE',
-    wrapper.includes('MON_READ_SOURCE') ? '' : 'launchd 起的行程永遠讀不到它')
+  const keys = extractExportedEnvKeys(wrapper)
+  judge(keys.includes('MON_READ_SOURCE'), 'run-monitor.sh 逐 key 匯出白名單含 MON_READ_SOURCE',
+    keys.length === 0
+      ? '找不到 `for KEY in ...; do` 迴圈——wrapper 結構變了，這一格已經不知道自己在驗什麼'
+      : `白名單＝[${keys.join(' ')}]`)
+
+  // 一票否決還要確認 launchd 真的跑的是這支 wrapper——白名單寫得再對，
+  // plist 指到別的地方就白搭。
+  const plistPath = `${REPO}/launchd/com.aladdin.tg-monitor.plist`
+  const plist = existsSync(plistPath) ? readFileSync(plistPath, 'utf8') : ''
+  const usesWrapper = plist.includes('/launchd/run-monitor.sh')
+  judge(usesWrapper, 'plist 的 ProgramArguments 指向 run-monitor.sh',
+    usesWrapper ? '' : 'launchd 起的不是這支 wrapper，上面那格驗的白名單與實際啟動路徑無關')
 }
 
 // ═════════════════════ B. 端點行為（mysql 模式）═════════════════════
