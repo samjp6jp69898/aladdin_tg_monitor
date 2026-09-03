@@ -78,6 +78,52 @@ const REPO = new URL('..', import.meta.url).pathname.replace(/\/$/, '')
 export const STARTED_AT_TOLERANCE_MS = 2000
 
 /**
+ * `finished_at` 的兩軌容差（a7-D28→D36 定案；aladdin-1d 2026-09-03 定值）。
+ *
+ * **為什麼兩軌本來就不相等**（讀碼＋因果順序確認，不是推測）：
+ *   - sqlite 的 `pipeline_runs.finished_at` 不是輪詢當下的時間，是
+ *     `post-run-notify.log` 那一行**自己的時間戳**：`lib/ingest.ts:580` 的
+ *     `finishedAt = cls.loggedAt`，`cls.loggedAt` 來自
+ *     `telegram-dispatcher/lib/pipeline-runner/post-run-notify.ts:91` 的
+ *     `log()` helper 寫那一行時取的 `new Date().toISOString()`。
+ *   - 監控 DB 的 `runs.finished_at` 是**同一支行程稍後**另一次 `new Date()`
+ *     （同檔 `:200`）。程式順序上 `:387` 先 `log(classification=…)`，
+ *     `:394` 才 `await writeAuthoritativeOutcome(...)`。
+ *   兩者中間隔著「`appendFileSync` 返回 + 幾行同步檢查（`isMonitorDbEnabled`、
+ *     讀 `MON_RUN_ID`）」——**跟 `started_at` 同構**：兩次獨立 `new Date()`，
+ *     因果順序決定方向，量級是同行程內同步程式碼的抖動，不是輪詢週期。
+ *
+ * 因此：
+ *   - **方向是單向的**：mysql 的值必然 **≥** sqlite 的值（因果順序決定，不是統計
+ *     傾向）。負差代表配對錯誤或時鐘倒退，一律 FAIL，不給容差（同 D6 的立場）。
+ *   - **樣本**（2026-09-03，n=5，`host='head'`）：4 筆 Δ=1ms、1 筆 Δ=2ms，
+ *     無離群值，方向 100% 一致。
+ *   - **取 200ms，不是實測上界（2ms）本身**：機制雖與 `started_at` 同構，但涉及
+ *     的 I/O 更輕（一次已完成的 `appendFileSync` 之後幾行同步碼，沒有 `started_at`
+ *     那條的行程 spawn），所以不套用 `STARTED_AT_TOLERANCE_MS` 那個為 spawn 抖動
+ *     設的 2000ms（**兩者不共用常數**——這是 a7 已經論證過的立場：合併會讓其中
+ *     一條失去可檢驗的理由）。200ms 是實測上界的 100 倍安全係數，用來吸收
+ *     GC 暫停與磁碟寫入在負載下的偶發抖動，同時遠小於「對錯列」或「timeout
+ *     真正延後結束」會產生的差距（分鐘級）。**這是判斷，不是量出來的**——
+ *     樣本更多之後如果經常貼著上界，要收緊或放寬都改這個常數，不要改判準本身。
+ *   - 本腳本會印出**實測到的最大差值**，同 `started_at` 的做法。
+ *
+ * **適用範圍（a7-D36 §2.3 定案）**：
+ *   - 僅適用 `host='head'` 的配對（同 `started_at` 的單一時鐘前提）。
+ *   - **`outcome='timeout'` 的列整條排除、不進本容差、也不進逐字相等**：
+ *     `ingest.ts:585-588` 對 timeout 走 `startedAt + CREATE_MR_TIMEOUT_SECONDS`
+ *     推算出的 finished_at，不是真實結束時間；mysql 記的是真正 exit 時間。
+ *     差到分鐘級是**設計如此**，跟這條容差要抓的「同步程式碼抖動」不是同一種
+ *     現象，硬套會把第一筆 timeout run 直接打爆容差——所以是整列豁免，不是
+ *     放寬容差去吞它。
+ *   - 與既有的 `outcome_source='tracker_reconcile'` 豁免（§9.2-1）**不是同一類、
+ *     不共用判準**：那條是 mon_ui 結構上永遠沒有 UPDATE `finished_at` 的授權，
+ *     屬於永久性缺口，差值可以是分鐘到小時級；這條是兩次時鐘讀取的正常抖動，
+ *     差值恆定在個位數到低兩位數毫秒。
+ */
+export const FINISHED_AT_TOLERANCE_MS = 200
+
+/**
  * `agent_runs.cost_usd` 的兩軌比對。
  *
  * **為什麼兩軌本來就不相等**（讀過原始碼與實測，不是推測）：
@@ -503,8 +549,9 @@ for (const q of ['admin', 'Admin', 'ADMIN']) {
   judge(a.totalEvents === b.totalEvents, 'C3 stats.totalEvents 一致', `${a.totalEvents} vs ${b.totalEvents}`)
 }
 
-// C4/C5 runs：覆蓋率 + 逐欄（started_at 走容差）
+// C4/C5 runs：覆蓋率 + 逐欄（started_at/finished_at 走容差）
 let observedMaxDelta = Number.NEGATIVE_INFINITY
+let observedMaxFinishedDelta = Number.NEGATIVE_INFINITY
 {
   const [a, b] = [await sqliteReader.pipelineRuns(FULL), await mysqlReader.pipelineRuns(FULL)]
   const bk = new Map(b.map(r => [r.key, r]))
@@ -514,12 +561,15 @@ let observedMaxDelta = Number.NEGATIVE_INFINITY
   judge(missing.length === 0, 'C4 sqlite 的每一筆 run 在 mysql 都找得到',
     `sqlite=${a.length} mysql=${b.length} 缺=${missing.length}${missing.length ? '（例：' + missing.slice(0, 3).map(r => r.key).join(', ') + '）' : ''}`)
 
-  const IGNORE = new Set(['started_at', 'host', 'run_id', 'agents', 'agent_count', 'total_input', 'total_output', 'total_cost'])
+  const IGNORE = new Set(['started_at', 'finished_at', 'host', 'run_id', 'agents', 'agent_count', 'total_input', 'total_output', 'total_cost'])
   const fieldDiffs: string[] = []
   const badDelta: string[] = []
+  const badFinishedDelta: string[] = []
   let backfillPairs = 0
   const crossHostPairs: string[] = []
   const finishedAtExempt: string[] = []
+  const finishedAtTimeoutExempt: string[] = []
+  const finishedAtTolerated: string[] = []
   const outcomeDiff3Exempt: string[] = []
   const roundsExempt: string[] = []
   for (const r of a) {
@@ -538,6 +588,33 @@ let observedMaxDelta = Number.NEGATIVE_INFINITY
       observedMaxDelta = Math.max(observedMaxDelta, delta)
       if (delta < 0 || delta > STARTED_AT_TOLERANCE_MS) badDelta.push(`${r.key} Δ=${delta}ms`)
     }
+
+    // finished_at：獨立於通用逐欄迴圈之外處理（同 started_at 的位置與理由，見
+    // FINISHED_AT_TOLERANCE_MS 說明）。三層判斷依序試：既有的 tracker_reconcile
+    // 永久性豁免 → D36 的 timeout 整列豁免 → head-host 容差 → 其餘真差異。
+    {
+      const sVal = r.finished_at ?? null
+      const mVal = (o as any).finished_at ?? null
+      if (JSON.stringify(sVal) !== JSON.stringify(mVal)) {
+        if (isFinishedAtExempt(meta.outcome_source)) {
+          finishedAtExempt.push(`${r.key}（outcome_source=${meta.outcome_source}）`)
+        } else if (r.outcome === 'timeout') {
+          finishedAtTimeoutExempt.push(`${r.key}：sqlite=${JSON.stringify(sVal)} mysql=${JSON.stringify(mVal)}`)
+        } else if (host === 'head' && sVal !== null && mVal !== null) {
+          const fDelta = Date.parse(mVal as string) - Date.parse(sVal as string)
+          observedMaxFinishedDelta = Math.max(observedMaxFinishedDelta, fDelta)
+          if (fDelta < 0 || fDelta > FINISHED_AT_TOLERANCE_MS) {
+            badFinishedDelta.push(`${r.key} Δ=${fDelta}ms`)
+          } else {
+            finishedAtTolerated.push(`${r.key} Δ=${fDelta}ms`)
+          }
+        } else {
+          // 非 head 配對，或一邊為 null 一邊有值：不在本容差適用範圍內，維持嚴格判定。
+          fieldDiffs.push(`${r.key}.finished_at: sqlite=${JSON.stringify(sVal)} mysql=${JSON.stringify(mVal)}`)
+        }
+      }
+    }
+
     // rounds 出窗方向敏感豁免（§9.3）：以這一筆 run 的 finished_at 判斷是否出窗。
     // 執行中的 run（finished_at 為 null）不適用——交給自然收斂，不是本豁免的範圍。
     const finishedAtMs = (o as any).finished_at ? Date.parse((o as any).finished_at) : null
@@ -547,10 +624,6 @@ let observedMaxDelta = Number.NEGATIVE_INFINITY
       const sVal = (r as any)[col] ?? null
       const mVal = (o as any)[col] ?? null
       if (JSON.stringify(sVal) === JSON.stringify(mVal)) continue
-      if (col === 'finished_at' && isFinishedAtExempt(meta.outcome_source)) {
-        finishedAtExempt.push(`${r.key}（outcome_source=${meta.outcome_source}）`)
-        continue
-      }
       if (col === 'outcome' && isOutcomeDifference3Exempt(sVal, meta.outcome_tier)) {
         outcomeDiff3Exempt.push(`${r.key}: sqlite=${JSON.stringify(sVal)} mysql=${JSON.stringify(mVal)}（tier=${meta.outcome_tier}）`)
         continue
@@ -567,14 +640,20 @@ let observedMaxDelta = Number.NEGATIVE_INFINITY
     `實測最大 Δ=${Number.isFinite(observedMaxDelta) ? observedMaxDelta + 'ms' : "n/a（無 host='head' 交集樣本）"}` +
       `｜回填列已排除 ${backfillPairs} 筆（Δ≡0 by construction）` +
       (badDelta.length ? ` 逾差：${badDelta.slice(0, 3).join('; ')}` : ''))
+  judge(badFinishedDelta.length === 0,
+    `C5 runs.finished_at 在容差內（0 ≤ Δ ≤ ${FINISHED_AT_TOLERANCE_MS}ms，Δ = mysql − sqlite，僅 host='head' 且 outcome≠'timeout' 配對）`,
+    `實測最大 Δ=${Number.isFinite(observedMaxFinishedDelta) ? observedMaxFinishedDelta + 'ms' : "n/a（無符合資格樣本）"}` +
+      (badFinishedDelta.length ? ` 逾差：${badFinishedDelta.slice(0, 3).join('; ')}` : ''))
   // 非 head 配對是 key 碰撞的訊號，不靜靜跳過。
   judge(crossHostPairs.length === 0,
     "C5b 沒有 host≠'head' 的配對（head 的 sqlite 結構上只有本機 run，配到別台＝legacy_key 撞了）",
     crossHostPairs.length ? crossHostPairs.slice(0, 3).join('; ') : '')
   judge(fieldDiffs.length === 0, 'C5 runs 其餘每一欄逐字相等',
     fieldDiffs.length ? fieldDiffs.slice(0, 4).join(' | ') : '')
-  // 三條豁免逐列印出，不靜默（每一條都是日後可能吞掉真差異的地方）。
+  // 豁免與容差內差異逐列印出，不靜默（每一條都是日後可能吞掉真差異的地方）。
   if (finishedAtExempt.length) console.log(`[EXEMPT] C5 finished_at（outcome_source=tracker_reconcile，共 ${finishedAtExempt.length} 筆）：${finishedAtExempt.slice(0, 10).join('; ')}`)
+  if (finishedAtTimeoutExempt.length) console.log(`[EXEMPT] C5 finished_at（outcome=timeout，a7-D36 §2.3 條件3，共 ${finishedAtTimeoutExempt.length} 筆）：${finishedAtTimeoutExempt.slice(0, 10).join('; ')}`)
+  if (finishedAtTolerated.length) console.log(`[TOLERATED] C5 finished_at 容差內差異（共 ${finishedAtTolerated.length} 筆，非靜默僅供追蹤）：${finishedAtTolerated.slice(0, 10).join('; ')}`)
   if (outcomeDiff3Exempt.length) console.log(`[EXEMPT] C5 outcome 差異3（sqlite 已 reconcile、mysql 仍 tier1，共 ${outcomeDiff3Exempt.length} 筆）：${outcomeDiff3Exempt.slice(0, 10).join('; ')}`)
   if (roundsExempt.length) console.log(`[EXEMPT] C5 rounds 出窗歷史殘差（共 ${roundsExempt.length} 筆）：${roundsExempt.slice(0, 10).join('; ')}`)
 }
