@@ -403,8 +403,9 @@ class FakeRoundsWritePool {
     if (!sql.startsWith('UPDATE runs')) throw new Error(`FakeRoundsWritePool: 未預期的 SQL：${sql}`)
     // 守衛 SQL 形狀斷言（測試檔直接檢查文字，確保 WHERE 子句真的把兩欄的
     // 單調不回退檢查都包進去，不是只在應用層做）。
-    expect(sql).toContain('review_rounds = ?')
-    expect(sql).toContain('final_review_rounds = ?')
+    // 0→NULL 的 SQL 文字釘（a7 2026-09-03 裁定，D15：null=不知道不得寫成 0）
+    expect(sql).toContain('review_rounds = NULLIF(?, 0)')
+    expect(sql).toContain('final_review_rounds = NULLIF(?, 0)')
     expect(sql).toContain('review_rounds IS NULL OR review_rounds <=')
     expect(sql).toContain('final_review_rounds IS NULL OR final_review_rounds <=')
     const [reviewRounds, finalReviewRounds, runId, host] = params as [number, number, string, string]
@@ -413,8 +414,9 @@ class FakeRoundsWritePool {
     const reviewOk = row.review_rounds === null || row.review_rounds <= reviewRounds
     const finalOk = row.final_review_rounds === null || row.final_review_rounds <= finalReviewRounds
     if (!reviewOk || !finalOk) return [{ info: 'Rows matched: 0  Changed: 0  Warnings: 0' }, []]
-    row.review_rounds = reviewRounds
-    row.final_review_rounds = finalReviewRounds
+    // 與 NULLIF(?, 0) 逐字對照：0 落庫為 NULL。
+    row.review_rounds = reviewRounds === 0 ? null : reviewRounds
+    row.final_review_rounds = finalReviewRounds === 0 ? null : finalReviewRounds
     return [{ info: 'Rows matched: 1  Changed: 1  Warnings: 0' }, []]
   }
 }
@@ -449,6 +451,29 @@ describe('writeRunRounds', () => {
     const r = await writeRunRounds(pool, { runId: 'run-nope', reviewRounds: 1, finalReviewRounds: 0 })
     expect(r.ok).toBe(false)
   })
+
+  // ── 0→NULL（a7 2026-09-03 裁定；b5 擋門抓到 sqlite=null vs mysql=0）──
+  test('D15：rounds=0 落庫為 NULL 不是 0——「還沒有 reviewer 被派工」不得被寫成「輪數確實是 0」', async () => {
+    const pool = new FakeRoundsWritePool()
+    pool.rows.set('run-z', { run_id: 'run-z', host: 'head', review_rounds: null, final_review_rounds: null })
+    const r = await writeRunRounds(pool, { runId: 'run-z', reviewRounds: 0, finalReviewRounds: 0 })
+    expect(r.ok).toBe(true)
+    expect(pool.rows.get('run-z')).toEqual({ run_id: 'run-z', host: 'head', review_rounds: null, final_review_rounds: null })
+  })
+
+  test('自癒：修法前誤寫成 0 的列（守衛 0<=0 通過）在下一次寫入被改回 NULL；有值的一欄照常前進', async () => {
+    const pool = new FakeRoundsWritePool()
+    pool.rows.set('run-h', { run_id: 'run-h', host: 'head', review_rounds: 0, final_review_rounds: 0 })
+    const r1 = await writeRunRounds(pool, { runId: 'run-h', reviewRounds: 0, finalReviewRounds: 0 })
+    expect(r1.ok).toBe(true)
+    expect(pool.rows.get('run-h')).toEqual({ run_id: 'run-h', host: 'head', review_rounds: null, final_review_rounds: null })
+
+    const pool2 = new FakeRoundsWritePool()
+    pool2.rows.set('run-h2', { run_id: 'run-h2', host: 'head', review_rounds: 0, final_review_rounds: 0 })
+    const r2 = await writeRunRounds(pool2, { runId: 'run-h2', reviewRounds: 2, finalReviewRounds: 0 })
+    expect(r2.ok).toBe(true)
+    expect(pool2.rows.get('run-h2')).toEqual({ run_id: 'run-h2', host: 'head', review_rounds: 2, final_review_rounds: null })
+  })
 })
 
 // ---------- persistReviewRoundsToMonDb（cache + 1000ms 預算，budgetMs 可覆寫供測試） ----------
@@ -472,8 +497,9 @@ class FakeRoundsFullPool {
       const reviewOk = row.review_rounds === null || row.review_rounds <= reviewRounds
       const finalOk = row.final_review_rounds === null || row.final_review_rounds <= finalReviewRounds
       if (!reviewOk || !finalOk) return [{ info: 'Rows matched: 0  Changed: 0  Warnings: 0' }, []]
-      row.review_rounds = reviewRounds
-      row.final_review_rounds = finalReviewRounds
+      // 與 NULLIF(?, 0) 逐字對照：0 落庫為 NULL。
+      row.review_rounds = reviewRounds === 0 ? null : reviewRounds
+      row.final_review_rounds = finalReviewRounds === 0 ? null : finalReviewRounds
       return [{ info: 'Rows matched: 1  Changed: 1  Warnings: 0' }, []]
     }
     throw new Error(`FakeRoundsFullPool: 未預期的 SQL：${sql}`)
@@ -514,7 +540,8 @@ describe('persistReviewRoundsToMonDb', () => {
     const r1 = await persistReviewRoundsToMonDb(pool, { key: 'FAQ-1.a', ticket: 'FAQ-1', stdoutPath: '/logs/FAQ-1.a.stdout.log', reviewRounds: 1, finalReviewRounds: 0 })
     expect(r1.wrote).toBe(true)
     expect(pool.calls.map(c => c.kind)).toEqual(['resolve', 'write'])
-    expect(pool.writeRows.get('run-1')).toEqual({ run_id: 'run-1', host: 'head', review_rounds: 1, final_review_rounds: 0 })
+    // final=0 落庫為 NULL（0→NULL 裁定）；review=1 照常。
+    expect(pool.writeRows.get('run-1')).toEqual({ run_id: 'run-1', host: 'head', review_rounds: 1, final_review_rounds: null })
 
     pool.calls = []
     const r2 = await persistReviewRoundsToMonDb(pool, { key: 'FAQ-1.a', ticket: 'FAQ-1', stdoutPath: '/logs/FAQ-1.a.stdout.log', reviewRounds: 1, finalReviewRounds: 0 })

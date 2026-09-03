@@ -400,9 +400,16 @@ export async function resolveRunIdForRounds(
   return selectSingleRunId(pool, ROUNDS_RESOLVE_SQL, [RUNS_HOST, ticket, legacyKey ?? null, stdoutPath ?? null])
 }
 
+// 0 → NULL（a7 2026-09-03 裁定，b5 擋門抓到的兩軌差異）：sqlite 側慣例是
+// 「0 或無值就不帶欄位」（bumpReviewRounds 呼叫端 `counts.x > 0 ? x : null`），
+// mysql 側原樣寫 0 會把「還沒有任何 reviewer 被派工（不知道）」說成「輪數確實
+// 是 0」——D15 硬約束：null=不知道，不得轉成 0。NULLIF 在 SQL 邊界轉換，
+// TS 型別與呼叫端不動；順帶自癒：既有誤寫成 0 的列（守衛 0 <= 0 通過）下一次
+// 寫入會被改回 NULL。刻意**不做**三態（0=確實零輪）——需要「有沒有進過
+// review」的訊號，目前沒有消費端需要，a7 裁定範圍就是一律 NULL。
 const WRITE_ROUNDS_SQL = `
 UPDATE runs
-   SET review_rounds = ?, final_review_rounds = ?
+   SET review_rounds = NULLIF(?, 0), final_review_rounds = NULLIF(?, 0)
  WHERE run_id = ? AND host = ?
    AND (review_rounds IS NULL OR review_rounds <= ?)
    AND (final_review_rounds IS NULL OR final_review_rounds <= ?)
