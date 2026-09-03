@@ -14,7 +14,9 @@
 // 副作用邊界（誠實列出，第一版踩過一次）：
 //   - 另起一個 server（隨機空 port），`TG_MONITOR_DB` 指向 VACUUM INTO 出來的暫存
 //     sqlite 副本 → **不寫 data/monitor.sqlite**；
-//   - 對監控 DB 只有 SELECT；
+//   - 對監控 DB 只有 SELECT——**子行程以 `MON_DB_ENABLED=0` 派生**，所以它的
+//     collector 不會寫 spool / 心跳 / runs（見下方 spawn 處的註解）。這一句在
+//     2026-09-03 之前是不真的：子行程繼承了 live 的 `MON_DB_ENABLED=1`；
 //   - log 那一節會在 `DISPATCHER_LOG_DIR` 底下造一個**自己的**檔案再刪掉
 //     （白名單只涵蓋那個目錄，所以不能放到 /tmp）。檔名刻意避開 collector 的
 //     pipeline log 規則——見該節的註解，第一版沒避開，害線上 collector 生出四筆
@@ -49,7 +51,24 @@ const PORT = freePort()
 
 const proc = Bun.spawn(['bun', 'run', join(REPO, 'server.ts')], {
   cwd: REPO,
-  env: { ...process.env, TG_MONITOR_PORT: String(PORT), TG_MONITOR_DB: dbCopy, MON_READ_SOURCE: source },
+  // MON_DB_ENABLED: '0' 是**必要的**，不是保險（Reviewer B MAJOR-4）：
+  // `process.env` 含 Bun 從 cwd 自動載入的 .env，若 live 是 '1' 就會被繼承，
+  // 而 server.ts:57 無條件 startCollectors() ⇒ 子行程開機就 probeAll()（每個
+  // service 各落一筆基準列進真實 SPOOL_DIR）、heartbeatTick()（覆蓋 live 的
+  // (host,'tg-monitor') 心跳）、scanPipelineRuns()（對 live runs 發 UPDATE）。
+  // 那些 spool 條目由 head 的重放者原封寫進 live service_status_log /
+  // monitor_heartbeat —— **驗收腳本污染它正在觀測的系統**，而且檔頭還寫著
+  // 「對監控 DB 只有 SELECT」。
+  // 讀取面與寫入面本就獨立（lib/read/source.ts:5-6 自己這麼說），所以關掉寫入面
+  // 不影響 `MON_READ_SOURCE=mysql` 的驗收——實測子行程仍回
+  // {effective:'mysql', degraded:false}。
+  env: {
+    ...process.env,
+    TG_MONITOR_PORT: String(PORT),
+    TG_MONITOR_DB: dbCopy,
+    MON_READ_SOURCE: source,
+    MON_DB_ENABLED: '0',
+  },
   stdout: 'pipe',
   stderr: 'pipe',
 })

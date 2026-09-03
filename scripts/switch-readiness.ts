@@ -6,6 +6,11 @@
 // 這支是給總指揮調度切換時序用的**單一判準**：exit 0 才代表「切過去不會壞、
 // 壞了退得回來」。它不切換任何東西、不寫任何檔案、對監控 DB 只有 SELECT。
 //
+// ⚠️ 「只有 SELECT」這句在 2026-09-03 之前**不真**（Reviewer B MAJOR-4）：B 組派生的
+// `verify-stream.ts` 會另起一個 server，而它繼承了 live 的 `MON_DB_ENABLED=1`，
+// 於是子行程的 collector 對 live 監控 DB 寫入（spool 基準列、心跳 upsert、runs
+// UPDATE）。已修：spawn 時明確帶 `MON_DB_ENABLED='0'`。
+//
 // 判準分四組，任一組 FAIL 就不可切：
 //   A. 回滾槓桿是通的（一票否決：這條不過，出事就退不回來，其他都不用談）
 //   B. 端點行為在 mysql 模式下正確
