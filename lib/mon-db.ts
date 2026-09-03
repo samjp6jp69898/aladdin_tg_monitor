@@ -858,6 +858,15 @@ export function appendStatusLogToSpool(args: StatusLogSpoolEntryArgs, dir: strin
 //     任何管道知道自己這一份 spool 檔已被重放到哪個 offset，因此無法算出有意
 //     義的 backlog 深度。依總指揮指示「取不到就 null/0」，本函式一律傳 null，
 //     不發明假數據。
+//   - **告警解讀陷阱（closeout §6 殘留項，2026-09-03 補文件；不改行為）**：
+//     `monitor_heartbeat` 裡這一列的新鮮度＝「tg-monitor 活著」**與**「head
+//     的重放者正常在排水」的合取，不是單純「tg-monitor 活著」。這條 append
+//     只把心跳寫進本機 spool，真正落庫（決定告警看到的 ts）是 head 上的重放
+//     者。重放者掛掉或積壓時，即使 tg-monitor 完全正常，這條心跳也會被判定
+//     過期。完整的告警端解讀寫在
+//     telegram-dispatcher/lib/monitor-db/alerts.ts 條件 (a) 的
+//     `(head,'tg-monitor')` 分支註解——收到那條告警要先看 (b) spool 深度有
+//     沒有同時翻轉，才能判斷是 tg-monitor 本身還是重放者的問題。
 // ─────────────────────────────────────────────────────────────────────────
 
 /**
