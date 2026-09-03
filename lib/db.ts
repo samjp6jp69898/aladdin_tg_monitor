@@ -206,7 +206,13 @@ const bumpReviewRoundsStmt = db.prepare(`
   WHERE key = @key
 `)
 export function bumpReviewRounds(key: string, reviewRounds: number | null, finalReviewRounds: number | null) {
-  bumpReviewRoundsStmt.run({ key, review_rounds: reviewRounds, final_review_rounds: finalReviewRounds })
+  // bun:sqlite 具名參數：綁定物件的 key 要帶 @ 前綴（同 upsertAgentRun 的既有
+  // 註記）。裸 key 不是錯誤而是**靜默綁 NULL**：@x IS NOT NULL 恆 false、
+  // WHERE key=NULL 恆不中 → changes=0 的完美 no-op——本函式因此從 2026-09-02
+  // 誕生起一次都沒寫進去過（53 列全 NULL），UI 即時輪數走 getReviewRoundCounts
+  // 現算所以畫面一直是好的，直到 b5 的雙軌逐欄擋門照出來（2026-09-03 修）。
+  // 這一類坑由 db.named-binding.test.ts 的綁定形式掃描釘住，不只釘本函式。
+  bumpReviewRoundsStmt.run({ '@key': key, '@review_rounds': reviewRounds, '@final_review_rounds': finalReviewRounds } as never)
 }
 
 const agentMtimeStmt = db.prepare('SELECT file_mtime FROM agent_runs WHERE path = ?')
