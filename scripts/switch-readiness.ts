@@ -400,20 +400,54 @@ for (const q of ['admin', 'Admin', 'ADMIN']) {
   judge(a.length === b.length, `C1b events?q=${q} 筆數一致`, `sqlite=${a.length} mysql=${b.length}`)
 }
 
-// C1c events 回傳順序自洽（單軌：mysql 軌自己必須是嚴格 ts DESC, id DESC）
-// C1 是集合比對（setEqual 建 Set），對順序與重複列都不敏感——這一格補的正是它。
+// C1c events 分頁自洽（單軌：逐頁走完必須等於一次 FULL）
+//
+// **這一格換過內容，換的理由本身值得記**（a7-D55）：
+// 原本的 C1c 是「`queryEvents(FULL)` 回來的列是嚴格 ts DESC, id DESC」。它在
+// `ORDER BY` 還是 `e.id DESC` 的時候是**真紅的**——它抓到了 mysql 軌第一筆比
+// 內容上最新那筆舊 19 小時。但 `96cd9f2` 把 `ORDER BY` 改成 `ts DESC, id DESC`
+// 之後，它就退化成**同義反覆**：MySQL 保證 ORDER BY 成立，所以除非有人改掉
+// 那個子句，它永遠是綠的。
+//
+// **一個檢查在它所偵測的缺陷被修好之後，可能失去偵測力，而沒有人會發現——
+// 因為它從此永遠是綠的，看起來像在工作。**（D47 的鏡像：D47 是「綠燈根本沒
+// 測到這件事」，D55 是「檢查曾經有效，是因為修復而失效」。）
+//
+// 所以換成真正對應 D46 缺陷族的判準：**跨頁**重複／遺漏。那才是換游標的理由——
+// 只比 id 的游標配上 ts 排序會跳頁與重複列，而那不會在單頁的 ORDER BY 上顯現。
+// 這一格同時涵蓋舊判準：若有人把 ORDER BY 改回 id DESC 而游標仍是 (ts, id)，
+// 逐頁的結果就會與 FULL 不一致。
+//
+// 單軌、不與 sqlite 比：兩軌 id 是各自獨立的 AUTO_INCREMENT，逐列比會因**合法的**
+// 插入順序差異而紅。附帶好處是 Phase 9 退役 sqlite collector 之後仍然有效（D38）。
 {
-  const f = { errorsOnly: false, toolOnly: false, limit: FULL } as any
-  const mrows = await mysqlReader.queryEvents(f)
-  const bad = findOrderViolations(mrows as any)
-  // sqlite 側只印不判：它是要退役的那一軌，且其亂序不擋切換（a7-D46）。
-  const srows = await sqliteReader.queryEvents(f)
-  const sBad = findOrderViolations(srows as any)
-  judge(bad.length === 0,
-    'C1c /api/events 的 mysql 軌回傳順序是嚴格 ts DESC, id DESC',
-    (bad.length
-      ? `違規相鄰對 ${bad.length} 處（例：${bad.slice(0, 2).join('; ')}）｜第一筆 ts=${(mrows[0] as any)?.ts}`
-      : '') + `｜參考：sqlite 軌 ${sBad.length} 處（不判，該軌待退役）`)
+  const f = { errorsOnly: false, toolOnly: false } as any
+  const full = (await mysqlReader.queryEvents({ ...f, limit: FULL })) as any[]
+  const PAGE = 500
+  const seen: any[] = []
+  let cur: { ts: string; id: number } | undefined
+  let pages = 0
+  let runaway = false
+  for (;;) {
+    const page = (await mysqlReader.queryEvents(
+      cur ? { ...f, limit: PAGE, beforeTs: cur.ts, beforeId: cur.id } : { ...f, limit: PAGE },
+    )) as any[]
+    seen.push(...page)
+    pages++
+    if (page.length < PAGE) break
+    const last = page[page.length - 1]
+    cur = { ts: last.ts, id: last.id }
+    if (pages > Math.ceil(full.length / PAGE) + 5) { runaway = true; break }
+  }
+  const ids = seen.map(r => r.id)
+  const dup = ids.length - new Set(ids).size
+  const fullIds = new Set(full.map(r => r.id))
+  const missing = [...fullIds].filter(id => !new Set(ids).has(id)).length
+  const orderKept = JSON.stringify(ids) === JSON.stringify(full.map(r => r.id))
+  judge(!runaway && dup === 0 && missing === 0 && orderKept,
+    'C1c /api/events 逐頁走完 ＝ 一次 FULL（無重複、無遺漏、跨頁順序一致）',
+    `${pages} 頁 / 分頁 ${seen.length} 列 / FULL ${full.length} 列｜重複 ${dup}｜遺漏 ${missing}` +
+      `｜跨頁順序${orderKept ? '一致' : '不一致'}${runaway ? '｜⚠️ 頁數未收斂' : ''}`)
 }
 
 // C2 sessions：順序也要一致（session 串接吃順序）
