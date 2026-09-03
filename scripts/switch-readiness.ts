@@ -1,7 +1,8 @@
 // scripts/switch-readiness.ts — 「可以切 MON_READ_SOURCE=mysql 了嗎」的可執行判準。
 //
 //   cd /Users/user/aladdin/tg-monitor && bun run scripts/switch-readiness.ts
-//   （加 --skip-slow 略過要另起 server 的 B 組；退出碼 0 = 全綠 = 可以切）
+//   （加 --skip-slow 略過要另起 server 的 B 組）
+//   退出碼：0＝全綠可切／1＝有項目未過／2＝沒有未過但有未驗（--skip-slow）
 //
 // 這支是給總指揮調度切換時序用的**單一判準**：exit 0 才代表「切過去不會壞、
 // 壞了退得回來」。它不切換任何東西、不寫任何檔案、對監控 DB 只有 SELECT。
@@ -222,6 +223,41 @@ export function judgeWriteSideField(
 
 let fails = 0
 let checks = 0
+/** 被略過（未驗）的項數。跳過 ≠ 通過，所以它會讓結論與退出碼都不同於全綠。 */
+let skipped = 0
+
+/**
+ * 結論與退出碼（Reviewer B MINOR-5）。
+ *
+ * **修的是什麼**：舊版是 `fails === 0 ? '可以切' : '不可切'` 與
+ * `process.exit(fails === 0 ? 0 : 1)`——`--skip-slow` 把 B 組整組略過時，
+ * 結論列與退出碼**與全綠一模一樣**。於是讀到 exit 0 的人無從知道 B 組
+ * 有沒有被驗過，而 B 組正是 BLOCKER-1 所在。
+ *
+ * 更糟的是兩個缺陷的交互：MAJOR-4 修好之前，跑完整模式會污染 live 監控 DB
+ * ⇒ 大家的理性選擇就是 `--skip-slow` ⇒ **恰好跳過含 BLOCKER 的那一組**。
+ * 任何一條單獨看都不致命，合起來讓「exit 0」這句話失去意義。
+ *
+ * 退出碼三態，1 與 2 分開是為了讓自動化也能區分：
+ *   0 = 全部驗過且全過 → 可以切
+ *   1 = 有項目未過
+ *   2 = 沒有未過，但有項目未驗（跳過不等於通過）
+ */
+export function concludeVerdict(fails: number, checks: number, skipped: number): { verdict: string; exitCode: 0 | 1 | 2 } {
+  if (fails > 0) {
+    return {
+      verdict: `**不可切**（${fails}/${checks} 項未過${skipped ? `，另有 ${skipped} 項未驗` : ''}）`,
+      exitCode: 1,
+    }
+  }
+  if (skipped > 0) {
+    return {
+      verdict: `**未完整驗證**（${checks} 項已過，但 ${skipped} 項被 --skip-slow 略過而未驗；跳過不等於通過）`,
+      exitCode: 2,
+    }
+  }
+  return { verdict: '**可以切** MON_READ_SOURCE=mysql', exitCode: 0 }
+}
 function ok(label: string, detail = '') {
   checks++
   console.log(`[OK]   ${label}${detail ? '  — ' + detail : ''}`)
@@ -257,7 +293,12 @@ console.log('\n═══ A. 回滾槓桿（不通就不准切——出事會退�
 // ═════════════════════ B. 端點行為（mysql 模式）═════════════════════
 console.log('\n═══ B. 端點行為（mysql 模式）═══')
 if (skipSlow) {
-  console.log('[SKIP] --skip-slow：略過 sse-segfault-repro 與 verify-stream')
+  // 「跳過」不等於「通過」（Reviewer B MINOR-5）：B 組整組被略過時，舊版的結論列
+  // 與退出碼與全綠**一模一樣**，於是讀到 exit 0 的人無從知道 B 組有沒有被驗過。
+  // 而 B 組正是 BLOCKER-1 所在，且在 MAJOR-4 修好之前，跑完整模式會污染 live
+  // ⇒ 大家的理性選擇就是 --skip-slow ⇒ **恰好跳過含 BLOCKER 的那一組**。
+  skipped += 2
+  console.log('[SKIP] --skip-slow：略過 sse-segfault-repro 與 verify-stream（此二項未驗，結論不會是「可以切」）')
 } else {
   judge((await run(['bun', 'run', 'scripts/sse-segfault-repro.ts'])) === 0,
     'sse-segfault-repro.ts（§8.2 前置關卡）', 'FAIL 就維持輪詢、不上 SSE')
@@ -509,10 +550,14 @@ console.log('\n═══ D. 寫入端已知缺口（切過去之後畫面上真�
 }
 
 // ═════════════════════ 結論 ═════════════════════
-console.log(`\n═══ 結論：${fails === 0 ? '**可以切** MON_READ_SOURCE=mysql' : `**不可切**（${fails}/${checks} 項未過）`} ═══`)
-if (fails === 0) {
+const { verdict, exitCode } = concludeVerdict(fails, checks, skipped)
+console.log(`\n═══ 結論：${verdict} ═══`)
+if (fails === 0 && skipped > 0) {
+  console.log('要得到「可以切」必須不帶 --skip-slow 跑完整模式（B 組含 §8.2 前置關卡與 27 項端點行為）。')
+}
+if (fails === 0 && skipped === 0) {
   console.log('切換步驟：改 tg-monitor/.env 的 MON_READ_SOURCE=mysql → launchctl kickstart -k com.aladdin.tg-monitor')
   console.log('回滾步驟：同上改回 sqlite 再 kickstart（秒級，不需 commit / push / sync-workers）')
   console.log('切完立刻打 /api/read-source 確認 effective=mysql 且 degraded=false（探針失敗會靜默退回 sqlite）')
 }
-process.exit(fails === 0 ? 0 : 1)
+process.exit(exitCode)
