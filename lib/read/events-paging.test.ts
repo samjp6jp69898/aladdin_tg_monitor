@@ -22,7 +22,19 @@ const FIXTURES: { ts: string; tag: string }[] = [
   { ts: '2026-09-01T12:00:00.000Z', tag: 'e' },
 ]
 
-const SERVICE = 'paging-fixture'
+// 縱深防禦（2026-09-03 踩過一次）：即使 import 順序又出問題，也絕不寫進 live DB。
+// 靠「別的檔案有沒有記得先 import test-tmp-db」來保護 live 資料太脆弱——
+// 那是一個沒有守衛的約定，而約定會被下一個新增測試檔的人漏掉。
+const DB_FILE = (db as any).filename ?? process.env.TG_MONITOR_DB ?? ''
+if (!/tg-monitor-test-db-|[\\/]tmp[\\/]|[\\/]var[\\/]folders[\\/]/.test(DB_FILE)) {
+  throw new Error(
+    `events-paging.test.ts 拒絕執行：sqlite 路徑不是暫存檔而是 ${DB_FILE}。\n` +
+      '成因是 import 順序——有測試檔在 test-tmp-db.ts 之前就載入了 lib/db.ts。\n' +
+      '請確認每個（直接或間接）import ./db.ts 的測試檔都把 test-tmp-db 放在第一行。',
+  )
+}
+
+const SERVICE = 'paging-fixture' 
 const stmt = db.prepare(
   `INSERT INTO events (service, ts, event, identity, source_ip, method, path, tool, result,
                        agrabah_identifier, duration_ms, reason, raw)

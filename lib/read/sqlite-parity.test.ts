@@ -21,6 +21,13 @@
 // 這份字串要人工核對一次——落地時已用腳本對 `git show f3dbe92:server.ts`
 // 逐條驗過 30 條全部命中，之後 review 這個檔案時請一併重看。）
 
+// **必須是第一個 import**：本檔 import './sqlite.ts'（→ '../db.ts'），而 db.ts 在
+// import 當下就依 TG_MONITOR_DB 開檔。多檔同行程跑 bun test 時，誰先載入 db.ts
+// 誰就決定了 DB_PATH——本檔原本沒有這一行，於是它會先把 db.ts 綁到使用者真正的
+// data/monitor.sqlite，讓同批其他測試檔的 test-tmp-db 失效（2026-09-03 實際發生：
+// events-paging.test.ts 的 7 筆 fixture 寫進了 live monitor.sqlite）。
+// 這正是 lib/test-tmp-db.ts 檔頭那條規則要防的事，而本檔違反了它。
+import '../test-tmp-db.ts'
 import { describe, expect, test } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { sqliteReader } from './sqlite.ts'
