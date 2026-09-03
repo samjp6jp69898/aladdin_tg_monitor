@@ -145,11 +145,73 @@ export function findOrderViolations(rows: { ts: string; id?: number }[]): string
  * 這些欄位一旦切過去就是畫面上真的看不到的東西，不是可以「之後再說」的。
  */
 const WRITE_SIDE_GAPS = [
-  { field: 'stderr_path', owner: '寫入端（spawn-create-mr → runs）', note: 'migration 004 已補欄' },
-  { field: 'triggered_by', owner: '寫入端（triggered_by_name / triggered_by_email）', note: '沒有它，列表「發起人」欄全空' },
-  { field: 'review_rounds', owner: '97（排在 health-monitor 批之後）', note: '詳情頁的審查輪數' },
-  { field: 'final_review_rounds', owner: '同上', note: 'Step 6.5 的派工次數' },
+  { field: 'stderr_path', owner: '寫入端（spawn-create-mr → runs）', note: 'migration 004 已補欄', requireFinished: false },
+  { field: 'triggered_by', owner: '寫入端（triggered_by_name / triggered_by_email）', note: '沒有它，列表「發起人」欄全空', requireFinished: false },
+  // rounds 兩欄只有「已結束」的 run 才該有值——執行中的 run 本來就還沒有輪數，
+  // 拿它們當樣本會把「還沒跑完」誤判成「寫入端沒接」。
+  { field: 'review_rounds', owner: '97（排在 health-monitor 批之後）', note: '詳情頁的審查輪數', requireFinished: true },
+  { field: 'final_review_rounds', owner: '同上', note: 'Step 6.5 的派工次數', requireFinished: true },
 ]
+
+/** D 組的樣本數。樣本不足判 FAIL，不判跳過——樣本不足不等於通過。 */
+export const WRITE_SIDE_SAMPLE_N = 5
+
+/** 回填列的 host 哨兵（backfill-sqlite.ts 寫死的值）。 */
+const BACKFILL_HOST = 'unknown_pre_migration'
+
+/**
+ * D 組判準：「寫入端有沒有真的在填這個欄位」。
+ *
+ * **修的是什麼**（Reviewer B MAJOR-1）：原判準是「`mysqlReader.pipelineRuns(FULL)`
+ * 裡有任一筆該欄非 null」。而 `backfill-sqlite.ts:258,266-268` 把 sqlite 的
+ * `stderr_path` / `triggered_by` / `review_rounds` / `final_review_rounds`
+ * **原樣複製**進 mysql `runs`（`host='unknown_pre_migration'`）。所以 Phase 6 回填
+ * 一跑，D 組四格全綠——**與 spawn-create-mr 有沒有真的寫這些欄位完全無關**，
+ * 而驗證寫入端正是 D 組存在的唯一理由。
+ *
+ * **為什麼用「列舉 host='head'」而不是「排除 host='unknown_pre_migration'」**
+ * （這兩者不等價，失敗方向相反，選擇要有理由）：
+ *   - **排除法**：未來若出現第三種非 live 來源（另一支回填、匯入工具、測試灌檔），
+ *     它的 host 不叫 `unknown_pre_migration`，就會被當成 live ⇒ **靜默轉綠**。
+ *   - **列舉法**：新來源不被計入，最壞情況是樣本不足 ⇒ **紅燈，有人要解釋**。
+ *   本專案這一輪拆掉的四個缺陷全是「形狀完好、實則空轉」的綠燈，
+ *   所以在兩種失敗方向之間，**選會叫的那一種**。
+ *
+ * **worker run 為什麼不列入樣本**：worker 的 run 也是 live 寫入端產物，但
+ * worker 名單是動態的（擴容就多一個），列舉它們會讓判準跟著名冊漂移。
+ * head 的樣本足以回答「寫入端有沒有接」這個問題，而且是確定性的。
+ * worker 列只計數、印在 detail 供人看，不參與判定——**這使 worker 擴容不會誤報**。
+ *
+ * **為什麼不是 `filled > 0`**：D 組註解自稱驗的是「切過去畫面上真的會看不到的
+ * 東西」，但一筆有值就過的話，1/300 也算「已接」。改成「最近 N 筆全部有值」。
+ */
+export function judgeWriteSideField(
+  rows: any[],
+  opts: { field: string; requireFinished: boolean; sampleN?: number },
+): { ok: boolean; detail: string } {
+  const n = opts.sampleN ?? WRITE_SIDE_SAMPLE_N
+  const backfill = rows.filter(r => r?.host === BACKFILL_HOST).length
+  const otherHosts = rows.filter(r => r?.host !== 'head' && r?.host !== BACKFILL_HOST).length
+  let live = rows.filter(r => r?.host === 'head')
+  if (opts.requireFinished) live = live.filter(r => r?.finished_at !== null && r?.finished_at !== undefined)
+  live = [...live].sort((a, b) => {
+    const x = String(a?.started_at ?? '')
+    const y = String(b?.started_at ?? '')
+    return x === y ? 0 : x < y ? 1 : -1 // started_at 新→舊
+  })
+  const suffix =
+    `｜樣本＝最近 ${n} 筆 host='head'${opts.requireFinished ? ' 且已結束' : ''} 的 run` +
+    `（回填列 ${backfill} 筆、其他 host ${otherHosts} 筆不計入）`
+  if (live.length < n) {
+    return { ok: false, detail: `樣本不足：只有 ${live.length} 筆可用，需要 ${n} 筆${suffix}` }
+  }
+  const sample = live.slice(0, n)
+  const missing = sample.filter(r => r[opts.field] === null || r[opts.field] === undefined)
+  return {
+    ok: missing.length === 0,
+    detail: `${n - missing.length}/${n} 筆有值${suffix}`,
+  }
+}
 
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -435,9 +497,8 @@ console.log('\n═══ D. 寫入端已知缺口（切過去之後畫面上真�
     fail('D 有 run 可檢查', 'mysql runs 表是空的')
   } else {
     for (const g of WRITE_SIDE_GAPS) {
-      const filled = b.filter(r => (r as any)[g.field] !== null && (r as any)[g.field] !== undefined).length
-      judge(filled > 0, `D ${g.field} 寫入端已接`,
-        `${filled}/${b.length} 筆有值｜負責：${g.owner}｜${g.note}`)
+      const r = judgeWriteSideField(b, { field: g.field, requireFinished: g.requireFinished })
+      judge(r.ok, `D ${g.field} 寫入端已接`, `${r.detail}｜負責：${g.owner}｜${g.note}`)
     }
   }
 }
