@@ -287,7 +287,10 @@ export const RUNS_SELECT = `
          r.review_rounds                                       AS review_rounds,
          r.final_review_rounds                                 AS final_review_rounds,
          r.host                                                AS host,
-         r.run_id                                              AS run_id
+         r.run_id                                              AS run_id,
+         -- 只給 toPipelineRunRow 內部重建顯示值用，**不進回傳列**（進去就是
+         -- /api/pipelines 的回應多一個欄位＝a7-D15 的契約變更）。見 displayOutcome。
+         r.outcome_source                                      AS outcome_source
   FROM runs r`
 
 // queued 列（lifecycle_rank=10）不進列表：sqlite 那側的 pipeline_runs 本來就只有
@@ -324,6 +327,36 @@ export const AGENT_RUNS_SELECT = `
   JOIN runs r ON r.run_id = a.run_id
    AND ${RUNS_LIST_WHERE}`
 
+/**
+ * 把權威表的裸 `outcome` 還原成 sqlite 軌的**顯示值**。
+ *
+ * ⚠️ **後綴是呈現層從 `outcome_source` 重建的，從不儲存。**
+ * 直查 DB 會看到裸值 `failed`，UI 會看到 `failed（人工判定）`——**那不是資料不一致**，
+ * 是這一層刻意的還原。查 DB 的人要看 `outcome_source` 才知道全貌。
+ *
+ * **為什麼做在讀取層，而不是擋門豁免或前端**（a7 核准；D1 的延伸：
+ * 後綴是呈現、`outcome_source` 是事實 ⇒ 呈現層還原呈現，權威表存事實）：
+ *   1. 這件事無論如何都要有人做——切到 mysql 後列表要顯示後綴，只能從
+ *      `outcome_source` 還原。差別只在做在哪一層。
+ *   2. 做在這裡 ⇒ **切換前後 `/api/pipelines` 的顯示值完全一致**，不觸發
+ *      a7-D15 的契約通報，前端零改動。
+ *   3. **擋門的 outcome 逐欄比對自然通過，一條豁免都不用寫。**
+ *      豁免面越小越好——每一條豁免都是日後可能吞掉真差異的地方。
+ *
+ * 兩軌的寫入差異（97 的 W6 tracker reconcile，a7 已核准）：
+ *   - sqlite（`tg-monitor/lib/ingest.ts` 的 `reconcileWithTracker`）：outcome 直接寫
+ *     顯示字串 `recovered` / `failed（人工判定）` / `needs_qa_clarification（人工判定）`。
+ *   - mysql（W6）：寫值域內裸值 + `outcome_source='tracker_reconcile'`。
+ *     §11.2 驗收禁值域外的值；把來源編碼進值字串會讓一個欄位承載兩種資訊。
+ *
+ * `recovered` **不加後綴**——sqlite 側對 tracker done 就是寫裸值
+ * （`tg-monitor/lib/ingest.ts:401`，97 逐行確認）。
+ */
+function displayOutcome(outcome: string | null, outcomeSource: string | null): string | null {
+  if (outcome === null || outcomeSource !== 'tracker_reconcile') return outcome
+  return outcome === 'failed' || outcome === 'needs_qa_clarification' ? `${outcome}（人工判定）` : outcome
+}
+
 function toPipelineRunRow(r: any): PipelineRunRow {
   return {
     key: r.key,
@@ -333,7 +366,7 @@ function toPipelineRunRow(r: any): PipelineRunRow {
     stdout_path: r.stdout_path ?? null,
     stderr_path: r.stderr_path ?? null,
     finished_at: r.finished_at ?? null,
-    outcome: r.outcome ?? null,
+    outcome: displayOutcome(r.outcome ?? null, r.outcome_source ?? null),
     cancelled_at: r.cancelled_at ?? null,
     triggered_by: r.triggered_by ?? null,
     // 寫入端還沒接，目前一律是 NULL——numOrNull 會原樣傳 null 下去，
