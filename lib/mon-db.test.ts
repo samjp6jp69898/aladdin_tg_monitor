@@ -558,21 +558,55 @@ describe('persistReviewRoundsToMonDb', () => {
     expect(getRoundsUnresolvedCountForTest()).toBe(before + 2) // missTtlMs=0 → 每次都真的重查一次
   })
 
-  test('write 失敗（單調守衛擋下）→ cache 不推進，下一輪同值仍會重試', async () => {
+  test('write 被單調守衛擋（matched=0）→ 進 TTL 負向快取：cache 不推進，TTL 窗內同 key 不再打 pool（closeout §6 殘餘飢餓向量，不變式 I2）', async () => {
     restoreFlag = setMonDbFlag('1')
     const pool = new FakeRoundsFullPool()
     pool.resolveRows.push({ run_id: 'run-3', host: 'head', ticket: 'FAQ-3', legacy_key: null, stdout_path: '/logs/FAQ-3.a.stdout.log' })
-    // mon_ui 既有值已經比本次算出的值大（例如另一輪已經寫過更大的值）→ UPDATE 會被 WHERE 擋下。
+    // mon_ui 既有值已經比本次算出的值大（rounds 回退等資料異常）→ UPDATE 永遠被 WHERE 擋下。
     pool.writeRows.set('run-3', { run_id: 'run-3', host: 'head', review_rounds: 9, final_review_rounds: 9 })
 
     const r1 = await persistReviewRoundsToMonDb(pool, { key: 'FAQ-3.a', ticket: 'FAQ-3', stdoutPath: '/logs/FAQ-3.a.stdout.log', reviewRounds: 1, finalReviewRounds: 0 })
     expect(r1.wrote).toBe(false)
+    expect(pool.calls.map(c => c.kind)).toEqual(['resolve', 'write'])
 
     pool.calls = []
-    // cache 沒推進（因為上次沒成功）→ 同樣的值這次還是會再打一次 pool，而不是被「值未變化」短路跳過。
+    // 修法前的行為：runId 已 cache → 跳過 TTL 判斷 → 同值每輪都再發一次注定
+    // matched=0 的 UPDATE（本測試舊版還把這個行為當成期望釘住）。修法後：
+    // matched=0 已進 miss cache，TTL 窗內（預設 30 秒，兩次呼叫背靠背 ≪ 30 秒，
+    // 靠執行速度不靠等待）完全不打 pool——也就不佔名額。
     const r2 = await persistReviewRoundsToMonDb(pool, { key: 'FAQ-3.a', ticket: 'FAQ-3', stdoutPath: '/logs/FAQ-3.a.stdout.log', reviewRounds: 1, finalReviewRounds: 0 })
     expect(r2.wrote).toBe(false)
-    expect(pool.calls.length).toBeGreaterThan(0) // 沒有被「值未變化」短路跳過
+    expect(pool.calls.length).toBe(0)
+  })
+
+  test('matched=0 進 miss cache 不是永久放棄：missTtlMs=0 時每輪重試，守衛解除後寫入成功並清空失敗記錄、回歸正常快路徑', async () => {
+    restoreFlag = setMonDbFlag('1')
+    const pool = new FakeRoundsFullPool()
+    pool.resolveRows.push({ run_id: 'run-3b', host: 'head', ticket: 'FAQ-3b', legacy_key: null, stdout_path: '/logs/FAQ-3b.a.stdout.log' })
+    pool.writeRows.set('run-3b', { run_id: 'run-3b', host: 'head', review_rounds: 9, final_review_rounds: 9 })
+
+    const r1 = await persistReviewRoundsToMonDb(pool, { key: 'FAQ-3b.a', ticket: 'FAQ-3b', stdoutPath: '/logs/FAQ-3b.a.stdout.log', reviewRounds: 1, finalReviewRounds: 0 }, undefined, 0)
+    expect(r1.wrote).toBe(false)
+
+    // missTtlMs=0（測試專用覆寫）→ 節流停用，下一輪真的重試一次 write（runId
+    // 已 cache，所以只有 write、沒有 resolve）。
+    pool.calls = []
+    const r2 = await persistReviewRoundsToMonDb(pool, { key: 'FAQ-3b.a', ticket: 'FAQ-3b', stdoutPath: '/logs/FAQ-3b.a.stdout.log', reviewRounds: 1, finalReviewRounds: 0 }, undefined, 0)
+    expect(r2.wrote).toBe(false)
+    expect(pool.calls.map(c => c.kind)).toEqual(['write'])
+
+    // 守衛解除（本輪算出的值追過 DB 既有值）→ 寫入成功、失敗記錄清空。
+    pool.calls = []
+    const r3 = await persistReviewRoundsToMonDb(pool, { key: 'FAQ-3b.a', ticket: 'FAQ-3b', stdoutPath: '/logs/FAQ-3b.a.stdout.log', reviewRounds: 10, finalReviewRounds: 9 }, undefined, 0)
+    expect(r3.wrote).toBe(true)
+    expect(pool.writeRows.get('run-3b')!.review_rounds).toBe(10)
+
+    // 成功之後值未進展 → 被 lastWrittenRounds 短路，零呼叫（回歸正常快路徑，
+    // 證明 miss cache 的殘留不會反過來擋住已恢復的 run——成功路徑有清掉它）。
+    pool.calls = []
+    const r4 = await persistReviewRoundsToMonDb(pool, { key: 'FAQ-3b.a', ticket: 'FAQ-3b', stdoutPath: '/logs/FAQ-3b.a.stdout.log', reviewRounds: 10, finalReviewRounds: 9 }, undefined, 0)
+    expect(r4.wrote).toBe(false)
+    expect(pool.calls.length).toBe(0)
   })
 
   test('budgetMs 逾時分支：注入永不 resolve 的假 pool + budgetMs:0 → 確定性走 budget 分支，零等待（對抗審查 NB-1，之前誤判為不可測）', async () => {
@@ -705,6 +739,58 @@ describe('persistReviewRoundsToMonDb', () => {
     expect(rA.wrote).toBe(false) // A、B 是 TTL no-op：不打 DB、也沒佔名額
     expect(rB.wrote).toBe(false)
     expect(rLive.wrote).toBe(true) // LIVE 在同一個 tick 內完成寫入
+    expect(pool.calls).toEqual(['resolve:LIVE', 'write:run-LIVE'])
+  })
+
+  // ---------- closeout §6 殘餘飢餓向量迴歸：matched=0 也必須是 TTL no-op ----------
+  //
+  // 與 BLOCKING-3 同構、觸發條件窄一量級的殘餘向量：resolve 成功（runId 進
+  // cache）但 UPDATE 被單調守衛擋（matched=0，rounds 回退等資料異常）。修法前
+  // 這條路徑不留任何容器痕跡，且 runId 已 cache 使 TTL 判斷被跳過——每輪都取
+  // 名額發一次注定 matched=0 的 UPDATE；兩個這種 run 排在 readdir 前面就把
+  // 名額（上限 2）佔滿，後面真正可寫的 run 確定性飢餓。
+  test('§6 殘餘飢餓迴歸：兩個 matched=0 的 run 進入 TTL 快取後，同一個同步批次內不佔名額、不擋排在後面真正可寫的 LIVE run', async () => {
+    restoreFlag = setMonDbFlag('1')
+    class Pool {
+      guarded = new Set<string>() // 這些 run 的 UPDATE 永遠 matched=0（模擬單調守衛擋下）
+      calls: string[] = []
+      async execute(sql: string, params: unknown[] = []): Promise<[unknown, unknown]> {
+        if (sql.includes('legacy_key = ? OR stdout_path = ?')) {
+          const ticket = (params as unknown[])[1] as string
+          this.calls.push(`resolve:${ticket}`)
+          return [[{ run_id: `run-${ticket}` }], []] // 每一路都對得到 run_id
+        }
+        if (sql.startsWith('UPDATE runs')) {
+          const [, , runId] = params as [number, number, string, string]
+          this.calls.push(`write:${runId}`)
+          if (this.guarded.has(runId)) return [{ info: 'Rows matched: 0  Changed: 0  Warnings: 0' }, []]
+          return [{ info: 'Rows matched: 1  Changed: 1  Warnings: 0' }, []]
+        }
+        throw new Error(`Pool: 未預期的 SQL：${sql}`)
+      }
+    }
+    const pool = new Pool()
+    pool.guarded.add('run-GA').add('run-GB')
+
+    // 先各打一次：resolve 成功 + write matched=0 → GA、GB 進入 TTL 負向快取。
+    await persistReviewRoundsToMonDb(pool, { key: 'GA', ticket: 'GA', stdoutPath: '/logs/GA.stdout.log', reviewRounds: 1, finalReviewRounds: 0 })
+    await persistReviewRoundsToMonDb(pool, { key: 'GB', ticket: 'GB', stdoutPath: '/logs/GB.stdout.log', reviewRounds: 1, finalReviewRounds: 0 })
+    expect(pool.calls).toEqual(['resolve:GA', 'write:run-GA', 'resolve:GB', 'write:run-GB'])
+
+    // 下一個 tick 的同步迴圈：GA、GB（matched=0 的 TTL 命中）排在 LIVE 前面，
+    // 三行之間沒有任何 await——與 scanPipelineRuns 的全同步迴圈同形。
+    pool.calls = []
+    const pA = persistReviewRoundsToMonDb(pool, { key: 'GA', ticket: 'GA', stdoutPath: '/logs/GA.stdout.log', reviewRounds: 2, finalReviewRounds: 0 })
+    const pB = persistReviewRoundsToMonDb(pool, { key: 'GB', ticket: 'GB', stdoutPath: '/logs/GB.stdout.log', reviewRounds: 2, finalReviewRounds: 0 })
+    const pLive = persistReviewRoundsToMonDb(pool, { key: 'LIVE', ticket: 'LIVE', stdoutPath: '/logs/LIVE.stdout.log', reviewRounds: 2, finalReviewRounds: 0 })
+
+    // LIVE 的 SELECT 必須在同一個同步批次內就已經發出——GA、GB 完全沒佔名額。
+    expect(pool.calls).toEqual(['resolve:LIVE'])
+
+    const [rA, rB, rLive] = await Promise.all([pA, pB, pLive])
+    expect(rA.wrote).toBe(false)
+    expect(rB.wrote).toBe(false)
+    expect(rLive.wrote).toBe(true)
     expect(pool.calls).toEqual(['resolve:LIVE', 'write:run-LIVE'])
   })
 })

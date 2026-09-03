@@ -473,7 +473,12 @@ const lastWrittenRounds = new Map<string, { review: number; final: number }>()
 // 稍晚才寫入，不能一次找不到就永久放棄，下一輪自然重試——用下面的 TTL 負向
 // 快取節流重試頻率，而不是完全不重試）。
 const roundsRunIdCache = new Map<string, string>()
-// key → 上次「對不到 run_id」的嘗試時間（epoch ms）。TTL 負向快取，見上方常數註解。
+// key → 上次「確定性失敗」的嘗試時間（epoch ms）。TTL 負向快取，見上方常數註解。
+// 確定性失敗＝同輸入下一輪必然重複失敗的兩種情況：resolve 對不到 run_id、
+// resolve 成功但 UPDATE 被單調守衛擋（matched=0，rounds 回退等資料異常，
+// closeout §6 殘餘向量 2026-09-03 修）。連線類例外／逾時是暫時性失敗，
+// **不**進本快取，維持下一輪立即重試——「這次做不成」與「這件事本來就做不成」
+// 不共用同一條節流路徑。
 const roundsRunIdMissCache = new Map<string, number>()
 // key → 是否已經為「目前這一串連續失敗」印過 WARN；成功一次就清掉，讓下一次
 // 失敗重新印一次——不是永久靜音，只是同一串連續失敗不重複洗版（對抗審查
@@ -567,11 +572,14 @@ export async function persistReviewRoundsToMonDb(
   // 又因為 readdir 順序穩定、TTL miss 刷新後仍是 miss，下一輪的輸入條件與這一
   // 輪完全相同 → 不是「下一輪自然重試」，是確定性飢餓。
   const cachedRunId = roundsRunIdCache.get(input.key)
-  if (cachedRunId === undefined) {
-    const lastMiss = roundsRunIdMissCache.get(input.key)
-    // TTL 負向快取命中：距離上次對不到還沒滿 missTtlMs，不重打 SELECT，也不佔名額。
-    if (lastMiss !== undefined && Date.now() - lastMiss < missTtlMs) return noteRoundsWriteFailure(input)
-  }
+  // TTL 負向快取判斷**無條件**執行，不再只限 run_id 未 cache 的情況（closeout
+  // §6 殘餘向量，2026-09-03 修）：快取語意是「近期一次確定性失敗」——resolve
+  // 對不到 run_id，或 resolve 成功但 UPDATE 被單調守衛擋（matched=0）。後者若
+  // 不節流，runId 已 cache 會跳過本判斷，每輪都取名額發一次注定 matched=0 的
+  // UPDATE——與 BLOCKING-3 同構的確定性飢餓，只是觸發需要 rounds 回退等資料
+  // 異常，窄一個量級。
+  const lastMiss = roundsRunIdMissCache.get(input.key)
+  if (lastMiss !== undefined && Date.now() - lastMiss < missTtlMs) return noteRoundsWriteFailure(input)
 
   // ── 到這裡才確定要打 DB（resolve 與／或 write 至少一次），才取名額 ──
   // 有界並發（BLOCKING-1(d)）：名額用滿就直接放棄，不排隊——下一輪 ingest
@@ -580,6 +588,16 @@ export async function persistReviewRoundsToMonDb(
   // 到名額是預期中的背壓，不是「寫入失敗」，而且它會隨名額釋放自行消失；若在這
   // 裡也印 WARN，一個持續有進展的 run 就會在「這輪被擋→下輪寫成功清掉標記→再被
   // 擋」之間反覆印。
+  //
+  // ── 取名額不變式（明文化，mon-db.test.ts 以迴歸測試釘住）──
+  // (I1) 同一個同步批次內確定不發任何 SQL 的路徑（值未進展、TTL 命中、深度
+  //      防禦），不得取名額。
+  // (I2) 「同輸入下一輪必然重複失敗」的確定性失敗（resolve miss、守衛
+  //      matched=0）必須進 TTL 負向快取；暫時性失敗（連線例外、budget 逾時）
+  //      不進，維持下一輪立即重試。
+  // 違反任一條，在「readdir 順序穩定＋名額上限 2＋scanPipelineRuns 全同步迴圈」
+  // 之下都會退化成確定性飢餓——BLOCKING-3 與 closeout §6 殘餘向量是同一類
+  // 缺陷的兩個實例。重構本函式的控制流之前，先確認這兩條仍然成立。
   if (roundsInFlightCount >= ROUNDS_MAX_CONCURRENT_DB_OPS) return { wrote: false }
   roundsInFlightCount++
   try {
@@ -598,7 +616,16 @@ export async function persistReviewRoundsToMonDb(
         roundsRunIdCache.set(input.key, runId)
         roundsRunIdMissCache.delete(input.key)
       }
-      return writeRunRounds(pool, { runId, reviewRounds: input.reviewRounds, finalReviewRounds: input.finalReviewRounds })
+      const res = await writeRunRounds(pool, { runId, reviewRounds: input.reviewRounds, finalReviewRounds: input.finalReviewRounds })
+      if (res.ok) {
+        // 對稱於 resolve 成功清 miss：一次成功把「確定性失敗」記錄作廢。
+        roundsRunIdMissCache.delete(input.key)
+      } else {
+        // matched=0（單調守衛擋下，或列被移走）：確定性失敗（不變式 I2），進
+        // TTL 節流。連線類例外走 throw → 外層 catch，不會經過這裡。
+        roundsRunIdMissCache.set(input.key, Date.now())
+      }
+      return res
     })()
 
     let budgetTimer: ReturnType<typeof setTimeout>
