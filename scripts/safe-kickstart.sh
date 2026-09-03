@@ -37,6 +37,11 @@ set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SERVICE='com.aladdin.tg-monitor'
 LOG="${REPO}/data/kickstart.log"
+# 交給 launchd/run-monitor.sh 起的 kickstart-guard.sh 讀，讓它分得出「這次啟動經由本
+# 腳本」與「裸 launchctl kickstart」。marker 不帶時效：kickstart 失敗時本腳本自己收回
+# 去（見檔尾），所以不會有「marker 還在但沒有新行程」的舊 marker 誤導下一次啟動，
+# 不需要靠時間窗去猜。
+MARKER="${REPO}/data/.kickstart-via-safe"
 
 DRY_RUN=0
 FORCE=0
@@ -98,7 +103,14 @@ printf '%s | head=%s | declared=%s | undeclared=%s | force=%s\n' \
   "$(date '+%Y-%m-%d %H:%M:%S')" "${HEAD_SHA}" \
   "$(IFS=,; echo "${DECLARED[*]-}")" "$(IFS=,; echo "${UNDECLARED[*]-}")" "${FORCE}" >> "${LOG}"
 
-launchctl kickstart -k "gui/$(id -u)/${SERVICE}" || { echo "RESULT: FAILED — kickstart 失敗"; exit 1; }
+: > "${MARKER}" 2>/dev/null || true
+if ! launchctl kickstart -k "gui/$(id -u)/${SERVICE}"; then
+  # kickstart 沒起成 = 沒有新行程去消費 marker，這裡收回去，免得它留到下一次
+  # （可能是裸 kickstart 的那一次）被誤認成「經由 safe-kickstart」。
+  rm -f "${MARKER}"
+  echo "RESULT: FAILED — kickstart 失敗"
+  exit 1
+fi
 echo ""
 echo "RESULT: RESTARTED — 已重啟，紀錄寫入 ${LOG}"
 echo "  重啟後健康檢查請跑 telegram-dispatcher/deploy/doctor-monitor.sh（本腳本不代勞）"

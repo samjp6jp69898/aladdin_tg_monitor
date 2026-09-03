@@ -28,5 +28,18 @@ fi
 
 cd "$TG_MONITOR_DIR" || exit 1
 
+# D48 啟動來源留痕（2026-09-03）：記下這次啟動是不是經由 scripts/safe-kickstart.sh。
+# guard **只記錄、不阻擋**，理由見 scripts/kickstart-guard.sh 檔頭（KeepAlive=true 下
+# 阻擋 = 無限 crash loop，而且擋在這一層本來就擋不住裸 kickstart）。
+#
+# 兩層隔離，缺一不可：
+#   - `|| true`：guard 執行失敗（語法壞掉、git 不可用、log 寫不進去）不影響下面的 exec；
+#   - 背景化：guard **卡住**也不影響 exec。fail-open 擋得住失敗，擋不住 hang。
+# 而 guard 是獨立一支檔、不是寫在這裡的幾行：它自己壞掉時，壞的是一個被隔離的子行程，
+# 不是這支「服務能不能起來」的腳本本身。一支為了保護部署而寫的東西若自己會讓服務起不來，
+# 期望損失會高於它防的東西。
+GUARD="$TG_MONITOR_DIR/scripts/kickstart-guard.sh"
+[ -f "$GUARD" ] && { bash "$GUARD" & } || true
+
 # exec 讓 bun 取代 shell 行程本身，launchd SIGTERM 才殺得到 bun（同 run-server.sh）。
 exec "$BUN" run server.ts
