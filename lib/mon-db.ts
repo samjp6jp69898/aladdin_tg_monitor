@@ -855,3 +855,171 @@ export function closeSpoolForTest(): void {
   spoolDirUsed = null
   spoolSeq = 0
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// W6：tracker 遲到補跑修正（2026-09-03 新增；a7-D39 裁定缺口的補位，
+// phase9-readiness.md §3.3 / monitor-db-project-docs/phase9-reconcile-rounds-design.md）。
+//
+// mysql 對應 sqlite 側 ingest.ts 的 reconcileStaleOutcomes：pipeline 以未解決
+// 分類（timeout / infra_failure / …）結束後，票被人工或另一個 agent 補跑完、
+// tracker 給出更晚的終態——這裡把 tracker 當更晚、更權威的事實來源，覆蓋
+// 顯示用 outcome。plan v3.md §11.2 已定義 `outcome_source='tracker_reconcile'`
+// 卻只給了一次性回填一個寫入端，活路徑由本節補上；「權威值互不覆寫」（R3'）
+// 的特例形狀沿用 W5 先例：專屬具名語句＋窄 WHERE 前置條件，冪等、自終止
+// （改掉分類後不再落入候選 SELECT 與守衛）。
+//
+// 與 sqlite 側的三個刻意差異（a7 2026-09-03 核准，均為設計不是疏漏）：
+//   D-1 寫值域內裸值 `recovered` / `failed` / `needs_qa_clarification`（不帶
+//       「（人工判定）」後綴）——後綴是呈現、outcome_source 才是事實；§11.2
+//       驗收禁值域外的值。讀取面要顯示後綴時由 outcome_source 還原。
+//   D-2 **不覆蓋 finished_at**——mon_ui 沒有該欄 UPDATE 授權（migrate.sh:104），
+//       補授權與 F-0 工作面衝突。已知雙軌差異，§10.2 擋門豁免與後續對齊
+//       另列 Phase 9 前置工單（a7 裁定），這裡不是漏寫。
+//   D-3 只 reconcile tier 2 列——mon_ui 不能寫 outcome_tier（v3.1 刻意移除），
+//       對 tier 1（unknown_* / lost_*）硬寫會產生 outcome='recovered' 但
+//       tier=1 的矛盾列。tier 1 列永遠不被本節 reconcile，是範圍限制不是
+//       暫時狀態；它們本就開放給任何 tier 2 寫入端經標準守衛（outcome_tier<2）
+//       覆寫，不歸 W6 管。
+// ─────────────────────────────────────────────────────────────────────────
+
+/** 未解決分類中屬 tier 2、可被 W6 覆寫者。sqlite 側 UNRESOLVED_OUTCOMES 另含
+ * `unknown_failure`（tier 1），依 D-3 排除。 */
+export const RECONCILE_UNRESOLVED_OUTCOMES = ['skipped', 'timeout', 'infra_failure', 'cli_failure'] as const
+
+const RECONCILE_IN_PLACEHOLDERS = RECONCILE_UNRESOLVED_OUTCOMES.map(() => '?').join(', ')
+
+// 候選掃描：6 小時窗與 sqlite 側同值同語意——不是正確性邊界，只是避免對
+// 「已確定沒人再處理」的舊票反覆 spawn tracker.sh；出窗後若真的被補跑完成，
+// 畫面只是繼續顯示原本的失敗分類，不是顯示錯誤資訊。窗天然為候選數上界，
+// 不另設 LIMIT。
+const RECONCILE_CANDIDATES_SQL = `
+SELECT run_id, ticket, outcome, finished_at FROM runs
+ WHERE host = ? AND kind = 'bug' AND lifecycle_rank = 100 AND outcome_tier = 2
+   AND outcome IN (${RECONCILE_IN_PLACEHOLDERS})
+   AND finished_at >= ?
+`.trim()
+
+// R4 合規：SET 只用參數與常數，守衛全在 WHERE（引用的 outcome / outcome_tier
+// 依 MySQL UPDATE 語意讀更新前的列值）。matched=0＝良性併發（列已被改掉），
+// 不重試——下一輪候選 SELECT 也不會再回傳它。
+const W6_SQL = `
+UPDATE runs
+   SET outcome = ?, outcome_source = 'tracker_reconcile'
+ WHERE run_id = ? AND host = ? AND outcome_tier = 2
+   AND outcome IN (${RECONCILE_IN_PLACEHOLDERS})
+`.trim()
+
+/** tracker 終態 → mysql 值域內裸值（D-1）；pending / rerun / in_progress 等
+ * 「還沒被接手處理」狀態回 null＝不覆蓋，與 sqlite 側 reconcileWithTracker
+ * 同一組判定。 */
+export function mapTrackerStatusToOutcome(status: string): string | null {
+  if (status === 'done') return 'recovered'
+  if (status === 'failed') return 'failed'
+  if (status === 'needs_qa') return 'needs_qa_clarification'
+  return null
+}
+
+/** `'2026-09-03 10:00:00.123'` → `'2026-09-03T10:00:00.123Z'`（pool 是
+ * timezone:'Z' + dateStrings，值本就是 UTC）；防禦性補 `.000`。 */
+function mysqlDatetime3ToIso(dt: string): string {
+  const base = dt.includes('.') ? dt : `${dt}.000`
+  return `${base.replace(' ', 'T')}Z`
+}
+
+/** 與 ingest.ts readTrackerStatusAsync 同形；以參數注入（tg-monitor 內
+ * ingest.ts → mon-db.ts 單向 import，反向會成環）。 */
+export type TrackerReadFn = (ticket: string) => Promise<{ status: string; completedAt: string | null } | null>
+
+const RECONCILE_RECENT_WINDOW_MS = 6 * 3600 * 1000
+// sweep 節流（純 DB／tracker.sh spawn 負載節流，非正確性等待）：sqlite 側每
+// 3 秒 tick 都重查 tracker，mysql 側多一層 30 秒間隔——tracker 是人工補跑後
+// 的分鐘級事實來源，30 秒的遲到修正延遲對「顯示用分類」無感。
+const RECONCILE_SWEEP_INTERVAL_MS = 30_000
+// 整趟 sweep（SELECT + 逐候選 tracker.sh + UPDATE）的預算：readTracker 每次
+// spawn 自帶 10s timeout、候選數受 6h 窗限制，20s 覆蓋正常情況；逾時同 rounds
+// 慣例——race 只決定這次呼叫要不要繼續等，背景 attempt 跑完為止（W6 冪等，
+// 晚到的寫入無害）。
+const RECONCILE_BUDGET_MS = 20_000
+
+let reconcileSweepInFlight = false
+let lastReconcileSweepAt = 0
+// 同一串連續失敗只印一次 WARN，成功一輪後清掉（比照 noteRoundsWriteFailure）。
+let reconcileSweepWarned = false
+
+/** 測試專用：清空本節模組級狀態。 */
+export function __resetReconcileMonDbStateForTest(): void {
+  reconcileSweepInFlight = false
+  lastReconcileSweepAt = 0
+  reconcileSweepWarned = false
+}
+
+/**
+ * 掛在 ingest.ts scanPipelineRuns 尾端（sqlite 側 reconcileStaleOutcomes 之後）
+ * fire-and-forget 呼叫。swept=false＝這一輪被節流（前一趟 in-flight 或未滿
+ * sweep 間隔）或旗標關閉；applied＝本趟真的把幾列改成 tracker 終態。
+ * 失敗只 WARN 不落 spool：候選由下一趟 sweep 重新發現，自癒（與 rounds 同
+ * 理由——沒有「這次沒寫就永久遺失」的風險）。
+ */
+export async function reconcileStaleOutcomesToMonDb(
+  pool: MonitorDbExecutor,
+  readTracker: TrackerReadFn,
+  budgetMs: number = RECONCILE_BUDGET_MS,
+  sweepIntervalMs: number = RECONCILE_SWEEP_INTERVAL_MS,
+): Promise<{ swept: boolean; applied: number }> {
+  if (!isMonitorDbEnabled()) return { swept: false, applied: 0 }
+  if (reconcileSweepInFlight) return { swept: false, applied: 0 }
+  const now = Date.now()
+  if (now - lastReconcileSweepAt < sweepIntervalMs) return { swept: false, applied: 0 }
+  reconcileSweepInFlight = true
+  lastReconcileSweepAt = now
+  try {
+    const attempt = (async (): Promise<number> => {
+      const cutoff = isoToMysqlDatetime3(new Date(now - RECONCILE_RECENT_WINDOW_MS).toISOString())
+      const [rows] = await pool.execute<RowDataPacket[]>(RECONCILE_CANDIDATES_SQL, [RUNS_HOST, ...RECONCILE_UNRESOLVED_OUTCOMES, cutoff])
+      const candidates = rows as unknown as Array<{ run_id: string; ticket: string; outcome: string; finished_at: string }>
+      let applied = 0
+      for (const c of candidates) {
+        const tracker = await readTracker(c.ticket)
+        // 只在 tracker 完成時間**晚於**這次執行的結束時間才覆蓋（避免把更早、
+        // 不相關的一次 done 誤蓋到這次執行上）——與 sqlite 側同一判準。
+        if (!tracker || !tracker.completedAt || tracker.completedAt <= mysqlDatetime3ToIso(c.finished_at)) continue
+        const mapped = mapTrackerStatusToOutcome(tracker.status)
+        if (mapped === null) continue
+        const [header] = await pool.execute<ResultSetHeader>(W6_SQL, [mapped, c.run_id, RUNS_HOST, ...RECONCILE_UNRESOLVED_OUTCOMES])
+        const matched = parseMatched((header as ResultSetHeader).info)
+        if (matched !== null && matched > 0) applied += 1
+      }
+      return applied
+    })()
+
+    let budgetTimer: ReturnType<typeof setTimeout>
+    const budget = new Promise<number | null>(resolve => {
+      budgetTimer = setTimeout(() => resolve(null), budgetMs)
+    })
+    const raced = await Promise.race([
+      attempt.catch((err): number | null => {
+        if (!reconcileSweepWarned) {
+          reconcileSweepWarned = true
+          console.warn(`mon-db: tracker reconcile sweep 失敗，下一趟（≥${Math.round(sweepIntervalMs / 1000)}s 後）自然重試（同一串連續失敗只印這一次）：${err}`)
+        }
+        return null
+      }),
+      budget,
+    ])
+    clearTimeout(budgetTimer!)
+    if (raced === null) {
+      if (!reconcileSweepWarned) {
+        reconcileSweepWarned = true
+        console.warn(`mon-db: tracker reconcile sweep 逾時（budget ${budgetMs}ms），背景繼續跑完（W6 冪等），下一趟自然重試（同一串連續失敗只印這一次）`)
+      }
+      return { swept: true, applied: 0 }
+    }
+    reconcileSweepWarned = false
+    return { swept: true, applied: raced }
+  } finally {
+    // 逾時情境下背景 attempt 仍可能在跑（同 rounds NB-5 的誠實記錄）：
+    // in-flight 旗標在 race 落定即釋放，極端下兩趟 sweep 短暫重疊——W6 冪等
+    // ＋守衛在 WHERE，重疊無正確性影響，只是多一次 no-op UPDATE。
+    reconcileSweepInFlight = false
+  }
+}

@@ -25,11 +25,15 @@ import {
   persistReviewRoundsToMonDb,
   getRoundsUnresolvedCountForTest,
   __resetRoundsMonDbStateForTest,
+  reconcileStaleOutcomesToMonDb,
+  mapTrackerStatusToOutcome,
+  __resetReconcileMonDbStateForTest,
   type ResolveRunIdInput,
+  type TrackerReadFn,
 } from './mon-db.ts'
 // 注意 import 順序：./test-tmp-db.ts 必須在本行之前（ingest.ts → db.ts 會在
 // import 當下開 sqlite）。
-import { persistReviewRoundsToMonDbGuarded, isRoundsMonDbEligible } from './ingest.ts'
+import { persistReviewRoundsToMonDbGuarded, isRoundsMonDbEligible, reconcileStaleOutcomesToMonDbGuarded } from './ingest.ts'
 
 // ---------- resolveRunId：假 pool，比對邏輯與 cancel-resolve.ts 相同 ----------
 
@@ -925,5 +929,268 @@ describe('persistReviewRoundsToMonDbGuarded — 6 小時窗接線（NB-6 / NB-1�
       __resetRoundsMonDbStateForTest()
       restoreFlag()
     }
+  })
+})
+
+// ---------- W6：tracker 遲到補跑修正（reconcileStaleOutcomesToMonDb） ----------
+//
+// 假 pool 依 W6 的 SQL 語意實作候選 SELECT 與守衛式 UPDATE；tracker 以注入的
+// 假函式回覆（不 spawn tracker.sh）。生產 SQL 的守衛存在性另以「捕捉到的 SQL
+// 文字」直接斷言（同 writeRunRounds 的守衛子句斷言手法）。
+
+interface FakeReconcileRow {
+  run_id: string
+  host: string
+  ticket: string
+  kind: string
+  lifecycle_rank: number
+  outcome: string
+  outcome_tier: number
+  outcome_source: string | null
+  finished_at: string // mysql DATETIME(3) 字串
+}
+
+class FakeReconcilePool {
+  rows = new Map<string, FakeReconcileRow>()
+  calls: string[] = []
+  sqls: string[] = []
+  async execute(sql: string, params: unknown[] = []): Promise<[unknown, unknown]> {
+    this.sqls.push(sql)
+    if (sql.includes('finished_at >= ?')) {
+      this.calls.push('select')
+      const [host, o1, o2, o3, o4, cutoff] = params as [string, string, string, string, string, string]
+      const unresolved = new Set([o1, o2, o3, o4])
+      const out = [...this.rows.values()].filter(
+        r => r.host === host && r.kind === 'bug' && r.lifecycle_rank === 100 && r.outcome_tier === 2 && unresolved.has(r.outcome) && r.finished_at >= cutoff,
+      )
+      return [out.map(r => ({ run_id: r.run_id, ticket: r.ticket, outcome: r.outcome, finished_at: r.finished_at })), []]
+    }
+    if (sql.includes("'tracker_reconcile'")) {
+      const [outcome, runId, host, o1, o2, o3, o4] = params as [string, string, string, string, string, string, string]
+      this.calls.push(`w6:${runId}:${outcome}`)
+      const unresolved = new Set([o1, o2, o3, o4])
+      const row = this.rows.get(runId)
+      if (!row || row.host !== host || row.outcome_tier !== 2 || !unresolved.has(row.outcome)) {
+        return [{ info: 'Rows matched: 0  Changed: 0  Warnings: 0' }, []]
+      }
+      row.outcome = outcome
+      row.outcome_source = 'tracker_reconcile'
+      return [{ info: 'Rows matched: 1  Changed: 1  Warnings: 0' }, []]
+    }
+    throw new Error(`FakeReconcilePool: 未預期的 SQL：${sql}`)
+  }
+}
+
+function recentFinishedAt(agoMs: number): string {
+  return isoToMysqlDatetime3(new Date(Date.now() - agoMs).toISOString())
+}
+
+function staleRow(runId: string, ticket: string, outcome: string, overrides: Partial<FakeReconcileRow> = {}): FakeReconcileRow {
+  return {
+    run_id: runId,
+    host: 'head',
+    ticket,
+    kind: 'bug',
+    lifecycle_rank: 100,
+    outcome,
+    outcome_tier: 2,
+    outcome_source: null,
+    finished_at: recentFinishedAt(3600_000), // 1 小時前結束，在 6h 窗內
+    ...overrides,
+  }
+}
+
+/** ticket → tracker 回覆的注入器；completedAt 預設「現在」（必然晚於候選列的 finished_at）。 */
+function trackerOf(map: Record<string, { status: string; completedAt?: string | null } | null>): TrackerReadFn {
+  return async ticket => {
+    const v = map[ticket]
+    if (v === null || v === undefined) return null
+    return { status: v.status, completedAt: v.completedAt === undefined ? new Date().toISOString() : v.completedAt }
+  }
+}
+
+describe('mapTrackerStatusToOutcome（D-1：值域內裸值，不帶「（人工判定）」後綴）', () => {
+  test('done → recovered；failed → failed；needs_qa → needs_qa_clarification；其餘（pending/rerun/in_progress/未知）→ null 不覆蓋', () => {
+    expect(mapTrackerStatusToOutcome('done')).toBe('recovered')
+    expect(mapTrackerStatusToOutcome('failed')).toBe('failed')
+    expect(mapTrackerStatusToOutcome('needs_qa')).toBe('needs_qa_clarification')
+    expect(mapTrackerStatusToOutcome('pending')).toBeNull()
+    expect(mapTrackerStatusToOutcome('rerun')).toBeNull()
+    expect(mapTrackerStatusToOutcome('in_progress')).toBeNull()
+    expect(mapTrackerStatusToOutcome('whatever')).toBeNull()
+  })
+})
+
+describe('reconcileStaleOutcomesToMonDb（W6）', () => {
+  let restoreFlag: () => void
+  afterEach(() => {
+    __resetReconcileMonDbStateForTest()
+    restoreFlag?.()
+  })
+
+  test('MON_DB_ENABLED 關閉（深度防禦）→ swept=false、零呼叫零副作用', async () => {
+    restoreFlag = setMonDbFlag(undefined)
+    const pool = new FakeReconcilePool()
+    const r = await reconcileStaleOutcomesToMonDb(pool, trackerOf({}))
+    expect(r).toEqual({ swept: false, applied: 0 })
+    expect(pool.calls.length).toBe(0)
+  })
+
+  test('tracker done → 覆蓋成 recovered + outcome_source=tracker_reconcile；生產 SQL 帶 tier 2 / kind / lifecycle 守衛；自終止：下一趟不再回傳該候選', async () => {
+    restoreFlag = setMonDbFlag('1')
+    const pool = new FakeReconcilePool()
+    pool.rows.set('run-1', staleRow('run-1', 'FAQ-91', 'timeout'))
+
+    const trackerCalls: string[] = []
+    const tracker: TrackerReadFn = async t => {
+      trackerCalls.push(t)
+      return { status: 'done', completedAt: new Date().toISOString() }
+    }
+    const r1 = await reconcileStaleOutcomesToMonDb(pool, tracker, undefined, 0)
+    expect(r1).toEqual({ swept: true, applied: 1 })
+    expect(pool.rows.get('run-1')!.outcome).toBe('recovered')
+    expect(pool.rows.get('run-1')!.outcome_source).toBe('tracker_reconcile')
+    // 生產 SQL 的守衛存在性（不是只驗假 pool 自己的模擬）：
+    expect(pool.sqls[0]).toContain("kind = 'bug'")
+    expect(pool.sqls[0]).toContain('lifecycle_rank = 100')
+    expect(pool.sqls[0]).toContain('outcome_tier = 2')
+    expect(pool.sqls[1]).toContain('outcome_tier = 2')
+    expect(pool.sqls[1]).toContain('outcome IN')
+    expect(pool.sqls[1]).toContain("outcome_source = 'tracker_reconcile'")
+
+    // 自終止：outcome 已不在未解決集合 → 下一趟（sweepIntervalMs=0）SELECT
+    // 不再回傳，tracker 也不再被查。
+    pool.calls = []
+    trackerCalls.length = 0
+    const r2 = await reconcileStaleOutcomesToMonDb(pool, tracker, undefined, 0)
+    expect(r2).toEqual({ swept: true, applied: 0 })
+    expect(pool.calls).toEqual(['select'])
+    expect(trackerCalls.length).toBe(0)
+  })
+
+  test('tracker failed / needs_qa → 寫值域內裸值（D-1）；tracker 還沒接手（null / pending / completedAt 不晚於 finished_at）→ 不覆蓋', async () => {
+    restoreFlag = setMonDbFlag('1')
+    const pool = new FakeReconcilePool()
+    pool.rows.set('run-f', staleRow('run-f', 'FAQ-92', 'infra_failure'))
+    pool.rows.set('run-q', staleRow('run-q', 'FAQ-93', 'cli_failure'))
+    pool.rows.set('run-p', staleRow('run-p', 'FAQ-94', 'timeout'))
+    pool.rows.set('run-n', staleRow('run-n', 'FAQ-95', 'skipped'))
+    pool.rows.set('run-e', staleRow('run-e', 'FAQ-96', 'timeout'))
+
+    const r = await reconcileStaleOutcomesToMonDb(
+      pool,
+      trackerOf({
+        'FAQ-92': { status: 'failed' },
+        'FAQ-93': { status: 'needs_qa' },
+        'FAQ-94': { status: 'pending', completedAt: null }, // 還沒被接手
+        'FAQ-95': null, // tracker 查不到
+        'FAQ-96': { status: 'done', completedAt: new Date(Date.now() - 7200_000).toISOString() }, // 更早的一次 done，不是這次執行的解決
+      }),
+      undefined,
+      0,
+    )
+    expect(r).toEqual({ swept: true, applied: 2 })
+    expect(pool.rows.get('run-f')!.outcome).toBe('failed')
+    expect(pool.rows.get('run-f')!.outcome_source).toBe('tracker_reconcile')
+    expect(pool.rows.get('run-q')!.outcome).toBe('needs_qa_clarification')
+    expect(pool.rows.get('run-p')!.outcome).toBe('timeout') // 原值不動
+    expect(pool.rows.get('run-n')!.outcome).toBe('skipped')
+    expect(pool.rows.get('run-e')!.outcome).toBe('timeout')
+    expect(pool.calls.filter(c => c.startsWith('w6:')).length).toBe(2)
+  })
+
+  test('D-3 範圍限制：tier 1（unknown_failure 等）與非未解決分類、出窗、非 bug、非本機列都不是候選', async () => {
+    restoreFlag = setMonDbFlag('1')
+    const pool = new FakeReconcilePool()
+    pool.rows.set('run-t1', staleRow('run-t1', 'FAQ-a', 'unknown_failure', { outcome_tier: 1 }))
+    pool.rows.set('run-ok', staleRow('run-ok', 'FAQ-b', 'success'))
+    pool.rows.set('run-old', staleRow('run-old', 'FAQ-c', 'timeout', { finished_at: recentFinishedAt(7 * 3600_000) })) // 出 6h 窗
+    pool.rows.set('run-dm', staleRow('run-dm', 'FAQ-d', 'timeout', { kind: 'demand' }))
+    pool.rows.set('run-wk', staleRow('run-wk', 'FAQ-e', 'timeout', { host: 'landon2' }))
+
+    const trackerCalls: string[] = []
+    const tracker: TrackerReadFn = async t => {
+      trackerCalls.push(t)
+      return { status: 'done', completedAt: new Date().toISOString() }
+    }
+    const r = await reconcileStaleOutcomesToMonDb(pool, tracker, undefined, 0)
+    expect(r).toEqual({ swept: true, applied: 0 })
+    expect(trackerCalls.length).toBe(0) // 沒有任何候選 → tracker 一次都不查
+    expect(pool.rows.get('run-t1')!.outcome).toBe('unknown_failure') // tier 1 永不被 W6 動到
+  })
+
+  test('sweep 間隔節流：預設 30s 間隔內的第二趟 swept=false、零呼叫；sweepIntervalMs=0（測試覆寫）則每趟都掃', async () => {
+    restoreFlag = setMonDbFlag('1')
+    const pool = new FakeReconcilePool()
+    const r1 = await reconcileStaleOutcomesToMonDb(pool, trackerOf({}))
+    expect(r1.swept).toBe(true)
+    expect(pool.calls).toEqual(['select'])
+
+    // 兩次呼叫背靠背 ≪ 30 秒（靠執行速度不靠等待）→ 被間隔節流。
+    pool.calls = []
+    const r2 = await reconcileStaleOutcomesToMonDb(pool, trackerOf({}))
+    expect(r2).toEqual({ swept: false, applied: 0 })
+    expect(pool.calls.length).toBe(0)
+
+    const r3 = await reconcileStaleOutcomesToMonDb(pool, trackerOf({}), undefined, 0)
+    expect(r3.swept).toBe(true)
+    expect(pool.calls).toEqual(['select'])
+  })
+
+  test('budget 逾時（注入永不 resolve 的假 pool + budgetMs=0，零等待）→ swept=true applied=0 不拋出；連續逾時 WARN 只印一次（去重）', async () => {
+    restoreFlag = setMonDbFlag('1')
+    class NeverResolvePool {
+      calls = 0
+      async execute(): Promise<[unknown, unknown]> {
+        this.calls++
+        return new Promise(() => {})
+      }
+    }
+    const warnSpy = spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const pool = new NeverResolvePool()
+      const r1 = await reconcileStaleOutcomesToMonDb(pool, trackerOf({}), 0, 0)
+      expect(r1).toEqual({ swept: true, applied: 0 })
+      expect(pool.calls).toBe(1) // 有真的發起 SELECT
+
+      const r2 = await reconcileStaleOutcomesToMonDb(pool, trackerOf({}), 0, 0)
+      expect(r2).toEqual({ swept: true, applied: 0 })
+      const reconcileWarns = warnSpy.mock.calls.filter((args: unknown[]) => String(args[0]).includes('tracker reconcile sweep'))
+      expect(reconcileWarns.length).toBe(1) // 同一串連續失敗只印一次
+    } finally {
+      warnSpy.mockRestore()
+    }
+  })
+})
+
+describe('reconcileStaleOutcomesToMonDbGuarded（ingest.ts）— 接線：同步 throw 不炸呼叫端', () => {
+  let restoreFlag: () => void
+  afterEach(() => {
+    __resetReconcileMonDbStateForTest()
+    restoreFlag?.()
+  })
+
+  test('MON_DB_ENABLED=1 但 MON_DB_HOST 缺漏 → getMonitorPool() 的同步 throw 被吞掉、只留 WARN，函式不拋出', () => {
+    restoreFlag = setMonDbFlag('1')
+    const origHost = process.env.MON_DB_HOST
+    delete process.env.MON_DB_HOST
+    const warnSpy = spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      // 前提同 rounds 的 BLOCKING-2 測試：poolSingleton 尚未被任何測試以完整
+      // env 建出（本測試套件從不真的連線），所以缺漏必然同步 throw。
+      expect(() => reconcileStaleOutcomesToMonDbGuarded()).not.toThrow()
+      const warns = warnSpy.mock.calls.filter((args: unknown[]) => String(args[0]).includes('tracker reconcile 掛載失敗'))
+      expect(warns.length).toBe(1)
+      expect(String(warns[0]![0])).toContain('MON_DB_HOST')
+    } finally {
+      warnSpy.mockRestore()
+      if (origHost === undefined) delete process.env.MON_DB_HOST
+      else process.env.MON_DB_HOST = origHost
+    }
+  })
+
+  test('MON_DB_ENABLED 未設（關閉）→ 不會走到 getMonitorPool()，同樣不拋出', () => {
+    restoreFlag = setMonDbFlag(undefined)
+    expect(() => reconcileStaleOutcomesToMonDbGuarded()).not.toThrow()
   })
 })

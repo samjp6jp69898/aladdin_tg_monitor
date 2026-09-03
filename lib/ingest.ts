@@ -32,6 +32,7 @@ import {
   RUNS_HOST,
   persistReviewRoundsToMonDb,
   forgetRoundsMonDbState,
+  reconcileStaleOutcomesToMonDb,
 } from './mon-db.ts'
 
 // ---------- 1) audit.jsonl tail ----------
@@ -620,6 +621,7 @@ export function scanPipelineRuns() {
     }
   }
   reconcileStaleOutcomes()
+  reconcileStaleOutcomesToMonDbGuarded()
 }
 
 /**
@@ -644,6 +646,30 @@ function reconcileStaleOutcomes(): void {
   for (const r of rows) {
     const resolved = reconcileWithTracker(r.ticket, r.outcome, r.finished_at)
     if (resolved.outcome !== r.outcome) updateStmt.run(resolved.outcome, resolved.finishedAt, r.key)
+  }
+}
+
+/**
+ * mon_ui 側的 tracker 遲到補跑修正（W6，a7-D39 缺口補位）：候選發現直接查
+ * mysql、不依賴上面 sqlite 迴圈的結果——sqlite collector 退役後照常運作。
+ * 兩側各自獨立掃描與寫入，過渡期同一張票兩邊各 spawn 一次 tracker.sh（6h 窗
+ * ＋mysql 側 30s sweep 節流自限，退役後自然消失）。與 sqlite 側的三個刻意
+ * 差異（裸值域、不覆蓋 finished_at、只碰 tier 2）見 mon-db.ts W6 區段檔頭。
+ *
+ * 結構比照 persistReviewRoundsToMonDbGuarded：flag 關閉零副作用；
+ * getMonitorPool() 的同步 throw（MON_DB_* 缺漏）不炸呼叫端；fire-and-forget
+ * 不拖 collector tick——tracker spawn 用 readTrackerStatusAsync（非 *Sync*，
+ * 不佔 event loop），以參數注入避免 mon-db.ts 反向 import 本檔成環。
+ */
+export function reconcileStaleOutcomesToMonDbGuarded(): void {
+  if (!isMonitorDbEnabled()) return
+  try {
+    const pool = getMonitorPool()
+    void reconcileStaleOutcomesToMonDb(pool, readTrackerStatusAsync).catch(err => {
+      console.warn(`mon-db: tracker reconcile 例外：${err}`)
+    })
+  } catch (err) {
+    console.warn(`mon-db: tracker reconcile 掛載失敗（可能是 MON_DB_* 環境變數缺漏）：${err}`)
   }
 }
 
