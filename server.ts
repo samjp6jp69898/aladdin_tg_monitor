@@ -17,6 +17,9 @@ import { getReader, initReader } from './lib/read/index.ts'
 import { resolveReadSource } from './lib/read/source.ts'
 import type { AgentRunRow } from './lib/read/types.ts'
 import { decodeEventsCursor, encodeEventsCursor } from './lib/events-cursor.ts'
+// 從 types.ts 匯入，**不是** lib/read/mysql.ts——後者靜態 import 會讓 sqlite 模式
+// 也載入 mysql2，違反 lib/read/index.ts:42-44 的 lazy import 紀律（MAJOR-D1）。
+import { UnresolvableBeforeIdError } from './lib/read/types.ts'
 import { startCollectors, getLastProbes, listRunningPipelineProcs, listBugLocks, loadRoster, cancelPipeline, summarizeEvents, computeBugStages, readTrackerStatusAsync, isBugOutcomeRetryable, parseClaudeEvents, getReviewRoundCounts } from './lib/ingest.ts'
 import { loadConnectedUsers, loadPendingSenders, loadAllTechUsers, assignChatId, unsetChatId, sendTestMessage } from './lib/tg-users.ts'
 import { getWebhookStatus } from './lib/webhook-status.ts'
@@ -188,7 +191,13 @@ app.get('/api/events', async c => {
     q: q.q,
     ...cursorFilter,
     limit,
+  }).catch(err => {
+    // deprecated 的 before_id 在 mysql 軌對不到列 → 400，與壞 cursor 同樣待遇。
+    // 靜默回空頁會讓前端顯示「已到底」，而那種失敗沒有人會發現。
+    if (err instanceof UnresolvableBeforeIdError) return null
+    throw err
   })
+  if (rows === null) return c.json({ error: 'invalid before_id' }, 400)
   // next_cursor（a7-D46）：客戶端不得自行構造游標（opaque），所以「下一頁從哪裡開始」
   // 必須由伺服器給。`null` ＝ 沒有更早的資料了——這個訊號同時解掉既有缺陷
   // 「0 筆時前端不更新 oldestId，之後『載入更早』永遠 0 筆且沒有已到底提示」。

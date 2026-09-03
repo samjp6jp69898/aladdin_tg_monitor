@@ -30,6 +30,7 @@
 // `IF(JSON_VALID(raw), ...)` 內：raw 若不是合法 JSON（理論上不會，寫入端與
 // insertAuditLine 同樣先 JSON.parse 才寫），回 NULL 而不是讓整個端點 500。
 
+import { UnresolvableBeforeIdError } from './types.ts'
 import type { Pool, RowDataPacket } from 'mysql2/promise'
 import { getMonitorPool, isoToMysqlDatetime3 } from '../mon-db.ts'
 import type {
@@ -631,8 +632,20 @@ export const mysqlReader: MonitorReader = {
       // deprecated 的 `before_id`（保留一個發版週期，給瀏覽器裡開著的舊分頁）。
       // **不沿用舊語意**——舊語意（純 id 比較）正是錯的東西；這裡把 id 翻譯成
       // 該列的 (ts, id) 再走同一條 row-value 路徑，語意與新游標完全一致。
-      where.push('(e.ts, e.id) < ((SELECT ts FROM mcp_usage WHERE id = ?), ?)')
-      params.push(f.beforeId, f.beforeId)
+      //
+      // **對不到列一定要吵**（Reviewer B MAJOR-7）：第一版用子查詢
+      // `(SELECT ts FROM mcp_usage WHERE id = ?)`，對不到時子查詢回 NULL、
+      // row-value 比較結果為 NULL、WHERE 整條不成立 ⇒ 回 0 列 ⇒ server.ts 給
+      // `next_cursor: null` ⇒ 前端停用按鈕並顯示「已到底」。
+      // **一個明明還有幾千筆的列表被安靜地宣告到底了。**
+      // 而切換當下最典型的觸發情境就是：舊分頁手上的 id 是 **sqlite 的 id 空間**，
+      // 與 `mcp_usage.id` 毫無關係——對不到是常態不是意外。
+      // 這與同一次改動裡對壞 cursor 選 400 的理由（靜默失敗沒有人會發現）
+      // 自相矛盾，所以改成同樣的待遇：解析不出來就讓呼叫端回 400。
+      const [ref] = await q<any[]>(`SELECT ${iso('ts')} AS ts FROM mcp_usage WHERE id = ?`, [f.beforeId])
+      if (!ref) throw new UnresolvableBeforeIdError(f.beforeId)
+      where.push('(e.ts, e.id) < (?, ?)')
+      params.push(isoToMysqlDatetime3(ref.ts), f.beforeId)
     }
     // LIMIT 片段要在下 SQL 之前算好：limit 是 NaN 時 limitClause 會丟錯，
     // 那是刻意對齊 sqlite 的行為（見該函式註解），不能吞掉。

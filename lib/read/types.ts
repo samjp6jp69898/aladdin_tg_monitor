@@ -213,3 +213,21 @@ export interface IdentityUsageRow {
   last_ts: string
   n: number
 }
+
+/**
+ * deprecated 的 `before_id` 在 mysql 軌對不到 `mcp_usage` 的任何一列。
+ *
+ * **為什麼要有這個錯誤而不是回空頁**：回空頁會讓 `next_cursor` 是 null，
+ * 前端據此顯示「已到底」——**一個還有資料的列表被安靜地宣告結束**，
+ * 而那種失敗沒有人會發現。呼叫端（server.ts）據此回 400。
+ *
+ * sqlite 軌**不會**丟這個錯：那一軌的 `before_id` 是原生的 `id < ?`，
+ * 對不到的 id 只是回較舊的列，語意明確且無害；改成 400 會製造一個新的失敗，
+ * 也會破壞「sqlite 軌逐位元不變」。
+ */
+export class UnresolvableBeforeIdError extends Error {
+  constructor(public readonly beforeId: number) {
+    super(`before_id=${beforeId} 在 mcp_usage 找不到對應列（游標無法解析）`)
+    this.name = 'UnresolvableBeforeIdError'
+  }
+}
