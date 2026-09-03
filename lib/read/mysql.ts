@@ -471,6 +471,30 @@ export async function probeMysqlReadable(): Promise<void> {
   await q('SELECT 1 AS ok')
 }
 
+/**
+ * 擋門專用：`outcome_source` / `outcome_tier` 豁免中繼資料，以 `legacy_key` 對位。
+ *
+ * **為什麼不進 `MonitorReader` 介面**（phase9-readiness.md §9.2，a7 核准）：
+ * 這兩欄只給擋門判斷豁免用，若進 `PipelineRunRow` 會改 `/api/pipelines` 回應形狀、
+ * 觸發 a7-D15 契約通報並牽動 parity。**擋門內部細節，不進任何端點契約**——
+ * 走同一條 `q()` 佇列（限流＋逾時），只是另一支唯讀查詢，不擴充 reader。
+ */
+export async function readOutcomeMeta(): Promise<Map<string, { outcome_source: string | null; outcome_tier: number | null }>> {
+  const rows = await q<any[]>(
+    `SELECT COALESCE(r.legacy_key, r.run_id) AS \`key\`,
+            r.outcome_source AS outcome_source,
+            r.outcome_tier   AS outcome_tier
+       FROM runs r
+      WHERE ${RUNS_LIST_WHERE}`,
+  )
+  return new Map(
+    rows.map(r => [
+      r.key as string,
+      { outcome_source: r.outcome_source ?? null, outcome_tier: r.outcome_tier === null ? null : Number(r.outcome_tier) },
+    ]),
+  )
+}
+
 export const mysqlReader: MonitorReader = {
   source: 'mysql',
 

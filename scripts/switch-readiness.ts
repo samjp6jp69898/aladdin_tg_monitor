@@ -146,6 +146,14 @@ export function findOrderViolations(rows: { ts: string; id?: number }[]): string
   return out
 }
 
+// C5/C6 豁免（phase9-readiness.md §9.1/§9.2/§9.3）的純函式判準，拆在
+// lib/read/gate-exemptions.ts（原因見該檔頭註解：純函式才能安全被單元測試 import，
+// 這支腳本本身 import 就會連 DB、跑判定、process.exit）。
+import {
+  extractIntConstant, isSkeletonAgentRun, SKELETON_EXEMPT_FIELDS,
+  isFinishedAtExempt, isOutcomeDifference3Exempt, isRoundsExempt, KNOWN_OUTCOME_SOURCES,
+} from '../lib/read/gate-exemptions.ts'
+
 /**
  * 寫入端的已知缺口清單（D 組）。每一項補齊之前都判 FAIL——
  * 這些欄位一旦切過去就是畫面上真的看不到的東西，不是可以「之後再說」的。
@@ -361,10 +369,12 @@ judge((await run(['bun', 'run', 'scripts/sync-inventory-lines.ts', '--check'])) 
 // ═════════════════════ C. 資料面收斂（§10.2）═════════════════════
 console.log('\n═══ C. 資料面收斂（§10.2 雙軌對照）═══')
 let mysqlReader: MonitorReader
+let outcomeMeta: Map<string, { outcome_source: string | null; outcome_tier: number | null }>
 try {
   const m = await import('../lib/read/mysql.ts')
   await m.probeMysqlReadable()
   mysqlReader = m.mysqlReader
+  outcomeMeta = await m.readOutcomeMeta()
 } catch (e) {
   fail('連得上監控 DB', e instanceof Error ? e.message : String(e))
   console.log(`\n═══ 結論：不可切（${fails}/${checks} 項未過）═══`)
@@ -374,6 +384,26 @@ try {
 const FULL = 1_000_000
 const now = Date.now()
 const iso = (t: number) => new Date(t).toISOString()
+
+// C5/C6 豁免要用到的兩個私有常數，從原始碼讀（不 import：CREATE_MR_TIMEOUT_SECONDS
+// 在 lib/ingest.ts 也沒 export，import 整支會拉進 collector 模組圖且它 import
+// 當下就開 sqlite）。讀不到就判 FAIL，不給預設值（見 extractIntConstant 說明）。
+const ingestSrc = readFileSync(`${REPO}/lib/ingest.ts`, 'utf8')
+const createMrTimeoutSec = extractIntConstant(ingestSrc, 'CREATE_MR_TIMEOUT_SECONDS')
+const roundsWindowMs = extractIntConstant(ingestSrc, 'ROUNDS_MON_DB_RECENT_WINDOW_MS')
+judge(createMrTimeoutSec !== null, 'C6 骨架列年齡上界常數可讀（CREATE_MR_TIMEOUT_SECONDS）',
+  createMrTimeoutSec !== null ? `${createMrTimeoutSec}s` : 'lib/ingest.ts 讀不到這個常數，C6 骨架列年齡判準無法執行')
+judge(roundsWindowMs !== null, 'rounds 豁免窗常數可讀（ROUNDS_MON_DB_RECENT_WINDOW_MS）',
+  roundsWindowMs !== null ? `${roundsWindowMs}ms` : 'lib/ingest.ts 讀不到這個常數，rounds 方向敏感豁免無法執行')
+
+// outcome_source 值域監看（§9.2，97 建議、b5 採納）：集合外的值只 WARN，不判 FAIL。
+{
+  const unknown = new Set<string>()
+  for (const meta of outcomeMeta.values()) {
+    if (meta.outcome_source !== null && !KNOWN_OUTCOME_SOURCES.has(meta.outcome_source)) unknown.add(meta.outcome_source)
+  }
+  if (unknown.size > 0) console.log(`[WARN] outcome_source 出現已知值域外的值（不影響判定，僅提醒維護清單）：${[...unknown].join(', ')}`)
+}
 
 /** 內容集合相等（忽略指定欄位）。 */
 function setEqual(a: any[], b: any[], drop: string[] = []): { equal: boolean; onlyA: number; onlyB: number } {
@@ -489,9 +519,13 @@ let observedMaxDelta = Number.NEGATIVE_INFINITY
   const badDelta: string[] = []
   let backfillPairs = 0
   const crossHostPairs: string[] = []
+  const finishedAtExempt: string[] = []
+  const outcomeDiff3Exempt: string[] = []
+  const roundsExempt: string[] = []
   for (const r of a) {
     const o = bk.get(r.key)
     if (!o) continue
+    const meta = outcomeMeta.get(r.key) ?? { outcome_source: null, outcome_tier: null }
     // Δ 判準只適用 host='head' 的配對（理由見 STARTED_AT_TOLERANCE_MS 的說明）。
     const host = (o as any).host
     if (host === 'unknown_pre_migration') {
@@ -504,11 +538,28 @@ let observedMaxDelta = Number.NEGATIVE_INFINITY
       observedMaxDelta = Math.max(observedMaxDelta, delta)
       if (delta < 0 || delta > STARTED_AT_TOLERANCE_MS) badDelta.push(`${r.key} Δ=${delta}ms`)
     }
+    // rounds 出窗方向敏感豁免（§9.3）：以這一筆 run 的 finished_at 判斷是否出窗。
+    // 執行中的 run（finished_at 為 null）不適用——交給自然收斂，不是本豁免的範圍。
+    const finishedAtMs = (o as any).finished_at ? Date.parse((o as any).finished_at) : null
+    const outOfWindow = roundsWindowMs !== null && finishedAtMs !== null && finishedAtMs < now - roundsWindowMs
     for (const col of Object.keys(r)) {
       if (IGNORE.has(col)) continue
-      if (JSON.stringify((r as any)[col] ?? null) !== JSON.stringify((o as any)[col] ?? null)) {
-        fieldDiffs.push(`${r.key}.${col}: sqlite=${JSON.stringify((r as any)[col])} mysql=${JSON.stringify((o as any)[col])}`)
+      const sVal = (r as any)[col] ?? null
+      const mVal = (o as any)[col] ?? null
+      if (JSON.stringify(sVal) === JSON.stringify(mVal)) continue
+      if (col === 'finished_at' && isFinishedAtExempt(meta.outcome_source)) {
+        finishedAtExempt.push(`${r.key}（outcome_source=${meta.outcome_source}）`)
+        continue
       }
+      if (col === 'outcome' && isOutcomeDifference3Exempt(sVal, meta.outcome_tier)) {
+        outcomeDiff3Exempt.push(`${r.key}: sqlite=${JSON.stringify(sVal)} mysql=${JSON.stringify(mVal)}（tier=${meta.outcome_tier}）`)
+        continue
+      }
+      if ((col === 'review_rounds' || col === 'final_review_rounds') && isRoundsExempt(sVal, mVal, outOfWindow)) {
+        roundsExempt.push(`${r.key}.${col}: sqlite=${sVal} mysql=NULL（出窗）`)
+        continue
+      }
+      fieldDiffs.push(`${r.key}.${col}: sqlite=${JSON.stringify(sVal)} mysql=${JSON.stringify(mVal)}`)
     }
   }
   judge(badDelta.length === 0,
@@ -522,6 +573,10 @@ let observedMaxDelta = Number.NEGATIVE_INFINITY
     crossHostPairs.length ? crossHostPairs.slice(0, 3).join('; ') : '')
   judge(fieldDiffs.length === 0, 'C5 runs 其餘每一欄逐字相等',
     fieldDiffs.length ? fieldDiffs.slice(0, 4).join(' | ') : '')
+  // 三條豁免逐列印出，不靜默（每一條都是日後可能吞掉真差異的地方）。
+  if (finishedAtExempt.length) console.log(`[EXEMPT] C5 finished_at（outcome_source=tracker_reconcile，共 ${finishedAtExempt.length} 筆）：${finishedAtExempt.slice(0, 10).join('; ')}`)
+  if (outcomeDiff3Exempt.length) console.log(`[EXEMPT] C5 outcome 差異3（sqlite 已 reconcile、mysql 仍 tier1，共 ${outcomeDiff3Exempt.length} 筆）：${outcomeDiff3Exempt.slice(0, 10).join('; ')}`)
+  if (roundsExempt.length) console.log(`[EXEMPT] C5 rounds 出窗歷史殘差（共 ${roundsExempt.length} 筆）：${roundsExempt.slice(0, 10).join('; ')}`)
 }
 
 // C6 agent_runs
@@ -533,11 +588,26 @@ let observedMaxDelta = Number.NEGATIVE_INFINITY
     `sqlite=${a.length} mysql=${b.length} 缺=${missing.length}`)
   const IGNORE = new Set(['file_mtime', 'run_id', 'host'])
   const diffs: string[] = []
+  const skeletonExempt: string[] = []
+  const skeletonTooOld: string[] = []
   for (const r of a) {
     const o = bk.get(r.path)
     if (!o) continue
+    // 骨架列豁免（§9.1）：mysql 未終態只寫骨架（payload 十欄全 NULL），這是
+    // 兩軌「該不該早寫」的已接受分岔，不是寫入端缺陷。判別子直接對應
+    // collector 自己的 terminal 定義。
+    const skeleton = isSkeletonAgentRun({ ended_at: (o as any).ended_at ?? null, is_error: (o as any).is_error ?? 0 })
+    if (skeleton) {
+      const ageMs = now - Date.parse(r.started_at)
+      skeletonExempt.push(`${r.path.split('/').pop()}（started_at=${r.started_at}，已停 ${Math.round(ageMs / 1000)}s）`)
+      // 骨架列年齡超過 pipeline 可能持續的最長時間 ⇒ 不可能是合法地還在跑。
+      if (createMrTimeoutSec !== null && ageMs > createMrTimeoutSec * 1000) {
+        skeletonTooOld.push(`${r.path.split('/').pop()}：已停 ${Math.round(ageMs / 1000)}s > 上界 ${createMrTimeoutSec}s`)
+      }
+    }
     for (const col of Object.keys(r)) {
       if (IGNORE.has(col)) continue
+      if (skeleton && SKELETON_EXEMPT_FIELDS.has(col)) continue
       // cost_usd 走 DECIMAL(12,6) 正規化：兩軌型別不同（sqlite REAL vs
       // mysql DECIMAL），逐字比會把已知的量化差報成資料不一致（實測假陽性）。
       const equal =
@@ -547,8 +617,11 @@ let observedMaxDelta = Number.NEGATIVE_INFINITY
       if (!equal) diffs.push(`${r.path.split('/').pop()}.${col}`)
     }
   }
-  judge(diffs.length === 0, 'C6 agent_runs 逐欄相等（file_mtime 不比：collector 私有游標，刻意不進權威表）',
+  judge(diffs.length === 0, 'C6 agent_runs 逐欄相等（file_mtime 不比：collector 私有游標，刻意不進權威表；骨架列 payload 欄豁免見下）',
     diffs.length ? [...new Set(diffs)].slice(0, 6).join(', ') : '')
+  judge(skeletonTooOld.length === 0, `C6 骨架列年齡未逾上界（${createMrTimeoutSec ?? 'n/a'}s，逾期＝結構上不可能合法還在跑）`,
+    skeletonTooOld.length ? skeletonTooOld.slice(0, 5).join('; ') : '')
+  if (skeletonExempt.length) console.log(`[EXEMPT] C6 骨架列 payload 欄豁免（共 ${skeletonExempt.length} 筆）：${skeletonExempt.slice(0, 10).join('; ')}`)
 }
 
 // C7 status_log：只在「兩軌都有資料」的時間窗內比對翻轉
