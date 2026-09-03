@@ -101,7 +101,14 @@ export function PipelinesListView({ resource }: { resource: Resource<PipelinesRe
             </a>
           )
         }
-        return '本機'
+        // history 列（來自 /api/pipelines 的 rows）：host 只有 MON_READ_SOURCE=mysql
+        // 才會帶（lib/read/types.ts PipelineRunRow.host?），依實際值分三種顯示，
+        // 不再不分青紅皂白硬寫「本機」。
+        const host = row.data.host
+        if (host === 'head') return '本機'
+        if (host === 'unknown_pre_migration') return '未知（遷移前）'
+        if (!host) return '未知'
+        return host
       },
     },
     {

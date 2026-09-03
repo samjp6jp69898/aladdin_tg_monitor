@@ -341,6 +341,12 @@ export interface PipelineRun extends PipelineRunBase {
   running: boolean
   assignee: string | null
   retryable: boolean
+  review_rounds: number | null
+  final_review_rounds: number | null
+  /** §8.1 可選欄位（lib/read/types.ts PipelineRunRow）：只有 MON_READ_SOURCE=mysql 時才帶。 */
+  host?: string
+  /** 同上，只有 mysql 來源才帶。 */
+  run_id?: string
 }
 
 export interface PipelinesResponse {
