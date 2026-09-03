@@ -42,7 +42,7 @@ app.get('/', c => c.html(Bun.file(new URL('./public/index.html', import.meta.url
 
 ## 端點清單
 
-### GET / — server.ts:72
+### GET / — server.ts:75
 
 - Query：無
 - Body：無（GET）
@@ -50,7 +50,7 @@ app.get('/', c => c.html(Bun.file(new URL('./public/index.html', import.meta.url
 - 特殊行為：無快取、無 ETag，每次請求都重新讀檔（`Bun.file().text()`）
 - 服務分頁：（推測）整個 SPA 的入口，非特定分頁
 
-### GET /api/overview — server.ts:145
+### GET /api/overview — server.ts:148
 
 - Query：無
 - Body：無
@@ -88,14 +88,14 @@ app.get('/', c => c.html(Bun.file(new URL('./public/index.html', import.meta.url
 - 錯誤格式：本端點內無顯式錯誤分支，任何拋出例外會落到 Hono 預設處理（未自訂 `app.onError`）。
 - 服務分頁：總覽（overview）
 
-### POST /api/services/restart — server.ts:150
+### POST /api/services/restart — server.ts:153
 
 - Body：`{ id?: string }`
 - 回傳（成功）：`restartService()` 結果 `{ ok: boolean, result: string }`，`ok` 時 HTTP 200，否則 409（`server.ts:114`）
 - 錯誤：`id` 為空/缺 → 400 `{ ok: false, result: 'RESTART_ERR_ARGS: missing id' }`（`server.ts:112`）；`restartService()`（`lib/services.ts:240-251`）內部錯誤字串前綴：`RESTART_ERR_UNKNOWN_ID`、`RESTART_ERR_NO_LAUNCHD_LABEL`、`RESTART_ERR_EXEC`；成功前綴 `RESTART_OK`
 - 服務分頁：總覽（每個 service 卡片的重啟按鈕，推測）
 
-### GET /api/events — server.ts:159
+### GET /api/events — server.ts:162
 
 - Query（皆選填，`server.ts:119-142`）：
   - `service`: string
@@ -150,14 +150,14 @@ app.get('/', c => c.html(Bun.file(new URL('./public/index.html', import.meta.url
 > 攔截注入模擬新後端，`next_cursor="CUR123"` → 下一次請求改送 `cursor=CUR123`（非 `before_id`），
 > `next_cursor=null` → 按鈕停用且顯示「已到底」，兩者皆 0 error。
 
-### GET /api/sessions — server.ts:204
+### GET /api/sessions — server.ts:213
 
 - Query：`days`（預設 7）、`service`（選填）、`identity`（選填）
 - 回傳：`{ sessions: Session[], gapMin: number, days: number }`（`gapMin` 常數 10 分鐘）
   `Session`（組裝於 `server.ts:161-178`）：`{ service, identity, start: string, end: string, count: number, errors: number, tools: string[], logins: string[], ips: string[], firstId: number, lastId: number }`（依 `end` 由新到舊排序）
 - 服務分頁：使用 Session（sessions）
 
-### GET /api/stats — server.ts:231
+### GET /api/stats — server.ts:240
 
 - Query：`days`（預設 7）
 - 回傳（`server.ts:191`）：
@@ -174,7 +174,7 @@ app.get('/', c => c.html(Bun.file(new URL('./public/index.html', import.meta.url
   ```
 - 服務分頁：歷史統計（stats）
 
-### GET /api/status-log — server.ts:239
+### GET /api/status-log — server.ts:248
 
 - Query：`service`（選填；不帶則回全部 service 混合）
 - 回傳：`{ rows: StatusLogRow[] }`，上限 200 筆，依 `id DESC`
@@ -197,7 +197,7 @@ app.get('/', c => c.html(Bun.file(new URL('./public/index.html', import.meta.url
 > 同檔 events 查詢（`:457`/`:461`/`:496`）一直是 `ts DESC, id DESC`，此修法是讓 status_log
 > 跟上同檔既有慣例，不是引進新慣例。
 
-### GET /api/pipelines — server.ts:322
+### GET /api/pipelines — server.ts:331
 
 - Query：無
 - 回傳（`server.ts:263`）：
@@ -213,7 +213,7 @@ app.get('/', c => c.html(Bun.file(new URL('./public/index.html', import.meta.url
   `DispatchEntry`（`lib/cluster-state.ts:60-68`）：`{ ticket, kind: 'bug'|'demand', status: 'dispatching'|'confirmed', worker, workerUrl, dispatchedAt, triggeredBy: {name,email} | null }`
 - 服務分頁：Pipelines（列表）
 
-### GET /api/toolsmith — server.ts:333
+### GET /api/toolsmith — server.ts:342
 
 - Query：無
 - 回傳：`{ rows: ToolsmithRunRow[] }`（上限 200，依 `updatedAt DESC`，`lib/toolsmith.ts:72-121`）
@@ -234,7 +234,7 @@ app.get('/', c => c.html(Bun.file(new URL('./public/index.html', import.meta.url
   ```
 - 服務分頁：Toolsmith
 
-### GET /api/cluster/workers — server.ts:338
+### GET /api/cluster/workers — server.ts:347
 
 - Query：無
 - 回傳（`server.ts:287`）：
@@ -254,7 +254,7 @@ app.get('/', c => c.html(Bun.file(new URL('./public/index.html', import.meta.url
 - 特殊行為：`capacity` 只在 `CLUSTER_SHARED_SECRET` 有設定時才會查（否則為 `null`），對每個 worker 平行 `fetch`（2.5s/3s timeout），worker 連不上時 `health`/`capacity` 為 `null`、`online: false`
 - 服務分頁：Workers
 
-### GET /api/cluster/worker — server.ts:355
+### GET /api/cluster/worker — server.ts:364
 
 - Query：`name`（必填，找不到對應 worker → 見錯誤）、`ticket`（選填，須符合 `/^(FAQ|ALDREQ)-\d+$/` 才會生效）
 - 錯誤：`name` 對不到已註冊 worker → 404 `{ error: 'worker 未註冊（可能已退役或名稱打錯）' }`
@@ -272,9 +272,9 @@ app.get('/', c => c.html(Bun.file(new URL('./public/index.html', import.meta.url
   `JobStatus`（`lib/cluster-state.ts:87`）：`{ locked: boolean, queueState: 'running'|'queued'|null, progress: string|null, stages?: ProgressStage[] }`；`ProgressStage`：`{ key, label, done: boolean, current: boolean, at: string|null }`
 - 服務分頁：Workers（單一 worker 詳情面板）／Pipelines（「查看 worker」連結，推測）
 
-### POST /api/cluster/worker/disable — server.ts:384
-### POST /api/cluster/worker/enable — server.ts:385
-### POST /api/cluster/worker/remove — server.ts:386
+### POST /api/cluster/worker/disable — server.ts:393
+### POST /api/cluster/worker/enable — server.ts:394
+### POST /api/cluster/worker/remove — server.ts:395
 
 三者共用同一個 handler `handleWorkerAction`（`server.ts:312-321`），差別只在呼叫 `disableWorker`/`enableWorker`/`removeWorker`（`lib/cluster-state.ts:141-143`，皆為 POST 到 head 8787 的 `/cluster/worker/:name/{action}`）。
 
@@ -287,7 +287,7 @@ app.get('/', c => c.html(Bun.file(new URL('./public/index.html', import.meta.url
 - 成功：200 `{ ok: true }`
 - 服務分頁：Workers（中斷/恢復/移除按鈕）
 
-### GET /api/pipelines/run — server.ts:452
+### GET /api/pipelines/run — server.ts:461
 
 > **2026-09-02 修正**：原文誤植「`run` 不含 agent_count 等彙總欄」。實際上 handler 呼叫
 > `attachAgentRuns(siblings)`（server.ts:332，對應本檔案「插入 15 行前」編號；含 `+15` offset
@@ -315,7 +315,7 @@ app.get('/', c => c.html(Bun.file(new URL('./public/index.html', import.meta.url
   `BugStage`（`lib/ingest.ts:447-461`）：`{ key: string, label: string, status: 'done'|'reused'|'pending'|'running', started_at: string|null, finished_at: string|null, detail?: string|null }`
 - 服務分頁：Pipelines（單張票的詳情/進度頁，前端定期輪詢，`server.ts:362-363` 註解）
 
-### GET /api/agent-trace — server.ts:459
+### GET /api/agent-trace — server.ts:468
 
 - Query：`path`（必填，須通過 `isAllowedTracePath()` 白名單：`lib/services.ts:224-228`，僅允許 `AGENT_TRACE_DIR/*.json` 或 `DISPATCHER_LOG_DIR/*.stdout.log`）
 - 錯誤：
@@ -347,7 +347,7 @@ app.get('/', c => c.html(Bun.file(new URL('./public/index.html', import.meta.url
   `AgentSummary`（`lib/ingest.ts:746-757`）：`{ model: string|null, input_tokens: number|null, output_tokens: number|null, cache_read_tokens: number|null, cache_create_tokens: number|null, cost_usd: number|null, num_turns: number|null, tool_calls: number, is_error: number, result_preview: string|null }`
 - 服務分頁：Pipelines（單一 agent 對話 drill-down，推測）
 
-### POST /api/pipelines/cancel — server.ts:510
+### POST /api/pipelines/cancel — server.ts:519
 
 - Body：`{ kind?: 'bug'|'demand', ticket?: string }`
 - 驗證：`kind` 必須是 `'bug'` 或 `'demand'` 且 `ticket` 須符合 `/^[A-Z]+-\d+$/`，否則 400 `{ ok: false, reason: 'bad params' }`
@@ -367,7 +367,7 @@ app.get('/', c => c.html(Bun.file(new URL('./public/index.html', import.meta.url
 > **本節上方的欄位清單仍是現行部署版本**，是「回應形狀不變」的驗收基準；上述三欄待後端 Phase 3
 > 部署後再併入正式清單。
 
-### POST /api/pipelines/retry — server.ts:558
+### POST /api/pipelines/retry — server.ts:567
 
 - Body：`{ ticket?: string }`
 - 驗證與錯誤（依序，`server.ts:472-512`）：
@@ -382,7 +382,7 @@ app.get('/', c => c.html(Bun.file(new URL('./public/index.html', import.meta.url
 - 成功：200 `{ ok: true, pid: number | undefined }`
 - 服務分頁：Pipelines（重試按鈕）
 
-### GET /api/tg-users — server.ts:603
+### GET /api/tg-users — server.ts:612
 
 - Query：無
 - 回傳：`{ connected: ConnectedUser[], pending: PendingSender[], techUsers: TechUser[] }`
@@ -391,34 +391,34 @@ app.get('/', c => c.html(Bun.file(new URL('./public/index.html', import.meta.url
   - `TechUser`（`lib/tg-users.ts:17`）：`{ name, email, chat_id }`（含未連接者，`chat_id` 可能為空字串）
 - 服務分頁：連接（tokens tab group）／TG 已連接／TG 待處理 三個子分頁共用同一個資料源
 
-### POST /api/tg-users/assign — server.ts:609
+### POST /api/tg-users/assign — server.ts:618
 
 - Body：`{ chat_id?: string, email?: string, force?: boolean }`
 - 驗證：`chat_id`、`email` 皆必填（trim 後非空），否則 400 `{ ok: false, result: 'SET_ERR_ARGS: missing chat_id/email' }`
 - 回傳：`assignChatId()` 結果（`lib/tg-users.ts:73-95`）`{ ok: boolean, result: string }`，成功字串前綴 `SET_OK`，200/409。`force` 對應 `tg-map-chatids.sh --set ... --force`
 - 服務分頁：TG 待處理（手動指定技術人員）
 
-### POST /api/tg-users/unset — server.ts:619
+### POST /api/tg-users/unset — server.ts:628
 
 - Body：`{ email?: string }`
 - 驗證：`email` 必填，否則 400 `{ ok: false, result: 'UNSET_ERR_ARGS: missing email' }`
 - 回傳：`unsetChatId()` 結果（`lib/tg-users.ts:98-106`）`{ ok, result }`，成功前綴 `UNSET_OK` 或 `UNSET_NOOP`，200/409
 - 服務分頁：TG 已連接（取消連接按鈕）
 
-### POST /api/tg-users/test — server.ts:628
+### POST /api/tg-users/test — server.ts:637
 
 - Body：`{ email?: string, text?: string }`（`text` 空白時預設 `'這是一則來自 tg-monitor 的測試訊息'`）
 - 驗證：`email` 必填，否則 400 `{ ok: false, result: 'TG_ERR_ARGS: missing email' }`
 - 回傳：`sendTestMessage()` 結果（`lib/tg-users.ts:109-117`）`{ ok, result }`，成功前綴 `TG_SENT`，200/409
 - 服務分頁：TG 已連接（測試發送按鈕）
 
-### GET /api/rosters — server.ts:637
+### GET /api/rosters — server.ts:646
 
 - Query：無
 - 回傳：**頂層是陣列**（非物件）：`[{ service: string, roster: [{ id, display_name, issued_at }] }]`，只列有 `tokensPath` 的 service（`lib/ingest.ts:932-941`）
 - 服務分頁：（推測）連接／Token 權限相關頁面，用途可能與 `/api/token-grants` 重疊或供其他呈現方式；下游 API client 需注意這是陣列頂層，跟其他端點多為物件頂層不同
 
-### GET /api/token-grants — server.ts:644
+### GET /api/token-grants — server.ts:653
 
 - Query：無
 - 回傳（`server.ts:576`）：
@@ -434,14 +434,14 @@ app.get('/', c => c.html(Bun.file(new URL('./public/index.html', import.meta.url
 - 特殊行為：已知侷限（`server.ts:565-568` 註解）：同一 `display_name` 被兩個不同 id 共用時，依 `display_name` 比對到的用量會重複計入兩人
 - 服務分頁：連接／Token 權限子分頁
 
-### POST /api/token-grants/revoke — server.ts:746
+### POST /api/token-grants/revoke — server.ts:755
 
 - Body：`{ id?: string, services?: string[] }`
 - 驗證：`id` 須符合 `KIT_ID_PATTERN`（`/^[a-z][a-z0-9_-]{1,31}$/`）否則 400 `{ ok: false, result: 'REVOKE_ERR_ARGS: id 格式不合法' }`；`services` 非空且每個值需在允許清單（`admin-dev / admin-pre / admin-evi / platform / platform-6t / platform-pre-pk / platform-pre-6t / platform-evi-6t / toolsmith`）否則 400 `{ ok: false, result: 'REVOKE_ERR_ARGS: services 只能是 ...' }`
 - 回傳：`combine()` 彙整結果 `{ ok: boolean, result: string }`（多個底層腳本輸出以 `\n\n` 串接），200/409
 - 服務分頁：Token 權限（撤銷）
 
-### POST /api/token-grants/add — server.ts:761
+### POST /api/token-grants/add — server.ts:770
 
 - Body：`{ id?: string, service?: string }`（單一 service，非陣列）
 - 驗證與錯誤：
@@ -452,28 +452,28 @@ app.get('/', c => c.html(Bun.file(new URL('./public/index.html', import.meta.url
 - 回傳：`runToolsmithTokens`/`runMakeKit` 結果 `{ ok, result }`，200/409
 - 服務分頁：Token 權限（補簽某一環境）
 
-### POST /api/token-grants/rename — server.ts:782
+### POST /api/token-grants/rename — server.ts:791
 
 - Body：`{ id?: string, name?: string }`
 - 驗證：`id` 格式錯 → 400 `RENAME_ERR_ARGS: id 格式不合法`；`name` 空或超過 64 字 → 400 `RENAME_ERR_ARGS: display_name 不能為空且不超過 64 字`；名冊都找不到此 id → 404 `RENAME_ERR_NOT_FOUND: 名冊裡找不到這個 id`
 - 回傳：`combine()` 結果 `{ ok, result }`，200/409
 - 服務分頁：Token 權限（改顯示名）
 
-### POST /api/token-grants/create — server.ts:801
+### POST /api/token-grants/create — server.ts:810
 
 - Body：`{ id?: string, name?: string, services?: string[] }`
 - 驗證：`id` 不符 `KIT_ID_PATTERN` → 400 `CREATE_ERR_ARGS: id 格式不合法（小寫英數/連字號/底線，2-32 字，小寫字母開頭）`；`name` 空或 >64 字 → 400 `CREATE_ERR_ARGS: display_name 不能為空且不超過 64 字`；`services` 空或含不合法值 → 400 `CREATE_ERR_ARGS: services 至少一個，且只能是 ...`
 - 回傳：`reconcileGrants()` 結果 `{ ok, result }`，200/409
 - 服務分頁：Token 權限（新增 token 表單）
 
-### POST /api/token-grants/resend — server.ts:817
+### POST /api/token-grants/resend — server.ts:826
 
 - Body：`{ id?: string, services?: string[] }`（`services` 選填——不帶時 fallback 成此人名冊裡現有的全部環境）
 - 驗證：`id` 格式錯 → 400 `RESEND_ERR_ARGS: id 格式不合法`；此 id 任何環境都沒有 token → 404 `RESEND_ERR_NOT_FOUND: 此 id 沒有任何環境的 token`；`services` 空或含不合法值 → 400 `RESEND_ERR_ARGS: services 至少勾選一個，且只能是 ...`
 - 回傳：`reconcileGrants()` 結果 `{ ok, result }`，200/409
 - 服務分頁：Token 權限（重發 token；含列表頁快速按鈕與可勾選環境的表單兩種用法）
 
-### GET /api/logs — server.ts:835
+### GET /api/logs — server.ts:844
 
 - Query：無
 - 回傳（`server.ts:761`）：
@@ -486,7 +486,7 @@ app.get('/', c => c.html(Bun.file(new URL('./public/index.html', import.meta.url
   ```
 - 服務分頁：Logs（清單）
 
-### GET /api/log/tail — server.ts:866
+### GET /api/log/tail — server.ts:875
 
 - Query：`path`（必填，須通過 `isAllowedLogPath()` 白名單：`lib/services.ts:209-217`）、`kb`（預設 64，`Math.min(kb, 2048)` 上限 2048）
 - 錯誤：path 不在白名單 → 403 純文字 `'path not allowed'`
@@ -494,7 +494,7 @@ app.get('/', c => c.html(Bun.file(new URL('./public/index.html', import.meta.url
 - 回傳：`tailFile()` 結果（`server.ts:764-777`）`{ text: string, size: number }`——讀檔尾 `kb*1024` bytes，若非從檔頭開始讀則捨棄第一個不完整行
 - 服務分頁：Logs（開啟某檔內容）
 
-### GET /api/log/since — server.ts:879
+### GET /api/log/since — server.ts:888
 
 - Query：`path`（必填，同上白名單）、`offset`（預設 0）
 - 錯誤：path 不在白名單 → 403 純文字 `'path not allowed'`
@@ -519,10 +519,10 @@ app.get('/', c => c.html(Bun.file(new URL('./public/index.html', import.meta.url
 
 不是 API，是 React 前端的靜態檔案服務；列在此處是為了讓本檔涵蓋 server.ts 的全部 36 條路由。
 
-### GET /next — server.ts:77
+### GET /next — server.ts:80
 302 導向 `/next/`（補斜線），讓少打一個斜線也能進站。
 
-### GET /next/* — server.ts:78
+### GET /next/* — server.ts:81
 服務 `frontend/dist` 的 build 產物。
 - 路徑正規化後必須仍在 `frontend/dist` 底下，否則回 404（目錄穿越防護）
 - 檔案不存在時回退 `index.html`（SPA fallback；hash routing 其實走不到，保險用）
@@ -536,7 +536,7 @@ app.get('/', c => c.html(Bun.file(new URL('./public/index.html', import.meta.url
 
 ## SSE 端點（2026-09-02 Phase 8 新增）
 
-### GET /api/stream — server.ts:939
+### GET /api/stream — server.ts:948
 
 單一串流端點，取代前端對 overview / pipelines / toolsmith / log 跟隨這四類的定期輪詢。
 **契約與前端已定案**（`frontend/src/api/transport.ts:9,173,194`）：`event: <topic>`，`data` 是該 topic
@@ -595,7 +595,7 @@ app.get('/', c => c.html(Bun.file(new URL('./public/index.html', import.meta.url
 
 ---
 
-## GET /api/read-source — server.ts:1128（2026-09-02 Phase 8 新增）
+## GET /api/read-source — server.ts:1137（2026-09-02 Phase 8 新增）
 
 讀取面實際生效的資料源。存在的理由：`MON_READ_SOURCE=mysql` 但啟動探針失敗時，
 tg-monitor 會**退回 sqlite 並繼續服務**（見 `lib/read/index.ts`：plist 是
