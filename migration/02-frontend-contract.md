@@ -102,6 +102,11 @@ export function postResult<T>(path: string, body?: unknown, signal?: AbortSignal
 - `postResult`：只要 body 是 JSON 就回傳，**不論 HTTP 狀態**。因為 server.ts 的
   mutating 端點在業務失敗時回 400/404/409/429/500 但 body 形狀相同（`{ ok:false, result|reason }`），
   訊息本身就是要顯示給使用者的。所有 `postXxx` 端點函式都走這條。
+- **`GET /api/events` 的兩種 400（皆已實作、未部署，且**僅 mysql 軌**）**：解不開的
+  `cursor` 回 `{error:'invalid cursor'}`（`96cd9f2`），對不到列的 deprecated `before_id`
+  回 `{error:'invalid before_id'}`（`92434b9`）。body 形狀是 `{error:string}`，
+  **與 mutating 端點的 `{ok:false,...}` 不同**。兩者都會經 `get()` 拋成 `ApiError`，
+  訊息在 `err.bodyText`。sqlite 軌對這兩種情況都不回 400，live 現在跑 sqlite 軌。
 - 三個端點在路徑白名單失敗時回 **403 純文字**（`/api/log/tail`、`/api/log/since`、`/api/agent-trace`），
   會拋 `ApiError`，訊息在 `err.bodyText`。
 

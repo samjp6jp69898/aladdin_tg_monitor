@@ -150,6 +150,21 @@ app.get('/', c => c.html(Bun.file(new URL('./public/index.html', import.meta.url
 > 攔截注入模擬新後端，`next_cursor="CUR123"` → 下一次請求改送 `cursor=CUR123`（非 `before_id`），
 > `next_cursor=null` → 按鈕停用且顯示「已到底」，兩者皆 0 error。
 
+> **⚠️ `before_id` 對不到列改回 400（2026-09-03；已實作 `92434b9`，未部署）**
+> **僅 mysql 軌。** deprecated 的 `before_id` 在 mysql 軌解析不到對應列時，回
+> **400 `{"error":"invalid before_id"}`**（`server.ts` 的 `UnresolvableBeforeIdError`
+> → `rows === null` → `c.json({ error: 'invalid before_id' }, 400)`）。
+> 與上面 `invalid cursor` 同樣的理由：靜默回空頁會讓前端顯示「已到底」，
+> 而那種失敗沒有人會發現。
+>
+> - **sqlite 軌行為刻意不變**：對不到的 `before_id` 仍回 **200** 與資料列，
+>   不得被一併改成 400（b5 的端點層驗證把這條列為對照組）。
+> - **live 現在跑 sqlite 軌**（`/api/read-source` 實測 `effective=sqlite, degraded=false`），
+>   所以**此刻對前端沒有任何影響**；要到讀取面切到 mysql 之後才會出現。
+> - **前端不需要改**：`client.ts:78` 對非 2xx 一律拋 `ApiError`，這個 400 會浮出成錯誤
+>   而不是被當成正常資料——那正是這個改動要的效果。但也因此，切軌後若真的送出對不到的
+>   `before_id`，使用者看到的是錯誤訊息而不是空清單，**這是預期行為不是回歸**。
+
 ### GET /api/sessions — server.ts:213
 
 - Query：`days`（預設 7）、`service`（選填）、`identity`（選填）
