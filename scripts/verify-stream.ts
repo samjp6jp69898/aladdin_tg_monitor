@@ -124,6 +124,35 @@ async function collect(url: string, want: string[], timeoutMs = 20_000) {
 try {
   await waitReady()
 
+  // ── 0. 前置關卡：資料源必須真的是啟動參數要的那個 ─────────────────────
+  //
+  // **為什麼是前置關卡而不是最後一格**（Reviewer B BLOCKER-1）：
+  // 原本這一格在檔尾，判準是 `j.effective === source || j.degraded === true`
+  // ——那個 `|| degraded` 讓它在**唯一該紅的情況**（要 mysql、實際跑 sqlite）
+  // 恆綠。而子行程的探針有 3 秒期限（lib/read/index.ts:25），失敗即靜默退回
+  // sqlite（index.ts:64-70，設計如此）。於是整支腳本的 §1–§7 會在一個
+  // **退化成 sqlite** 的 server 上跑完並全綠，`switch-readiness.ts` 的
+  // 「verify-stream.ts mysql（27 項端點行為）」印 [OK]，而 mysql 讀取面
+  // 一行 SQL 都沒被打到。
+  //
+  // 具體後果：`serviceAuditStats`（/api/overview 的核心 SQL）若有回歸，
+  // C 組沒有任何一格會呼叫它，唯一覆蓋它的就是本腳本的 overview topic——
+  // 正是可以在 sqlite 上跑完判綠的那一格。結論會印「可以切」，切過去
+  // /api/overview 與 SSE overview 直接 500。
+  //
+  // 所以：`&&` 而不是 `||`，而且**擋在前面**——degraded 就整支 FAIL、
+  // 後面 26 格不再跑（它們的結果在錯誤的資料源上沒有意義）。
+  {
+    const j: any = await (await fetch(`${base}/api/read-source`)).json()
+    check('/api/read-source 回報 requested/effective/degraded', ['requested', 'effective', 'degraded'].every(k => k in j), JSON.stringify(j))
+    const sourceOk = j.effective === source && j.degraded === false
+    check(`【前置】effective 與啟動參數一致且未降級（期望 ${source}）`, sourceOk, JSON.stringify(j))
+    if (!sourceOk) {
+      console.log('FAIL 前置關卡未過：資料源不是啟動參數要的那個，後續 26 格在錯誤的資料源上沒有意義，中止。')
+      throw new Error(`verify-stream 前置關卡：期望 effective=${source} 且 degraded=false，實際 ${JSON.stringify(j)}`)
+    }
+  }
+
   // ── 1. 參數驗證：都必須在開串流之前以一般 HTTP 回應送出 ────────────────
   for (const [q, want] of [
     ['', 400],
@@ -285,12 +314,6 @@ try {
     check('8 條 SSE 硬斷後 server 仍存活且可服務', alive)
   }
 
-  // ── 8. /api/read-source 誠實回報實際生效的資料源 ───────────────────────
-  {
-    const j: any = await (await fetch(`${base}/api/read-source`)).json()
-    check('/api/read-source 回報 requested/effective/degraded', ['requested', 'effective', 'degraded'].every(k => k in j), JSON.stringify(j))
-    check(`effective 與啟動參數一致（期望 ${source}）`, j.effective === source || j.degraded === true, JSON.stringify(j))
-  }
 } finally {
   proc.kill()
   await proc.exited
