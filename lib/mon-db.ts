@@ -663,23 +663,57 @@ export async function persistReviewRoundsToMonDb(
 
 // ─────────────────────────────────────────────────────────────────────────
 // spool 落地（複製 telegram-dispatcher/lib/monitor-db/spool/writer.ts 的最小
-// 子集：只支援 tg-monitor 這一種 writer 身分、只支援單條 append，不做輪替。
-// §6.5(a) 的目錄/檔名格式與硬規則（run_id 不得為空）逐字遵守，讓 head 上的
-// 重放者（telegram-dispatcher/server.ts，唯一的重放者，§6.5(d)）能原封不動
-// 重放這個檔。
+// 子集：只支援 tg-monitor 這一種 writer 身分、只支援單條 append。§6.5(a) 的
+// 目錄/檔名格式與硬規則（run_id 不得為空）逐字遵守，讓 head 上的重放者
+// （telegram-dispatcher/server.ts，唯一的重放者，§6.5(d)）能原封不動重放
+// 這個檔。
+//
+// §6.5(f) 64MB 輪替（closeout §6 殘留項，2026-09-03 修）：mini writer 原本
+// 沒有輪替，長駐行程不重啟時單一 spool 檔會無界成長（心跳 60 秒一條、每條
+// 約 200 bytes，約 105MB/年）。輪替後單檔上限與 spool/writer.ts 對齊（同
+// 64MB 門檻），檔名格式不變（`tg-monitor.<pid>.<startEpochMs>.jsonl`）——
+// 對 head 上的重放者／回收器而言，輪替出來的新檔與既有長駐寫入者
+// （server/worker-agent/log-intake）輪替出來的檔案沒有任何差異：回收器
+// （spool/reaper.ts）本來就是「等該 pid 的寫入者終止才回收」，輪替後同 pid
+// 舊檔要等 tg-monitor 行程重啟才會被回收——這不是新引入的行為，是
+// spool/writer.ts 既有機制原本就有的性質（reaper.ts 對所有 writer 一視同
+// 仁，不特別待遇 tg-monitor）。
 // ─────────────────────────────────────────────────────────────────────────
 
 export const SPOOL_DIR = join(DISPATCHER_LOG_DIR, 'spool')
+
+/** 與 telegram-dispatcher/lib/monitor-db/spool/writer.ts 的 DEFAULT_MAX_FILE_BYTES 對齊。 */
+const DEFAULT_SPOOL_MAX_FILE_BYTES = 64 * 1024 * 1024
 
 let spoolFd: number | null = null
 let spoolFilePath: string | null = null
 let spoolDirUsed: string | null = null
 let spoolSeq = 0
+/** 測試專用覆寫；正式路徑一律用 DEFAULT_SPOOL_MAX_FILE_BYTES（不傳）。 */
+let spoolMaxFileBytesOverride: number | null = null
+
+/** 測試專用：覆寫輪替門檻，避免測試要真的寫到 64MB 才能觸發輪替。傳 null 還原預設值。 */
+export function __setSpoolMaxFileBytesForTest(bytes: number | null): void {
+  spoolMaxFileBytesOverride = bytes
+}
+
+function currentSpoolFileSize(): number {
+  if (spoolFilePath === null) return 0
+  try {
+    return statSync(spoolFilePath).size
+  } catch {
+    return 0
+  }
+}
 
 function getSpoolFd(dir: string): { fd: number; filePath: string } {
-  // 測試用不同 dir 覆寫時，捨棄舊 fd 重開（正式路徑 dir 永遠是 SPOOL_DIR，
-  // 這個分支不會在生產流程觸發）。
-  if (spoolFd !== null && spoolFilePath !== null && spoolDirUsed === dir) return { fd: spoolFd, filePath: spoolFilePath }
+  const maxFileBytes = spoolMaxFileBytesOverride ?? DEFAULT_SPOOL_MAX_FILE_BYTES
+  // 快取命中且未達輪替門檻：直接沿用現有 fd。
+  // 測試用不同 dir 覆寫，或現有檔已達 64MB 門檻時，捨棄舊 fd 重開（正式路徑
+  // dir 永遠是 SPOOL_DIR，dir 不同這個分支不會在生產流程觸發；門檻分支會）。
+  if (spoolFd !== null && spoolFilePath !== null && spoolDirUsed === dir && currentSpoolFileSize() < maxFileBytes) {
+    return { fd: spoolFd, filePath: spoolFilePath }
+  }
   if (spoolFd !== null) {
     try {
       closeSync(spoolFd)

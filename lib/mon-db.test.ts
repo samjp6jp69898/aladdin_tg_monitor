@@ -15,6 +15,7 @@ import { join } from 'node:path'
 import {
   appendCancelFlagToSpool,
   closeSpoolForTest,
+  __setSpoolMaxFileBytesForTest,
   deriveLegacyKey,
   isoToMysqlDatetime3,
   readActiveMarker,
@@ -248,6 +249,60 @@ describe('appendCancelFlagToSpool', () => {
     const files = require('node:fs').readdirSync(dir) as string[]
     const dataFile = files.find((f: string) => f.endsWith('.jsonl'))!
     const lines = readFileSync(join(dir, dataFile), 'utf8').trim().split('\n')
+    expect(lines.length).toBe(2)
+    expect(JSON.parse(lines[0]!).seq).toBe(1)
+    expect(JSON.parse(lines[1]!).seq).toBe(2)
+  })
+})
+
+// ---------- spool 64MB 輪替（closeout §6 殘留項，2026-09-03 修）----------
+// mini writer 原本沒有輪替，長駐行程不重啟會讓單一 spool 檔無界成長。這裡不
+// 真的寫到 64MB（太慢也沒意義），改用 __setSpoolMaxFileBytesForTest 把門檻降
+// 到 1 byte，逼下一次 append 必定判定「已超過門檻」而輪替。
+// 斷言刻意不比較檔名是否不同：輪替時的新 startEpochMs 來自 Date.now()，測試
+// 裡兩次同步呼叫理論上可能落在同一毫秒（正式路徑不會——64MB 內容要花的時間
+// 遠超過 1ms）。改比對「seq 重新從 1 起算」這個輪替真正的行為信號：無論輪替
+// 是否巧合落到同名檔案，「開新檔」這個動作都會把 spoolSeq 歸零，兩次 append
+// 因此都應該各自產生一筆 seq=1 的紀錄——若沒有輪替，第二筆會是 seq=2。
+describe('spool 64MB 輪替（closeout §6 殘留項）', () => {
+  let dir: string
+  afterEach(() => {
+    closeSpoolForTest()
+    __setSpoolMaxFileBytesForTest(null)
+    if (dir) rmSync(dir, { recursive: true, force: true })
+  })
+
+  test('現有檔案已達輪替門檻時，下一次 append 開新檔、seq 從 1 重新起算', () => {
+    dir = mkdtempSync(join(tmpdir(), 'mon-db-spool-'))
+    __setSpoolMaxFileBytesForTest(1) // 任何非空內容都會超過 1 byte，逼下一次 append 判定輪替
+    appendCancelFlagToSpool({ runId: 'run-1', host: 'head', ticket: 'FAQ-1', kind: 'bug', cancelRequestedAt: '2026-09-02T00:00:00.000Z', resolvedBy: 'pid_match', legacyKey: null }, dir)
+    appendCancelFlagToSpool({ runId: 'run-2', host: 'head', ticket: 'FAQ-2', kind: 'bug', cancelRequestedAt: '2026-09-02T00:01:00.000Z', resolvedBy: 'marker', legacyKey: null }, dir)
+
+    const files = require('node:fs').readdirSync(dir) as string[]
+    const dataFiles = files.filter((f: string) => f.endsWith('.jsonl'))
+    let seqOneCount = 0
+    let totalLines = 0
+    for (const f of dataFiles) {
+      const lines = readFileSync(join(dir, f), 'utf8').trim().split('\n').filter(Boolean)
+      totalLines += lines.length
+      for (const line of lines) {
+        if (JSON.parse(line).seq === 1) seqOneCount += 1
+      }
+    }
+    expect(totalLines).toBe(2) // 兩次 append 沒有任何一筆遺失或重複
+    expect(seqOneCount).toBe(2) // 兩筆都是各自檔案的第一筆（輪替真的重開了新檔，不是沿用舊檔繼續遞增）
+  })
+
+  test('未達輪替門檻時，連續 append 停留在同一份檔案、seq 正常遞增', () => {
+    dir = mkdtempSync(join(tmpdir(), 'mon-db-spool-'))
+    __setSpoolMaxFileBytesForTest(1024 * 1024) // 遠大於兩筆測試資料的實際大小，不觸發輪替
+    appendCancelFlagToSpool({ runId: 'run-1', host: 'head', ticket: 'FAQ-1', kind: 'bug', cancelRequestedAt: '2026-09-02T00:00:00.000Z', resolvedBy: 'pid_match', legacyKey: null }, dir)
+    appendCancelFlagToSpool({ runId: 'run-2', host: 'head', ticket: 'FAQ-2', kind: 'bug', cancelRequestedAt: '2026-09-02T00:01:00.000Z', resolvedBy: 'marker', legacyKey: null }, dir)
+
+    const files = require('node:fs').readdirSync(dir) as string[]
+    const dataFiles = files.filter((f: string) => f.endsWith('.jsonl'))
+    expect(dataFiles.length).toBe(1)
+    const lines = readFileSync(join(dir, dataFiles[0]!), 'utf8').trim().split('\n')
     expect(lines.length).toBe(2)
     expect(JSON.parse(lines[0]!).seq).toBe(1)
     expect(JSON.parse(lines[1]!).seq).toBe(2)
