@@ -10,11 +10,17 @@
 // lib/read/sqlite.ts 內。任何人改動 lib/read/sqlite.ts 的 SQL 都會讓這裡變紅——
 // 那正是意圖：sqlite 這一側不是拿來重構的，要改行為請改 server.ts 的組裝層。
 //
-// **唯一一處刻意的偏離**（誠實記錄，不要以為是漏的）：`/api/pipelines` 的
-// `... ORDER BY started_at DESC LIMIT 300` 在這裡是 `LIMIT ?`、由呼叫端傳 300
-// 進來——reader 介面把筆數當參數是必要的（mysql 那側同款）。除了這個 `300` →
-// `?`，其餘每一個字元都一樣；`/api/pipelines` 的實際回應在改動前後逐位元組
-// 比對過（22 個端點變體全綠）。
+// **刻意的偏離**（誠實記錄，不要以為是漏的）：
+//   1. `/api/pipelines` 的 `... ORDER BY started_at DESC LIMIT 300` 在這裡是
+//      `LIMIT ?`、由呼叫端傳 300 進來——reader 介面把筆數當參數是必要的（mysql
+//      那側同款）。除了這個 `300` → `?`，其餘每一個字元都一樣；`/api/pipelines`
+//      的實際回應在改動前後逐位元組比對過（22 個端點變體全綠）。
+//   2. `sessions` 的 `ORDER BY service, identity, ts` 在這裡多了一個 `, id`
+//      （Reviewer B MINOR-1，2026-09-04）：同一毫秒內的多列（MCP 一次 tool
+//      呼叫常見）在 `ts` 之後順序未定義，讓 `/api/sessions` 回應的 `tools[]`
+//      順序不穩定——這是行為修正，不是重構，比照 a7-D51 的原則：改動 sqlite
+//      軌需要明確理由，且 parity 測試要繼續反映真實 SQL、不能被繞過（本檔的
+//      baseline 字串已同步更新為含 `, id` 的版本，不是刪掉那條測試）。
 //
 // （為什麼把期望值寫死在測試裡而不是 `git show f3dbe92:server.ts`：測試不該
 // 依賴 git 歷史還在不在、也不該在 worktree／淺 clone 下失效。寫死的代價是
@@ -69,7 +75,7 @@ const BASELINE_SQL: [string, string][] = [
   ],
   [
     'sessions',
-    `SELECT id, service, ts, identity, tool, path, result, source_ip, agrabah_identifier FROM events WHERE \${where.join(' AND ')} ORDER BY service, identity, ts`,
+    `SELECT id, service, ts, identity, tool, path, result, source_ip, agrabah_identifier FROM events WHERE \${where.join(' AND ')} ORDER BY service, identity, ts, id`,
   ],
   ['stats.perDay', `SELECT substr(ts, 1, 10) AS day, service, COUNT(*) AS n FROM events WHERE ts >= ? GROUP BY day, service ORDER BY day`],
   ['stats.perHour', `SELECT substr(ts, 1, 13) AS hour, COUNT(*) AS n FROM events WHERE ts >= ? GROUP BY hour ORDER BY hour`],

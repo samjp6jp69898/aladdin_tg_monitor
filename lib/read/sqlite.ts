@@ -94,8 +94,10 @@ export const sqliteReader: MonitorReader = {
     const params: any[] = [f.since]
     if (f.service) { where.push('service = ?'); params.push(f.service) }
     if (f.identity) { where.push('identity = ?'); params.push(f.identity) }
+    // ORDER BY 補 id 破平手（Reviewer B MINOR-1）：同一毫秒內的多列（MCP 一次
+    // tool 呼叫常見）在 ts 之後順序未定義，會讓 /api/sessions 的 tools[] 順序不穩定。
     return db
-      .prepare(`SELECT id, service, ts, identity, tool, path, result, source_ip, agrabah_identifier FROM events WHERE ${where.join(' AND ')} ORDER BY service, identity, ts`)
+      .prepare(`SELECT id, service, ts, identity, tool, path, result, source_ip, agrabah_identifier FROM events WHERE ${where.join(' AND ')} ORDER BY service, identity, ts, id`)
       .all(...params) as SessionEventRow[]
   },
 

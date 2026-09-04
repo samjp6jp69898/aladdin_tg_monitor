@@ -712,6 +712,8 @@ export const mysqlReader: MonitorReader = {
     // ORDER BY 也釘 utf8mb4_bin：session 串接靠「同 (service, identity) 的列相鄰」，
     // ai_ci 之下 'Foo' 與 'foo' 排序上相等會交錯，JS 端的 !== 比較就會把一段
     // session 切成很多段。
+    // 補 e.id 破平手（Reviewer B MINOR-1）：同一毫秒內多列（MCP 一次 tool 呼叫常見）
+    // 在 ts 之後順序未定義，讓 /api/sessions 的 tools[] 順序不穩定。
     const rows = await q<any[]>(
       `SELECT e.id AS id, e.service AS service, ${iso('e.ts')} AS ts, e.identity AS identity,
               ${jstr('e', 'tool')} AS tool, ${jstr('e', 'path')} AS path,
@@ -719,7 +721,7 @@ export const mysqlReader: MonitorReader = {
               ${jstr('e', 'agrabahIdentifier')} AS agrabah_identifier
          FROM mcp_usage e
         WHERE ${where.join(' AND ')}
-        ORDER BY e.service COLLATE utf8mb4_bin, e.identity COLLATE utf8mb4_bin, e.ts`,
+        ORDER BY e.service COLLATE utf8mb4_bin, e.identity COLLATE utf8mb4_bin, e.ts, e.id`,
       params,
     )
     return rows.map(r => ({
