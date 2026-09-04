@@ -13,6 +13,33 @@ import { AGENT_RUNS_SELECT, RUNS_SELECT, exact, iso, jnum, jstr, likeable, limit
 
 const MYSQL_SRC = readFileSync(new URL('./mysql.ts', import.meta.url).pathname, 'utf8')
 
+// Reviewer B MINOR-8：readChain / READ_QUERY_TIMEOUT_MS / READ_QUEUE_MAX 的
+// 「名字存在」測試原本用 MYSQL_SRC.toContain(...)，只要這幾個字串出現在整份
+// 檔案任何地方（含註解、含常數宣告本身）就算過——常數被搬去別處宣告、或
+// q() 函式本體改掉不再使用它們，測試都不會紅。改成只在 q() 函式**本體**內
+// 找這幾個識別字：q() 的宣告與常數宣告不同段（常數宣告在函式外，函式本體內
+// 只會出現真正的使用），這樣常數宣告存在但沒被用、或函式本體被改掉不再引用，
+// 測試才會真的紅。用大括號配對抓函式本體邊界，比固定行號 regex 更抗重排。
+function extractFunctionBody(src: string, signatureMarker: string): string {
+  const startIdx = src.indexOf(signatureMarker)
+  if (startIdx === -1) throw new Error(`extractFunctionBody: 找不到函式簽名 "${signatureMarker}"`)
+  const braceStart = src.indexOf('{', startIdx)
+  if (braceStart === -1) throw new Error(`extractFunctionBody: 簽名之後找不到 "{"`)
+  let depth = 0
+  let i = braceStart
+  for (; i < src.length; i++) {
+    if (src[i] === '{') depth++
+    else if (src[i] === '}') {
+      depth--
+      if (depth === 0) { i++; break }
+    }
+  }
+  if (depth !== 0) throw new Error('extractFunctionBody: 大括號未配對，函式本體邊界抓不到')
+  return src.slice(startIdx, i)
+}
+
+const Q_FN_SRC = extractFunctionBody(MYSQL_SRC, 'async function q<')
+
 describe('iso()：DATETIME(3) → 與 sqlite 同形的 ISO 字串', () => {
   const sql = iso('e.ts')
 
@@ -149,7 +176,10 @@ describe('紀律', () => {
   })
 
   test('讀取面查詢串成單一 FIFO 鏈，結構上最多佔用 1 條連線（pool 只有 4 條且 waitForConnections:false）', () => {
-    expect(MYSQL_SRC).toContain('readChain')
+    // 只在 q() 函式本體內找 readChain：宣告在函式外（module 層級），本體內
+    // 出現代表真的在用（.catch(...).then(...) 排隊、跑完後回寫），不是隨便
+    // 哪裡提到這個字串就算數。
+    expect(Q_FN_SRC).toContain('readChain')
   })
 
   test('session 串接的 ORDER BY 也釘 utf8mb4_bin（不然同名不同大小寫會交錯、把一段 session 切碎）', () => {
@@ -157,8 +187,10 @@ describe('紀律', () => {
   })
 
   test('讀取面查詢有 I/O 期限與佇列上限（一條卡死的查詢不得堵死整條鏈）', () => {
-    expect(MYSQL_SRC).toContain('READ_QUERY_TIMEOUT_MS')
-    expect(MYSQL_SRC).toContain('READ_QUEUE_MAX')
+    // 同上：常數宣告在函式外，這裡只認 q() 本體內的實際使用（setTimeout 期限
+    // 判斷、queueDepth 上限判斷），常數被搬走宣告或本體不再引用都會讓這裡紅。
+    expect(Q_FN_SRC).toContain('READ_QUERY_TIMEOUT_MS')
+    expect(Q_FN_SRC).toContain('READ_QUEUE_MAX')
   })
 })
 
