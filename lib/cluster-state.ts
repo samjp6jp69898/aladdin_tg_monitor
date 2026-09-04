@@ -118,6 +118,46 @@ export async function fetchWorkerJobStatus(url: string, secret: string, ticket: 
   }
 }
 
+/**
+ * `fetchWorkerJobStatus()` 結果套用到一列 pipeline run 的 running 旗標——純
+ * 函式，抽出來單獨給 server.ts 的 `correctRemoteRunningFlags()` /
+ * `buildPipelineRunPayload()` 共用，也讓下面這個 fail-closed 分支能不靠打
+ * 真實 worker 就單元測試（2026-09-04 安全審查 finding 修正，見兩處呼叫端的
+ * 註解）。
+ *
+ * fail-closed：`status === null` 代表 worker 逾時/連不上，是「無法確認」，
+ * 不是「確定沒在跑」——不能讓 `running` 靜默停留在呼叫端傳進來的預設值
+ * （通常是本機 ps 掃描帶來的錯誤 `false`），改標記 `runningStatusUnknown`，
+ * 前端據此顯示「無法確認執行狀態」而非可誤按的重試/取消按鈕。
+ */
+export function applyRemoteJobStatus(row: { running: boolean; runningStatusUnknown?: boolean }, status: JobStatus | null): void {
+  if (status) row.running = status.queueState === 'running' || status.queueState === 'queued'
+  else row.runningStatusUnknown = true
+}
+
+export type RemoteRetryBlock = { blocked: true; reason: string } | { blocked: false }
+
+/**
+ * `/api/pipelines/retry` 用：worker 探測結果換算成是否該擋下這次重試——純
+ * 函式，理由同上抽出來單獨測試。
+ *
+ * fail-closed（2026-09-04 安全審查 finding 修正）：`status === null` 時比照
+ * 「還在跑」擋下（回 409），不放行到 `retryRemoteDispatch()`——原本的判斷式
+ * `status?.queueState === 'running' || status?.queueState === 'queued'` 對
+ * `null` 是 `false`，會直接放行（雖然 `dispatchBug()` 內部的同步
+ * dispatch-registry 檢查仍會擋下真正的雙跑，但使用者體驗上會先看到一個不該
+ * 出現的操作入口）。
+ */
+export function evaluateRemoteRetryBlock(workerName: string, status: JobStatus | null): RemoteRetryBlock {
+  if (status?.queueState === 'running' || status?.queueState === 'queued') {
+    return { blocked: true, reason: `這張票目前還在 worker「${workerName}」上跑，不能重複觸發` }
+  }
+  if (status === null) {
+    return { blocked: true, reason: `worker「${workerName}」連不上，無法確認是否還在執行，暫不允許重試` }
+  }
+  return { blocked: false }
+}
+
 /** worker-agent.ts 的 `POST /jobs/:ticket/cancel` 回應形狀（見
  * telegram-dispatcher/lib/pipeline-runner/local-cancel.ts 的
  * `CancelLocalPipelineResult`）——與本機 `cancelPipeline()`

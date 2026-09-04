@@ -344,6 +344,12 @@ export interface PipelineRun extends PipelineRunBase {
   total_output: number
   total_cost: number
   running: boolean
+  /** worker 連不上/逾時（`fetchWorkerJobStatus()` 回傳 null）：無法確認這張
+   *  worker 執行票的實際 running 狀態，`running` 這時仍是 false 但不可信——
+   *  前端應顯示「無法確認執行狀態」，不可當作「確定沒在跑」顯示重試/取消按鈕。
+   *  只有 host 不是本機（worker 執行）且該次查詢逾時/連不上時才會是
+   *  true；單機部署或查詢成功時缺席。見 server.ts correctRemoteRunningFlags()。 */
+  runningStatusUnknown?: boolean
   assignee: string | null
   retryable: boolean
   review_rounds: number | null
@@ -421,6 +427,8 @@ export interface PipelineRunDetailResponse {
    */
   run: PipelineRunBase & {
     running: boolean
+    /** 同 PipelineRun.runningStatusUnknown（見該處註解），單一 run 詳情版本。 */
+    runningStatusUnknown?: boolean
     agents: AgentRunRow[]
     agent_count: number
     total_input: number

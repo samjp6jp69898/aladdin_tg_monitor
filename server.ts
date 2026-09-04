@@ -39,6 +39,8 @@ import {
   fetchRemoteFile,
   fetchRemoteStageFiles,
   retryRemoteDispatch,
+  applyRemoteJobStatus,
+  evaluateRemoteRetryBlock,
 } from './lib/cluster-state.ts'
 import { RUNS_HOST } from './lib/mon-db.ts'
 import { listToolsmithRuns } from './lib/toolsmith.ts'
@@ -308,8 +310,19 @@ function findWorkerByName(name: string): { name: string; url: string } | null {
  * 併發上限本來就不大），逐列打一次 worker 成本可接受；secret 未設定
  * （單機部署）或查無該 worker 時整段是 no-op，維持原本（錯誤但無害）的
  * false，不讓這段修正在單機模式下引入任何行為變化。
+ *
+ * fail-closed（2026-09-04 安全審查 finding 修正）：`fetchWorkerJobStatus()`
+ * 逾時/連不上時回傳 `null`，此時「無法確認該票是否還在跑」，不等於「確定
+ * 沒在跑」——原本這裡完全不修正，`running` 會靜默停留在 ps 掃描帶來的預設
+ * 錯誤值 `false`，導致 `retryable` 把一張其實可能還在 worker 上跑的票判成
+ * 可重試，前端顯示出可誤按的「重試」按鈕。改成明確標記
+ * `runningStatusUnknown = true`，呼叫端據此把 retryable 一併壓成 false（見
+ * 下面兩處重算 retryable 的迴圈），前端則顯示「無法確認執行狀態」而非任何
+ * 操作按鈕。
  */
-async function correctRemoteRunningFlags(rows: { kind: string; ticket: string; host?: string; finished_at: string | null; running: boolean }[]): Promise<void> {
+async function correctRemoteRunningFlags(
+  rows: { kind: string; ticket: string; host?: string; finished_at: string | null; running: boolean; runningStatusUnknown?: boolean }[],
+): Promise<void> {
   const secret = getClusterSecret()
   if (!secret) return
   const candidates = rows.filter(r => r.finished_at === null && r.host && r.host !== RUNS_HOST)
@@ -319,7 +332,7 @@ async function correctRemoteRunningFlags(rows: { kind: string; ticket: string; h
       const worker = findWorkerByName(r.host!)
       if (!worker) return
       const status = await fetchWorkerJobStatus(worker.url, secret, r.ticket)
-      if (status) r.running = status.queueState === 'running' || status.queueState === 'queued'
+      applyRemoteJobStatus(r, status)
     }),
   )
 }
@@ -391,10 +404,13 @@ async function buildPipelinesPayload() {
   // task 1：worker 執行中的列，running 改問該 worker 本人（見函式註解）。
   // 這會讓上面剛算好的 retryable 對這批列失真（它假設 running 已經是最終
   // 值）——worker 執行中的票本來就不該顯示重試按鈕，重算一次同一條件即可，
-  // 不需要整段搬到迴圈之後。
+  // 不需要整段搬到迴圈之後。runningStatusUnknown（worker 連不上/逾時）也要
+  // 一併壓成不可重試——fail-closed，見 correctRemoteRunningFlags 註解。
   await correctRemoteRunningFlags(rows)
   for (const r of rows) {
-    if (r.host && r.host !== RUNS_HOST) r.retryable = r.kind === 'bug' && !r.running && isBugOutcomeRetryable(r.outcome)
+    if (r.host && r.host !== RUNS_HOST) {
+      r.retryable = r.kind === 'bug' && !r.running && !r.runningStatusUnknown && isBugOutcomeRetryable(r.outcome)
+    }
   }
   return { rows, queued, remote }
 }
@@ -494,7 +510,7 @@ async function buildPipelineRunPayload(key: string) {
     const worker = secret ? findWorkerByName(me.host) : null
     if (worker && secret) {
       const status = await fetchWorkerJobStatus(worker.url, secret, me.ticket)
-      if (status) me.running = status.queueState === 'running' || status.queueState === 'queued'
+      applyRemoteJobStatus(me, status)
     }
   }
   // 需求單：把 demand-pipeline.log 該區間的進度行一併回傳
@@ -741,9 +757,11 @@ app.post('/api/pipelines/retry', async c => {
     const remoteWorker = await findRemoteWorkerForTicket('bug', ticket)
     if (remoteWorker) {
       const status = await fetchWorkerJobStatus(remoteWorker.url, clusterSecret, ticket)
-      if (status?.queueState === 'running' || status?.queueState === 'queued') {
-        return c.json({ ok: false, reason: `這張票目前還在 worker「${remoteWorker.name}」上跑，不能重複觸發` }, 409)
-      }
+      // fail-closed（2026-09-04 安全審查 finding 修正，見 evaluateRemoteRetryBlock
+      // 註解）：status === null（worker 連不上/逾時）比照「還在跑」擋下，不
+      // 放行到下面的 retryRemoteDispatch()。
+      const block = evaluateRemoteRetryBlock(remoteWorker.name, status)
+      if (block.blocked) return c.json({ ok: false, reason: block.reason }, 409)
     }
   }
 

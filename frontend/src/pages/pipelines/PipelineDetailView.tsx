@@ -175,7 +175,7 @@ export function PipelineDetailView({ runKey }: { runKey: string }) {
         <span style={{ fontSize: 20, fontWeight: 600 }}>{r ? `${r.ticket}（${r.kind}）` : ''}</span>
         <span className="mute">
           {r
-            ? `${fmt(r.started_at)} → ${r.finished_at ? fmt(r.finished_at) : '進行中'} · ${dur(r.started_at, r.finished_at)} · ${r.running ? 'running' : r.outcome || ''}`
+            ? `${fmt(r.started_at)} → ${r.finished_at ? fmt(r.finished_at) : '進行中'} · ${dur(r.started_at, r.finished_at)} · ${r.running ? 'running' : r.runningStatusUnknown ? '無法確認執行狀態（worker 連不上）' : r.outcome || ''}`
             : ''}
         </span>
       </Toolbar>

@@ -252,6 +252,11 @@ export function PipelinesListView({ resource }: { resource: Resource<PipelinesRe
             </Button>
           )
         }
+        // worker 連不上/逾時，無法確認這張票是否還在跑（見 types.ts
+        // runningStatusUnknown 註解）：不顯示重試/取消按鈕，避免誤按。
+        if (r.runningStatusUnknown) {
+          return <span className="mute">無法確認執行狀態</span>
+        }
         if (r.retryable) {
           return (
             <Button variant="warn" disabled={retryAction.pending} onClick={() => handleRetry(r.ticket)}>
