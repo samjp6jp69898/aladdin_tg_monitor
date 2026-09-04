@@ -17,6 +17,7 @@ import { getReader, initReader } from './lib/read/index.ts'
 import { resolveReadSource } from './lib/read/source.ts'
 import type { AgentRunRow } from './lib/read/types.ts'
 import { decodeEventsCursor, encodeEventsCursor } from './lib/events-cursor.ts'
+import { resolveNextStaticPath } from './lib/next-static-path.ts'
 // 從 types.ts 匯入，**不是** lib/read/mysql.ts——後者靜態 import 會讓 sqlite 模式
 // 也載入 mysql2，違反 lib/read/index.ts:42-44 的 lazy import 紀律（MAJOR-D1）。
 import { UnresolvableBeforeIdError } from './lib/read/types.ts'
@@ -79,9 +80,10 @@ app.get('/', c => c.redirect('/next/'))
 const NEXT_DIST = new URL('./frontend/dist/', import.meta.url).pathname
 app.get('/next', c => c.redirect('/next/'))
 app.get('/next/*', async c => {
-  const rel = decodeURIComponent(c.req.path.slice('/next/'.length))
-  const target = rel === '' ? join(NEXT_DIST, 'index.html') : join(NEXT_DIST, rel)
-  if (!target.startsWith(NEXT_DIST)) return c.text('not found', 404)
+  // Reviewer B MINOR-9：解析抽成純函式（lib/next-static-path.ts），非法百分號
+  // 序列與目錄穿越都回 null → 404，不再讓 decodeURIComponent 的 throw 穿透成 500。
+  const target = resolveNextStaticPath(NEXT_DIST, c.req.path.slice('/next/'.length))
+  if (target === null) return c.text('not found', 404)
   const file = Bun.file(target)
   if (await file.exists()) return new Response(file)
   const index = Bun.file(join(NEXT_DIST, 'index.html'))
