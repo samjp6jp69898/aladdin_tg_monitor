@@ -154,9 +154,20 @@ export function insertAuditLine(service: string, raw: string): boolean {
     return false
   }
   if (!j || typeof j !== 'object' || !j.ts) return false
+  // 寫入前驗證 ts（Reviewer B MINOR-6）：collector 解析出來的原始值若不是合法
+  // 時間字串，不原樣存進 sqlite——下游 encodeEventsCursor 故意對不可解析的 ts
+  // throw（見 events-cursor.test.ts:33-35，鎖死的設計意圖），從源頭堵住才不會
+  // 讓分頁在資料已經髒掉時假裝正常。不吞掉不留痕跡：console.error 記下原始壞
+  // 值方便事後追查來源，改用當下時間當合法 fallback。
+  const rawTs = String(j.ts)
+  let ts = rawTs
+  if (Number.isNaN(Date.parse(rawTs))) {
+    ts = new Date().toISOString()
+    console.error(`lib/db.ts: insertAuditLine 收到無法解析的 ts（service=${service}, raw=${JSON.stringify(rawTs)}），改用 fallback=${ts} 寫入`)
+  }
   const r = insertEventStmt.run(
     service,
-    String(j.ts),
+    ts,
     String(j.event ?? 'request'),
     j.identity ?? null,
     j.sourceIp ?? null,
