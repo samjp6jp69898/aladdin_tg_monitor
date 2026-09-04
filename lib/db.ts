@@ -6,7 +6,33 @@ import { Database } from 'bun:sqlite'
 import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 
-const DB_PATH = process.env.TG_MONITOR_DB ?? new URL('../data/monitor.sqlite', import.meta.url).pathname
+const LIVE_DB_PATH = new URL('../data/monitor.sqlite', import.meta.url).pathname
+const DB_PATH = process.env.TG_MONITOR_DB ?? LIVE_DB_PATH
+
+// ── 結構性隔離守衛（phase9-readiness.md §9.6，2026-09-03/04）───────────────
+// 「凡是 import 到本檔的測試檔都要先 import lib/test-tmp-db.ts」原本只是檔頭
+// 註解的約定——`1e03909` 那晚就真的踩到：sqlite-parity.test.ts 漏了那一行，
+// bun test 多檔同行程時它先把本檔綁到 live 路徑，害 7 筆 fixture 寫進使用者
+// 真正的 data/monitor.sqlite。約定沒有任何東西在強制，下一個新增測試檔的人
+// 一樣會漏掉。
+//
+// 這裡把它換成結構性檢查，不依賴任何測試檔記得做什麼：`bun test` 本身就會把
+// `NODE_ENV` 設成 `'test'`（Bun 內建行為，不需要任何專案設定，實測見
+// lib/db.live-guard.test.ts）。在測試環境下若解出的 DB_PATH 仍是 live 預設
+// 路徑——不管是因為沒有任何檔案設過 TG_MONITOR_DB（漏 import test-tmp-db.ts），
+// 還是有人手滑把它明確設成 live 路徑——一律視為違規、直接 throw，在建表/寫入
+// 之前就擋下來。**檢查點只有這一個，且是本檔案自己的第一段程式碼**：不管未來
+// 新增哪一支測試檔、間接 import 幾層，都逃不掉。
+if (process.env.NODE_ENV === 'test' && DB_PATH === LIVE_DB_PATH) {
+  throw new Error(
+    'lib/db.ts: 偵測到在測試環境（NODE_ENV=test，bun test 的預設行為）下嘗試開啟 ' +
+    'live data/monitor.sqlite。凡是（直接或間接）import 到 lib/db.ts 的測試檔，都要把 ' +
+    "lib/test-tmp-db.ts 放在 import 清單第一行（把 TG_MONITOR_DB 導向暫存路徑），" +
+    '或自行明確設定 TG_MONITOR_DB 指向非 live 的路徑。' +
+    '（這是結構性守衛，不是慣例——見 commit 1e03909、phase9-readiness.md §9.6）',
+  )
+}
+
 mkdirSync(dirname(DB_PATH), { recursive: true })
 
 export const db = new Database(DB_PATH)
