@@ -495,6 +495,59 @@ export async function readOutcomeMeta(): Promise<Map<string, { outcome_source: s
   )
 }
 
+/** 擋門 S1/S4/S6 專用（`lib/read/single-track-consistency.ts`）：`runs` 表的最小投影。 */
+export interface GateRunRow {
+  run_id: string
+  host: string
+  ticket: string
+  kind: string
+  legacy_key: string | null
+  stdout_path: string | null
+  started_at: string | null
+  lifecycle_rank: number
+  retry_of_run_id: string | null
+  outcome: string | null
+}
+
+/**
+ * 擋門 S1/S4/S6 專用：`runs` 表**不經 `RUNS_LIST_WHERE` 過濾**的全量投影。
+ *
+ * **為什麼不能重用 `pipelineRuns()`**：`RUNS_LIST_WHERE`（`lifecycle_rank >= 30
+ * AND started_at IS NOT NULL`）會把 S1 的 `undatedRows`／S4 的 `orphanRows`
+ * 正要抓的那批列（`started_at`/`stdout_path` 為 NULL 的孤兒列）直接濾掉——
+ * 用被過濾過的資料源去驗證「有沒有孤兒列」，結構上永遠驗不到。
+ * 同 `readOutcomeMeta` 的既有理由（phase9-readiness.md §9.2，a7 核准）：
+ * 這些欄位只給擋門內部判準用，不進 `MonitorReader` 介面、不進任何端點契約，
+ * 走同一條 `q()` 佇列（限流＋逾時），只是另一支唯讀查詢。
+ */
+export async function readAllRunsForGate(): Promise<GateRunRow[]> {
+  const rows = await q<any[]>(
+    `SELECT r.run_id                AS run_id,
+            r.host                  AS host,
+            r.ticket                AS ticket,
+            r.kind                  AS kind,
+            r.legacy_key            AS legacy_key,
+            r.stdout_path           AS stdout_path,
+            ${iso('r.started_at')}  AS started_at,
+            r.lifecycle_rank        AS lifecycle_rank,
+            r.retry_of_run_id       AS retry_of_run_id,
+            r.outcome               AS outcome
+       FROM runs r`,
+  )
+  return rows.map(r => ({
+    run_id: r.run_id as string,
+    host: r.host as string,
+    ticket: r.ticket as string,
+    kind: r.kind as string,
+    legacy_key: (r.legacy_key ?? null) as string | null,
+    stdout_path: (r.stdout_path ?? null) as string | null,
+    started_at: (r.started_at ?? null) as string | null,
+    lifecycle_rank: Number(r.lifecycle_rank),
+    retry_of_run_id: (r.retry_of_run_id ?? null) as string | null,
+    outcome: (r.outcome ?? null) as string | null,
+  }))
+}
+
 export const mysqlReader: MonitorReader = {
   source: 'mysql',
 

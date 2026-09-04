@@ -22,10 +22,18 @@
 // Phase 9（退役 sqlite collector）會再用一次同一組 C 判準，所以容差定義寫在這裡
 // 當單一來源，不要在別處各寫一份。
 
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
+import { join } from 'node:path'
 import { sqliteReader } from '../lib/read/sqlite.ts'
 import type { MonitorReader } from '../lib/read/types.ts'
-import { SERVICES } from '../lib/services.ts'
+import { SERVICES, DISPATCHER_LOG_DIR, AGENT_TRACE_DIR } from '../lib/services.ts'
+// S 組（單軌自洽性檢查，Phase 9 §3.1，a7-D38 核定方向）的純函式判準，同理由
+// 拆在 lib/read/single-track-consistency.ts（2026-09-04，設計稿
+// phase9-single-track-design-62.md，使用者核准後接線）。
+import {
+  collectFsRunLogs, judgeRunCoverage, isAgentRunSourcePath, judgeAgentRunCoverage,
+  judgeLegacyKeyCoherence, judgeRetryLineage, KEY_TO_STARTED_AT_TOLERANCE_MS,
+} from '../lib/read/single-track-consistency.ts'
 
 const skipSlow = process.argv.includes('--skip-slow')
 const REPO = new URL('..', import.meta.url).pathname.replace(/\/$/, '')
@@ -360,11 +368,18 @@ judge((await run(['bun', 'run', 'scripts/sync-inventory-lines.ts', '--check'])) 
 console.log('\n═══ C. 資料面收斂（§10.2 雙軌對照）═══')
 let mysqlReader: MonitorReader
 let outcomeMeta: Map<string, { outcome_source: string | null; outcome_tier: number | null }>
+let gateRuns: Awaited<ReturnType<typeof import('../lib/read/mysql.ts')['readAllRunsForGate']>>
+// gateRuns 的快照時刻：S1 的時序競態解法（見 single-track-consistency.ts 檔頭）
+// 要求「DB 快照時刻」是一個確定值，在真的發 SELECT 之前先記下來，比查詢本身
+// 開始時間更早沒關係（結構性下界，越早越安全，不會誤放過真漏收）。
+let gateRunsSnapshotAtMs: number
 try {
   const m = await import('../lib/read/mysql.ts')
   await m.probeMysqlReadable()
   mysqlReader = m.mysqlReader
   outcomeMeta = await m.readOutcomeMeta()
+  gateRunsSnapshotAtMs = Date.now()
+  gateRuns = await m.readAllRunsForGate()
 } catch (e) {
   fail('連得上監控 DB', e instanceof Error ? e.message : String(e))
   console.log(`\n═══ 結論：不可切（${fails}/${checks} 項未過）═══`)
@@ -760,6 +775,80 @@ console.log('\n═══ D. 寫入端已知缺口（切過去之後畫面上真�
       judge(r.ok, `D ${g.field} 寫入端已接`, `${r.detail}｜負責：${g.owner}｜${g.note}`)
     }
   }
+}
+
+// ═════════════════════ S. 單軌自洽性檢查（Phase 9 §3.1，a7-D38 核定方向）═════════════════════
+// 與 sqlite 完全無關——對照來源是檔案系統事實（DISPATCHER_LOG_DIR / AGENT_TRACE_DIR）
+// 與 mysql 自己，sqlite collector 退役後仍然成立。**新增，與 C 組並存顯示，不取代**
+// （使用者 2026-09-04 裁定：現在就接線，7 天觀察期後退役時只需把 C 組拿掉）。
+// 完整設計見 monitor-db-project-docs/phase9-single-track-design-62.md。
+console.log('\n═══ S. 單軌自洽性檢查（不依賴 sqlite，phase9-single-track-design-62.md）═══')
+{
+  // S1：DISPATCHER_LOG_DIR 的 pipeline stdout log 清單 ⇔ runs.legacy_key。
+  const fsSnapshotAtMs1 = Date.now()
+  const fsLogs = collectFsRunLogs(readdirSync(DISPATCHER_LOG_DIR))
+  const s1 = judgeRunCoverage(fsLogs, gateRuns, { dbSnapshotAtMs: gateRunsSnapshotAtMs, fsSnapshotAtMs: fsSnapshotAtMs1 })
+  judge(s1.missingInDb.length === 0, 'S1 runs 覆蓋率：log 檔案 → runs 無漏收（取代 C4）',
+    `counted fs=${s1.counted.fs} db=${s1.counted.db}` + (s1.missingInDb.length ? `｜缺：${s1.missingInDb.slice(0, 5).join(', ')}` : ''))
+  judge(s1.ghostInDb.length === 0, 'S1 runs 覆蓋率：runs → log 檔案無幽靈列',
+    s1.ghostInDb.length ? s1.ghostInDb.slice(0, 5).join(', ') : '')
+  judge(s1.undatedRows.length === 0, 'S1 runs 無法定位的孤兒列（legacy_key/started_at 為 NULL，兩軌對照結構性看不到）',
+    s1.undatedRows.length ? s1.undatedRows.slice(0, 5).join(', ') : '')
+  if (s1.deferredNewerThanDbSnapshot.length) console.log(`[DEFERRED] S1（晚於 DB 快照才開始，共 ${s1.deferredNewerThanDbSnapshot.length} 筆，不判紅）：${s1.deferredNewerThanDbSnapshot.slice(0, 5).join(', ')}`)
+  if (s1.deferredNewerThanFsSnapshot.length) console.log(`[DEFERRED] S1（晚於 FS 快照才寫入，共 ${s1.deferredNewerThanFsSnapshot.length} 筆，不判紅）：${s1.deferredNewerThanFsSnapshot.slice(0, 5).join(', ')}`)
+
+  // S2：agent trace / bug stdout 檔案清單 ⇔ agent_runs.path（取代 C6 覆蓋率一半，
+  // 逐欄相等沒有單軌對應，是刻意的偵測力淨損失，見設計稿 §1）。
+  const dirs = { dispatcherLogDir: DISPATCHER_LOG_DIR, agentTraceDir: AGENT_TRACE_DIR }
+  const dispatcherTopLevel = readdirSync(DISPATCHER_LOG_DIR)
+    .map(f => join(DISPATCHER_LOG_DIR, f))
+    .filter(p => { try { return statSync(p).isFile() } catch { return false } })
+  const agentTraceJson: string[] = []
+  if (existsSync(AGENT_TRACE_DIR)) {
+    for (const ticket of readdirSync(AGENT_TRACE_DIR)) {
+      const ticketDir = join(AGENT_TRACE_DIR, ticket)
+      let isDir = false
+      try { isDir = statSync(ticketDir).isDirectory() } catch { isDir = false }
+      if (!isDir) continue
+      for (const f of readdirSync(ticketDir)) if (f.endsWith('.json')) agentTraceJson.push(join(ticketDir, f))
+    }
+  }
+  const agentRunRows = (await mysqlReader.allAgentRuns()).map(r => ({ path: r.path, host: (r.host as string) ?? '', ended_at: r.ended_at, is_error: r.is_error }))
+  // localHosts 明確帶 host + 回填哨兵（judgeAgentRunCoverage 的預設只有 ['head']，
+  // 與 S1/S4 的 DEFAULT_LOCAL_HOSTS 不同，這裡要覆寫成一致）——回填列
+  // （host='unknown_pre_migration'）對應的是真實存在的舊 trace/stdout 檔案，
+  // 漏算會把 41 筆健康的回填列全部誤報成漏收（見設計稿 §2.2 的 counted{fs:89,db:84}）。
+  const s2 = judgeAgentRunCoverage([...dispatcherTopLevel, ...agentTraceJson], agentRunRows, dirs, { localHosts: ['head', 'unknown_pre_migration'] })
+  judge(s2.missingInDb.length === 0, 'S2 agent_runs 覆蓋率：trace/stdout 檔案 → agent_runs 無漏收（取代 C6 覆蓋率一半）',
+    `counted fs=${s2.counted.fs} db=${s2.counted.db}` + (s2.missingInDb.length ? `｜缺：${s2.missingInDb.slice(0, 5).join(', ')}` : ''))
+  judge(s2.foreignPaths.length === 0, 'S2 agent_runs.path 無不合法來源（寫入端沒有寫它不該寫的東西）',
+    s2.foreignPaths.length ? s2.foreignPaths.slice(0, 5).join(', ') : '')
+  if (s2.ghostInDb.length) console.log(`[EXEMPT] S2 幽靈列（檔案已被 cleanup-worktree 清掉，正常結局，不判紅，共 ${s2.ghostInDb.length} 筆）：${s2.ghostInDb.slice(0, 3).join(', ')}`)
+
+  // S4：runs 單列欄位自洽（legacy_key / stdout_path / started_at 三者互為可逆推導）。
+  const s4 = judgeLegacyKeyCoherence(gateRuns)
+  judge(s4.keyPathMismatch.length === 0, 'S4 legacy_key 與 stdout_path 自洽（新判準，兩軌時代看不見）',
+    s4.keyPathMismatch.length ? s4.keyPathMismatch.slice(0, 5).join(', ') : '')
+  judge(s4.keyStartedAtMismatch.length === 0, `S4 legacy_key 內嵌時間戳與 started_at 在容差內（0 ≤ Δ ≤ ${KEY_TO_STARTED_AT_TOLERANCE_MS}ms，與 C5 started_at 同一物理量）`,
+    s4.keyStartedAtMismatch.length ? s4.keyStartedAtMismatch.slice(0, 5).join(', ') : (s4.observedMaxDeltaMs === null ? '無樣本' : `實測最大 Δ=${s4.observedMaxDeltaMs}ms`))
+  judge(s4.duplicateKeys.length === 0, 'S4 同 host 下 legacy_key 無重複（idx_legacy_key 非 UNIQUE，等價 C5b）',
+    s4.duplicateKeys.length ? s4.duplicateKeys.slice(0, 5).join(', ') : '')
+  judge(s4.orphanRows.length === 0, 'S4 無孤兒列（lifecycle_rank≥30 但 stdout_path/started_at 為 NULL，兩軌對照結構性看不到）',
+    s4.orphanRows.length ? s4.orphanRows.slice(0, 3).join('; ') : '')
+
+  // S6：retry/resume 血緣自洽（新判準，phase9-readiness.md §1.3 缺口2，sqlite 無此概念、
+  // 兩軌對照定義上不可能檢查）。
+  const s6 = judgeRetryLineage(gateRuns)
+  judge(s6.dangling.length === 0 && s6.ticketMismatch.length === 0 && s6.notLaterThanParent.length === 0 && s6.cycles.length === 0 && s6.forkedParents.length === 0,
+    `S6 retry_of_run_id 血緣自洽（共 ${s6.counted.withLineage}/${s6.counted.total} 筆有血緣）`,
+    [
+      s6.dangling.length ? `dangling ${s6.dangling.length}` : '',
+      s6.ticketMismatch.length ? `ticketMismatch ${s6.ticketMismatch.length}` : '',
+      s6.notLaterThanParent.length ? `notLaterThanParent ${s6.notLaterThanParent.length}` : '',
+      s6.cycles.length ? `cycles ${s6.cycles.length}` : '',
+      s6.forkedParents.length ? `forkedParents ${s6.forkedParents.length}` : '',
+    ].filter(Boolean).join('｜') || (s6.counted.withLineage === 0 ? '目前零真實樣本，這格從未被觸發過（a7-D14）' : ''))
+  if (s6.unexpectedParentOutcome.length) console.log(`[WARN] S6 父列 outcome 不在自動重試值域內（手動重試值域不封閉，只列不判紅，共 ${s6.unexpectedParentOutcome.length} 筆）：${s6.unexpectedParentOutcome.slice(0, 3).join('; ')}`)
 }
 
 } catch (e) {
