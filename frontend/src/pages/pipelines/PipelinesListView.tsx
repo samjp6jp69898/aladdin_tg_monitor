@@ -150,12 +150,22 @@ export function PipelinesListView({ resource }: { resource: Resource<PipelinesRe
     },
     {
       key: 'tokens',
-      header: 'tokens in / out',
+      header: (
+        <span title="cache：同一 session 內重複讀取既有對話歷史的量，不是新產生的資料量——需求單常見數千萬～上億，屬正常現象，不代表真的處理了那麼多新資料">
+          tokens in / cache / out
+        </span>
+      ),
       className: 'mono',
+      cellTitle: row => {
+        if (row.kind !== 'history' || !row.data.agent_count) return undefined
+        return 'cache：同一 session 內重複讀取既有對話歷史的量，不是新產生的資料量'
+      },
       render: row => {
         if (row.kind !== 'history') return ''
         const r = row.data
-        return r.agent_count ? `${fmtTok(r.total_input)} / ${fmtTok(r.total_output)}` : ''
+        if (!r.agent_count) return ''
+        const cache = (r.total_cache_read ?? 0) + (r.total_cache_create ?? 0)
+        return `${fmtTok(r.total_input)} / ${fmtTok(cache)} / ${fmtTok(r.total_output)}`
       },
     },
     {

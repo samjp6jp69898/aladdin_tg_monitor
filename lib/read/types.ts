@@ -108,7 +108,12 @@ export interface PipelineRunRow {
   /** attachAgentRuns() 事後掛上，不由 reader 產生。 */
   agents?: AgentRunRow[]
   agent_count?: number
+  /** 真正的新輸入 token（`input_tokens` 加總，不含 cache）。2026-09-04 拆分，見 lib/agent-runs-summary.ts。 */
   total_input?: number
+  /** cache 命中讀取量加總（`cache_read_tokens`），量級可達千萬～上億，不是新產生的資料量。 */
+  total_cache_read?: number
+  /** cache 建立量加總（`cache_create_tokens`）。 */
+  total_cache_create?: number
   total_output?: number
   total_cost?: number
   [k: string]: unknown

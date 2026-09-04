@@ -335,7 +335,12 @@ export interface PipelineRunBase {
  */
 export interface PipelineRun extends PipelineRunBase {
   agent_count: number
+  /** 真正的新輸入 token（不含 cache）。2026-09-04 拆分，見 lib/agent-runs-summary.ts。 */
   total_input: number
+  /** cache 命中讀取量：同一 session 內重複讀取既有對話歷史的量，不是新產生的資料量。 */
+  total_cache_read: number
+  /** cache 建立量。 */
+  total_cache_create: number
   total_output: number
   total_cost: number
   running: boolean
@@ -403,14 +408,20 @@ export interface PipelineRunDetailResponse {
    * 實際上 server.ts 的 `GET /api/pipelines/run` handler（server.ts:342-377）呼叫
    * `attachAgentRuns(siblings)`（server.ts:347）後，直接把該筆 `me` 整包塞進
    * `c.json({ run: me, ... })`，並未像 `GET /api/pipelines`（server.ts:251）一樣
-   * `delete r.agents`——所以 `run` 上同時有 `agents[]` 本體與四個彙總欄，且一定存在
+   * `delete r.agents`——所以 `run` 上同時有 `agents[]` 本體與彙總欄，且一定存在
    * （`attachAgentRuns()` 對每列都無條件賦值，即使是空陣列/0）。
+   * 2026-09-04：彙總欄從四個拆成六個——`total_input` 曾把 cache_read/cache_create
+   * 無差別併入，跨多 stage 相加後對使用者顯示成一個嚇人的大數字（見
+   * lib/agent-runs-summary.ts 檔頭），現在拆開為 total_input（僅新輸入）、
+   * total_cache_read、total_cache_create 三個獨立欄。
    */
   run: PipelineRunBase & {
     running: boolean
     agents: AgentRunRow[]
     agent_count: number
     total_input: number
+    total_cache_read: number
+    total_cache_create: number
     total_output: number
     total_cost: number
   }

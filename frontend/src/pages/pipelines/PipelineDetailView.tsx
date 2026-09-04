@@ -216,8 +216,11 @@ export function PipelineDetailView({ runKey }: { runKey: string }) {
           />
           {agents.length > 0 && (
             <div className="mute" style={{ marginTop: 8 }}>
-              合計 {agents.length} 個 agent · input {fmtTok(r?.total_input ?? 0)}（含 cache）· output{' '}
-              {fmtTok(r?.total_output ?? 0)}
+              合計 {agents.length} 個 agent · input {fmtTok(r?.total_input ?? 0)} · cache{' '}
+              <span title="同一 session 內重複讀取既有對話歷史的量，不是新產生的資料量——多輪 agentic loop 的 stage 常見數千萬～上億，屬正常現象">
+                {fmtTok((r?.total_cache_read ?? 0) + (r?.total_cache_create ?? 0))}
+              </span>{' '}
+              · output {fmtTok(r?.total_output ?? 0)}
             </div>
           )}
         </Card>

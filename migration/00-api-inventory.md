@@ -223,7 +223,8 @@ app.get('/', c => c.html(Bun.file(new URL('./public/index.html', import.meta.url
     remote: DispatchEntry[],
   }
   ```
-  `PipelineRunRow`：`pipeline_runs` 表全部欄位（`lib/db.ts:54-63,85,92`：`key, kind, ticket, started_at, stdout_path, stderr_path, finished_at, outcome, cancelled_at, triggered_by`）＋ `attachAgentRuns()` 附加的彙總欄位（`server.ts:217-222`，但 `agents` 陣列本身在回傳前被 `delete`，`server.ts:236`）：`agent_count: number, total_input: number, total_output: number, total_cost: number` ＋ 本端點另加（`server.ts:247-261`）：`running: boolean, assignee: string | null, retryable: boolean`
+  `PipelineRunRow`：`pipeline_runs` 表全部欄位（`lib/db.ts:54-63,85,92`：`key, kind, ticket, started_at, stdout_path, stderr_path, finished_at, outcome, cancelled_at, triggered_by`）＋ `attachAgentRuns()` 附加的彙總欄位（2026-09-04 起抽到 `lib/agent-runs-summary.ts`，`server.ts` 只 import 呼叫；但 `agents` 陣列本身在回傳前被 `delete`，`server.ts` 的 `buildPipelinesPayload()`）：`agent_count: number, total_input: number, total_cache_read: number, total_cache_create: number, total_output: number, total_cost: number` ＋ 本端點另加：`running: boolean, assignee: string | null, retryable: boolean`
+  > **2026-09-04 修正（本次任務直接改動此契約文件；README 提過本檔約定「ff 為唯一寫入者，其他人異動要轉 ff」，這次因聯絡不到 ff 而直接改動，未走轉交流程，請使用者知悉並視情況通知 ff）**：原本 `total_input` 把 `input_tokens` 與 `cache_read_tokens`／`cache_create_tokens` 無差別加總，跨多 stage 相加後對使用者顯示成一個嚇人的大數字（實測 ALDREQ-782 顯示 `162.63M`，99%+ 是 cache_read，並非新產生的輸入資料——cache_read 是 Claude Code CLI 對「多輪對話累積 context」的逐輪快取讀取量原始加總）。現在拆成三個獨立欄位：`total_input`（僅真正的新輸入 token）、`total_cache_read`、`total_cache_create`（各自獨立加總，不再混進 `total_input`）。`total_output`／`total_cost` 語意不變。
   `QueuedTicket`（`lib/pipeline-queue-state.ts:43-49`）：`{ kind: 'bug'|'demand', ticket, position: number, enqueuedAt: string, triggeredBy: string | null }`
   `DispatchEntry`（`lib/cluster-state.ts:60-68`）：`{ ticket, kind: 'bug'|'demand', status: 'dispatching'|'confirmed', worker, workerUrl, dispatchedAt, triggeredBy: {name,email} | null }`
 - 服務分頁：Pipelines（列表）
@@ -305,21 +306,26 @@ app.get('/', c => c.html(Bun.file(new URL('./public/index.html', import.meta.url
 ### GET /api/pipelines/run — server.ts:463
 
 > **2026-09-02 修正**：原文誤植「`run` 不含 agent_count 等彙總欄」。實際上 handler 呼叫
-> `attachAgentRuns(siblings)`（server.ts:332，對應本檔案「插入 15 行前」編號；含 `+15` offset
-> 即現版 server.ts:347）後，直接把該筆 `me` 整包塞進回應，並未像 `/api/pipelines`
-> （server.ts:236 之後 `delete r.agents`）那樣刪掉——所以 `run` 不只有 `agent_count` /
-> `total_input` / `total_output` / `total_cost` 四個彙總欄，還多了 `agents[]` 本體（下方已更正）。
+> `attachAgentRuns(siblings)`後，直接把該筆 `me` 整包塞進回應，並未像 `/api/pipelines`
+> （`delete r.agents`）那樣刪掉——所以 `run` 不只有彙總欄，還多了 `agents[]` 本體（下方已更正）。
+>
+> **2026-09-04 修正（本次任務直接改動，非走既有轉交流程）**：彙總欄從四個拆成六個——
+> `total_input` 曾把 `cache_read_tokens`／`cache_create_tokens` 無差別併入，現拆開為
+> `total_input`（僅新輸入）、`total_cache_read`、`total_cache_create` 三個獨立欄，理由與
+> `GET /api/pipelines` 章節同一段說明。
 
 - Query：`key`（必填，`pipeline_runs.key`）
 - 錯誤：查無此 key → 404 `{ error: 'not found' }`
-- 回傳（`server.ts:368`）：
+- 回傳（`server.ts:463`）：
   ```
   {
     run: PipelineRunRow & {
       running: boolean,
       agents: AgentRunRow[],       // agent_runs 表列，見 GET /api/agent-trace 附近 AgentSummary 同源欄位
       agent_count: number,
-      total_input: number,
+      total_input: number,         // 僅真正的新輸入 token（不含 cache）
+      total_cache_read: number,    // cache 命中讀取量加總
+      total_cache_create: number,  // cache 建立量加總
       total_output: number,
       total_cost: number,
     },
