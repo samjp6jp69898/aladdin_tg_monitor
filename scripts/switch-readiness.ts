@@ -461,6 +461,30 @@ function setEqual(a: any[], b: any[], drop: string[] = []): { equal: boolean; on
   return { equal: onlyA === 0 && onlyB === 0, onlyA, onlyB }
 }
 
+/**
+ * C4/C5/C6 用 `new Map(rows.map(r => [key(r), r]))` 建索引比對——若鍵不是唯一
+ * （Reviewer B MINOR-3）：`legacy_key` 不是唯一索引（mysql.ts 自己的註解），
+ * `agent_runs` PK 是 `(run_id, path)`、同一個 path 理論上可以對到多個 run_id。
+ * 重複時 Map 留最後一筆，比對用的是任意一筆，而不是「有沒有重複」本身被看見。
+ *
+ * 這支只印 `[WARN]`、不判 FAIL：這條路徑目前資料是否真的有重複未知，先讓它
+ * 會叫（比照 compare-sqlite-mysql.ts 既有對 agent_runs path 重複的處理方式）。
+ */
+function warnDuplicateKeys(rows: any[], keyFn: (r: any) => string, label: string): void {
+  const seen = new Map<string, number>()
+  for (const r of rows) {
+    const k = keyFn(r)
+    seen.set(k, (seen.get(k) ?? 0) + 1)
+  }
+  const dup = [...seen].filter(([, n]) => n > 1)
+  if (dup.length) {
+    console.log(
+      `[WARN] ${label} 有 ${dup.length} 個鍵對到多筆列，Map 索引會靜默併掉重複、比對只用任意一筆：` +
+        dup.slice(0, 5).map(([k, n]) => `${k}×${n}`).join(', '),
+    )
+  }
+}
+
 // C1 events：全量內容必須完全一致（`id` 是各自獨立的 AUTOINCREMENT，不比）
 {
   const f = { errorsOnly: false, toolOnly: false, limit: FULL } as any
@@ -554,6 +578,7 @@ let observedMaxDelta = Number.NEGATIVE_INFINITY
 let observedMaxFinishedDelta = Number.NEGATIVE_INFINITY
 {
   const [a, b] = [await sqliteReader.pipelineRuns(FULL), await mysqlReader.pipelineRuns(FULL)]
+  warnDuplicateKeys(b, r => r.key, 'C4/C5 mysql pipelineRuns.key')
   const bk = new Map(b.map(r => [r.key, r]))
   const missing = a.filter(r => !bk.has(r.key))
   // 只要求「sqlite 有的 mysql 都要有」；mysql 多出來的是合理的（遠端 worker 的 run
@@ -661,6 +686,7 @@ let observedMaxFinishedDelta = Number.NEGATIVE_INFINITY
 // C6 agent_runs
 {
   const [a, b] = [await sqliteReader.allAgentRuns(), await mysqlReader.allAgentRuns()]
+  warnDuplicateKeys(b, r => r.path, 'C6 mysql agent_runs.path')
   const bk = new Map(b.map(r => [r.path, r]))
   const missing = a.filter(r => !bk.has(r.path))
   judge(missing.length === 0, 'C6 sqlite 的每一筆 agent_run 在 mysql 都找得到',
