@@ -8,3 +8,6 @@ migration/review/*-proof.png
 .env
 .env.*
 !.env.example
+
+# worktree 隔離型 subagent 派工產生的暫存 worktree（2026-09-04），本機產物不進 git。
+.claude/worktrees/
