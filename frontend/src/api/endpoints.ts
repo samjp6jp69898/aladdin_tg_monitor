@@ -272,19 +272,25 @@ export function fetchLogs(signal?: AbortSignal): Promise<LogsResponse> {
  * 檔案不存在時回 200 `{ text:'', size:0, missing:true }`；
  * path 不在白名單時回 **403 純文字**（拋 ApiError，訊息在 bodyText）。
  */
-export function fetchLogTail(path: string, kb?: number, signal?: AbortSignal): Promise<LogTailResponse> {
-  return get<LogTailResponse>('/api/log/tail', { path, kb }, signal)
+/** `host`（task 1，2026-09-04）：worker 執行的票，log 檔案只在該台機器上——帶
+ * 這個參數讓後端 proxy 過去（見 server.ts `/api/log/tail` 的 host 分流，與
+ * `/api/agent-trace` 的 `host` 參數同款模式）。省略或等於本機 host 就是原本
+ * 的本機讀取行為。 */
+export function fetchLogTail(path: string, kb?: number, host?: string, signal?: AbortSignal): Promise<LogTailResponse> {
+  return get<LogTailResponse>('/api/log/tail', { path, kb, host }, signal)
 }
 
 /**
  * `GET /api/log/since` — 即時跟隨：帶上次拿到的 `offset`，取回自該位置起的新增內容。
  * 單次最多讀 2MB；檔案被截斷（size < offset）時後端會從頭重讀並把 offset 重設為 0。
  * 這是全站唯一的「tail -f」機制（後端刻意不用 SSE，見 00-api-inventory.md）。
+ * `host`：同 `fetchLogTail()` 註解，worker 執行的票要帶這個參數。
  */
 export function fetchLogSince(
   path: string,
   offset?: number,
+  host?: string,
   signal?: AbortSignal,
 ): Promise<LogSinceResponse> {
-  return get<LogSinceResponse>('/api/log/since', { path, offset }, signal)
+  return get<LogSinceResponse>('/api/log/since', { path, offset, host }, signal)
 }

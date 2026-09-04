@@ -109,7 +109,7 @@ describe('computeBugStages — 帶 remoteFiles（worker 執行的票，task 1）
     expect(analytics.finished_at).toBeNull()
   })
 
-  test('running=true + remoteFiles：不丟例外，且不嘗試本機 transcript 推定（已知限制，見函式檔頭）——沒有任何階段被標成 running', () => {
+  test('running=true + remoteFiles，未帶 remoteCurrentStage（呼叫端沒有嘗試探測）：不丟例外，沒有任何階段被標成 running', () => {
     const remoteFiles: RemoteStageFiles = { debugFiles: { 'analytics.md': '2026-09-04T00:05:00.000Z' }, worktreeBootstrapLog: null }
     const stages = computeBugStages('FAQ-__compute-bug-stages-remote-running__', RUN_STARTED_AT, null, true, remoteFiles)
     expect(stages.some(s => s.status === 'running')).toBe(false)
@@ -123,5 +123,62 @@ describe('computeBugStages — 帶 remoteFiles（worker 執行的票，task 1）
     const exit = stages.find(s => s.key === 'exit')!
     expect(exit.status).toBe('done')
     expect(exit.finished_at).toBe('2026-09-04T01:00:00.000Z')
+  })
+})
+
+describe('computeBugStages — remoteCurrentStage（task 2，2026-09-04：worker 執行中的票即時進度）', () => {
+  const remoteFiles: RemoteStageFiles = { debugFiles: {}, worktreeBootstrapLog: null }
+
+  test('{ ok: false }（worker 探測逾時/連不上）：fail-closed，不顯示任何 running 列（不是顯示假資料）', () => {
+    const stages = computeBugStages('FAQ-__compute-bug-stages-remote-cur-unknown__', RUN_STARTED_AT, null, true, remoteFiles, { ok: false })
+    expect(stages.some(s => s.status === 'running')).toBe(false)
+  })
+
+  test('{ ok: true, stage: null }（探測成功但此刻沒有 agent 在跑）：不顯示 running 列', () => {
+    const stages = computeBugStages('FAQ-__compute-bug-stages-remote-cur-idle__', RUN_STARTED_AT, null, true, remoteFiles, { ok: true, stage: null })
+    expect(stages.some(s => s.status === 'running')).toBe(false)
+  })
+
+  test('{ ok: true, stage }（探測成功，bug-tracer 正在跑）：analysis-notes 該列標成 running', () => {
+    const since = '2026-09-04T00:20:00.000Z'
+    const stages = computeBugStages('FAQ-__compute-bug-stages-remote-cur-tracer__', RUN_STARTED_AT, null, true, remoteFiles, {
+      ok: true,
+      stage: { stageKey: 'analysis-notes', agent: 'bug-tracer', since },
+    })
+    const s = stages.find(x => x.key === 'analysis-notes')!
+    expect(s.status).toBe('running')
+    expect(s.started_at).toBe(since)
+    expect(s.detail).toBe('bug-tracer')
+  })
+
+  test('{ ok: true, stage }（stageKey=fixer）：動態插入一列 fixer，標成 running', () => {
+    const since = '2026-09-04T00:30:00.000Z'
+    const stages = computeBugStages('FAQ-__compute-bug-stages-remote-cur-fixer__', RUN_STARTED_AT, null, true, remoteFiles, {
+      ok: true,
+      stage: { stageKey: 'fixer', agent: 'bug-fixer-with-tests', since },
+    })
+    const fixer = stages.find(s => s.key === 'fixer')
+    expect(fixer).toBeDefined()
+    expect(fixer!.status).toBe('running')
+    expect(fixer!.detail).toBe('bug-fixer-with-tests')
+  })
+
+  test('{ ok: true, stage }（review + reviewRound）：detail 帶輪數', () => {
+    const since = '2026-09-04T00:40:00.000Z'
+    const stages = computeBugStages('FAQ-__compute-bug-stages-remote-cur-review__', RUN_STARTED_AT, null, true, remoteFiles, {
+      ok: true,
+      stage: { stageKey: 'review', agent: 'solution-reviewer', since, reviewRound: 2 },
+    })
+    const review = stages.find(s => s.key === 'review')!
+    expect(review.status).toBe('running')
+    expect(review.detail).toBe('solution-reviewer・第 2 輪')
+  })
+
+  test('running=false：即使帶 remoteCurrentStage 也不套用（跟本機 running=false 行為一致）', () => {
+    const stages = computeBugStages('FAQ-__compute-bug-stages-remote-cur-notrunning__', RUN_STARTED_AT, null, false, remoteFiles, {
+      ok: true,
+      stage: { stageKey: 'analysis-notes', agent: 'bug-tracer', since: '2026-09-04T00:20:00.000Z' },
+    })
+    expect(stages.some(s => s.status === 'running')).toBe(false)
   })
 })

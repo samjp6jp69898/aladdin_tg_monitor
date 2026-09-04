@@ -51,10 +51,30 @@ function buildOptions(data: LogsResponse | null): LogOption[] {
   return opts
 }
 
+/** GET /api/log/tail、/api/log/since 錯誤訊息：get() 對非 2xx 一律拋
+ * ApiError（worker 連不上/逾時、CLUSTER_SHARED_SECRET 未設定都在 502 body 帶
+ * `{ error }`）——比照 AgentConversationCard.tsx 的 traceErrorMessage()。 */
+function logErrorMessage(err: unknown): string {
+  if (err && typeof err === 'object' && 'body' in err) {
+    const body = (err as { body?: unknown }).body as { error?: string } | undefined
+    if (body?.error) return body.error
+  }
+  if (err && typeof err === 'object' && 'bodyText' in err) {
+    const bodyText = (err as { bodyText?: string }).bodyText
+    if (bodyText) return bodyText
+  }
+  return err instanceof Error ? err.message : String(err)
+}
+
 export function LogsPage() {
   const [searchParams] = useSearchParams()
   // 對應舊版 `window.openLog(path)`：跨分頁跳轉帶 `?path=` 進來時直接選中該檔案。
   const [path, setPath] = useState<string | null>(() => searchParams.get('path') || null)
+  // task 1（2026-09-04）：跨分頁跳轉可能帶 `?host=`（worker 執行的票的 stdout/
+  // stderr 連結，見 PipelinesListView.tsx）。下拉選單（`#lg-file`）的選項一律
+  // 來自 `/api/logs`，全部是本機檔案——使用者手動改選檔案時清掉 host，避免
+  // 「跳轉帶進來的 worker host」誤套用到之後手動選的本機檔案上。
+  const [host, setHost] = useState<string | undefined>(() => searchParams.get('host') || undefined)
   const [kb, setKb] = useState(64)
   const [follow, setFollow] = useState(true)
 
@@ -70,10 +90,13 @@ export function LogsPage() {
     setPath(options[0].path)
   }, [options, path])
 
-  const log = useLogFollow({ path, kb, follow })
+  const log = useLogFollow({ path, kb, follow, host })
 
   // `#lg-info`：missing 或載入中或未選檔案時清空，否則顯示目前已讀到的位移換算 KB。
   const info = !path || log.loading || log.missing ? '' : fmtKb(log.offset)
+  // fail-closed（task 1）：worker 連不上/逾時時 log.error 會有值，明確顯示出來，
+  // 不要讓畫面看起來像「檔案是空的」或維持上一次的舊內容誤導使用者。
+  const errorText = log.error ? logErrorMessage(log.error) : ''
 
   return (
     <>
@@ -82,7 +105,12 @@ export function LogsPage() {
           id="lg-file"
           style={{ minWidth: 420 }}
           value={path ?? ''}
-          onChange={e => setPath(e.target.value || null)}
+          onChange={e => {
+            setPath(e.target.value || null)
+            // 下拉選單的選項一律是本機檔案（`/api/logs` 只列 head 自己的
+            // logs）——清掉可能是跨分頁跳轉帶進來的 worker host。
+            setHost(undefined)
+          }}
         >
           {options.map((o, i) => (
             <option key={`${o.path}-${i}`} value={o.path} disabled={o.disabled}>
@@ -106,6 +134,12 @@ export function LogsPage() {
         <span className="mute" id="lg-info">
           {info}
         </span>
+        {host && (
+          <span className="mute" title="這個 log 檔案屬於 worker 執行的票，內容透過 head proxy 取得">
+            worker: {host}
+          </span>
+        )}
+        {errorText && <span className="err">{errorText}</span>}
       </Toolbar>
       {/* autoScroll 固定為 true（不綁 follow）：LogViewer 內部會依 reloadToken（= useLogFollow 的
           loadId，只在整批替換的 tail 抓取成功時 +1）分別套用「無條件捲到底」（載入/換檔/改 kb/

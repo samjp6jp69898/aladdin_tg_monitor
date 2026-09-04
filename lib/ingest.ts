@@ -983,6 +983,16 @@ export type RemoteStageFiles = {
   worktreeBootstrapLog: string | null
 }
 
+/** worker 執行的票「目前正在跑哪個 stage／哪位 agent」的即時探測結果
+ * （task 2，2026-09-04）——與 lib/cluster-state.ts 的 RemoteCurrentStageResult
+ * 同形狀。`undefined`＝呼叫端沒有嘗試探測（等同舊行為，不顯示 running 細節）；
+ * `{ ok: false }`＝探測過但打不通/逾時（fail-closed：一樣不顯示 running 細節，
+ * 但語意上是「不知道」而非「確定沒有」——呼叫端據此另外顯示「無法確認」，見
+ * server.ts buildPipelineRunPayload 的 liveProgressUnavailableReason）；
+ * `{ ok: true, stage }`＝探測成功，`stage` 是實際推定結果（可能為 null，代表
+ * 此刻沒有任何 agent 在跑，例如兩個 Step 之間的空檔）。 */
+export type RemoteCurrentStage = { ok: true; stage: CurrentBugStage | null } | { ok: false }
+
 /**
  * remoteFiles（task 1，2026-09-04）：省略／undefined 時完全比照舊行為，直接
  * 掃 head 本機的 Debug/worktrees 路徑（run.host 是 head 自己執行的票）。帶值
@@ -990,11 +1000,13 @@ export type RemoteStageFiles = {
  * 檔案的本機路徑可掃（worker 執行時 Debug/worktrees 只落在 worker 本地檔案
  * 系統），見 lib/cluster-state.ts fetchRemoteStageFiles() 呼叫處。
  *
- * 只有「產物檔存在＋mtime」這部分能做到跟本機執行的票一致；`running` 為
- * true 時本函式仍會嘗試 inferCurrentBugStage()（transcript 掃描）推定目前
- * 正在跑哪一步——那份 transcript（~/.claude/projects/...）一樣只在執行機
- * 本地，remoteFiles 模式下天生推不出來，是本輪已知、留待下一輪的限制（見
- * server.ts buildPipelineRunPayload 呼叫處與最終回報）。
+ * remoteCurrentStage（task 2，2026-09-04）：`remoteFiles` 模式下（worker 執行
+ * 的票）本機讀不到 transcript，改由呼叫端先打 worker 的
+ * `GET /jobs/:ticket/current-stage`（見 lib/cluster-state.ts
+ * fetchRemoteCurrentStage()）取得探測結果，傳進本參數——本函式據此標出
+ * running 那一列，不再對 remoteFiles 模式整段跳過（原本是已知限制，留待下一
+ * 輪，現已補上）。`remoteFiles` 省略時（本機執行）本參數不生效，一律用本機
+ * inferCurrentBugStage()。
  */
 export function computeBugStages(
   ticket: string,
@@ -1002,6 +1014,7 @@ export function computeBugStages(
   tracker: { status: string; completedAt: string | null } | null,
   running = false,
   remoteFiles?: RemoteStageFiles,
+  remoteCurrentStage?: RemoteCurrentStage,
 ): BugStage[] {
   const dir = join(DEBUG_DIR, ticket)
   // Debug/{ticket} 產物跨同一張票的多次執行共用（重試不會清掉上一輪留下的
@@ -1067,11 +1080,14 @@ export function computeBugStages(
   // running（覆蓋 done/reused——例如審查否決後重跑 review 時，舊報告的 done
   // 會被即時的 running 蓋掉）。Step 5（fixer）沒有產物列，動態插一列。
   //
-  // remoteFiles 模式（worker 執行的票）目前跳過這段：transcript
-  // （~/.claude/projects/...）只在執行機本地，head 這裡天生推不出來——已知
-  // 限制，留待下一輪（見本函式檔頭與最終回報「殘留風險」）。
-  if (running && !remoteFiles) {
-    const cur = inferCurrentBugStage(ticket, runStartedAt)
+  // remoteFiles 模式（worker 執行的票，task 2）：transcript
+  // （~/.claude/projects/...）只在執行機本地，head 這裡天生讀不到，改用呼叫端
+  // 傳入的 remoteCurrentStage（worker 探測結果）——`undefined` 或 `{ok:false}`
+  // 都視為「沒有可用的 running 細節」，fail-closed 不顯示任何 running 列，不是
+  // 顯示假資料；呼叫端另外用 `ok:false` 去顯示「無法確認目前進度」的提示（見
+  // server.ts buildPipelineRunPayload 的 liveProgressUnavailableReason）。
+  if (running) {
+    const cur = remoteFiles ? (remoteCurrentStage?.ok === true ? remoteCurrentStage.stage : null) : inferCurrentBugStage(ticket, runStartedAt)
     if (cur) {
       if (cur.stageKey === 'fixer') {
         const idx = stages.findIndex(s => s.key === 'review')

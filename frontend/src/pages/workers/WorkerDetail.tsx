@@ -6,13 +6,13 @@
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { ApiError } from '../../api/client'
-import { fetchWorkerDetail } from '../../api/endpoints'
+import { fetchWorkerDetail, postPipelineCancel } from '../../api/endpoints'
 import { topics } from '../../api/topics'
-import type { DispatchEntry, ProgressStage, WorkerDetailResponse } from '../../api/types'
+import type { CancelPipelineResponse, DispatchEntry, ProgressStage, WorkerDetailResponse } from '../../api/types'
 import { Badge, Button, Card, type Column, DataTable, LogViewer, Toolbar, TwoColumn } from '../../components/shared'
 import { useAction, useResource } from '../../hooks'
 import { fmt } from '../../lib/format'
-import { workersPath } from '../../lib/navigation'
+import { pipelinesPath, workersPath } from '../../lib/navigation'
 
 /**
  * 舊版 `pre.log` 在本頁三處都是 `style="height:auto;max-height:30vh"`。2026-09-02 起
@@ -34,6 +34,25 @@ export function WorkerDetail({ name, initialTicket }: WorkerDetailProps) {
   const [ticketInput, setTicketInput] = useState(initialTicket ?? '')
   const [ticketQueried, setTicketQueried] = useState(false)
   const ticketAction = useAction()
+  // task 3（2026-09-04）：「目前指派在這台的票」表格的取消動作——跟
+  // PipelinesListView.tsx 的 handleCancel 同一支 API（/api/pipelines/cancel，
+  // 已是 host-aware，會自動轉發給對的 worker）、同一套 confirm/成功/失敗回饋
+  // 文案，避免兩個分頁的取消語意不一致。
+  const cancelAction = useAction()
+
+  async function handleCancelTicket(kind: 'bug' | 'demand', ticket: string) {
+    const result = await cancelAction.run(() => postPipelineCancel(kind, ticket), {
+      confirm: `確定要取消 ${kind} pipeline ${ticket}？\n\n會送 SIGTERM 給整棵行程樹；wrapper 的收尾會照常執行（釋放 bug-lock、發 TG「異常終止」通知給認領人、釋放併發名額）。`,
+    })
+    if (result === null) return
+    const raw = result.raw as CancelPipelineResponse
+    window.alert(
+      result.ok
+        ? `已送出取消：對 ${raw.killed.length} 個子行程送出 SIGTERM（${raw.killed.join(', ')}），wrapper ${raw.wrapperPid} 會自行收尾。幾秒後列表會更新。`
+        : `取消失敗：${raw.reason || 'unknown'}`,
+    )
+    await detail.reload()
+  }
 
   async function runTicketQuery(raw: string) {
     const t = raw.trim()
@@ -76,12 +95,48 @@ export function WorkerDetail({ name, initialTicket }: WorkerDetailProps) {
       ? JSON.stringify(ticketStatus, null, 2)
       : '（查詢失敗：worker 連不上，或票號格式不對，或 CLUSTER_SHARED_SECRET 未設定）'
 
+  // task 3（2026-09-04）：「目前指派在這台的票」表格補上兩個操作入口。
+  // - 詳情：連到 PipelineDetailView，`runKey`（server.ts `/api/cluster/worker`
+  //   反查 pipeline_runs 補上，見該處註解）找不到時（run 還沒落地／尚未被
+  //   collector 撈到）顯示「-」，不是壞連結。
+  // - 取消：`status === 'confirmed'` 視同「這張票確定在這台 worker 上跑」——
+  //   DispatchEntry 沒有 PipelineRun 那種 running/runningStatusUnknown 欄位，
+  //   `dispatching`（head 剛送出、還沒收到 worker 確認）跟「無法確認執行狀態」
+  //   是同一種「不確定」，都不顯示取消按鈕，避免誤按。
   const ticketsColumns: Column<DispatchEntry>[] = [
     { key: 'ticket', header: '票號', className: 'mono', render: t => t.ticket },
     { key: 'kind', header: '種類', render: t => t.kind },
     { key: 'status', header: '狀態', render: t => t.status },
     { key: 'dispatchedAt', header: '派工時間', className: 'mono', render: t => fmt(t.dispatchedAt) },
     { key: 'triggeredBy', header: '觸發人', render: t => t.triggeredBy?.name ?? '' },
+    {
+      key: 'detail',
+      header: '詳情',
+      render: t =>
+        t.runKey ? (
+          <a
+            href={pipelinesPath(t.runKey!)}
+            onClick={e => {
+              e.preventDefault()
+              navigate(pipelinesPath(t.runKey!))
+            }}
+          >
+            查看
+          </a>
+        ) : (
+          <span className="mute">-</span>
+        ),
+    },
+    {
+      key: 'actions',
+      header: '',
+      render: t =>
+        t.status === 'confirmed' ? (
+          <Button variant="danger" disabled={cancelAction.pending} onClick={() => handleCancelTicket(t.kind, t.ticket)}>
+            取消
+          </Button>
+        ) : null,
+    },
   ]
 
   const stageColumns: Column<ProgressStage>[] = [

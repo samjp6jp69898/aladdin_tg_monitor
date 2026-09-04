@@ -55,9 +55,12 @@ export function eventsPath(f: EventsJumpFilters = {}): string {
 
 /* ── logs ─────────────────────────────────────────────────────────────── */
 
-/** 對應舊版 `openLog(path)`：切到 logs 分頁並選中指定檔案。 */
-export function logsPath(path?: string): string {
-  return withQuery('logs', { path })
+/** 對應舊版 `openLog(path)`：切到 logs 分頁並選中指定檔案。
+ * `host`（task 1，2026-09-04）：這個 log 屬於哪台 worker（省略＝本機），讓
+ * LogsPage 帶著它一起打 /api/log/tail、/api/log/since——見
+ * PipelinesListView.tsx 的 stdout/stderr 連結呼叫處。 */
+export function logsPath(path?: string, host?: string): string {
+  return withQuery('logs', { path, host })
 }
 
 /* ── pipelines ────────────────────────────────────────────────────────── */

@@ -311,6 +311,14 @@ export interface DispatchEntry {
   workerUrl: string
   dispatchedAt: string
   triggeredBy: { name: string; email: string } | null
+  /**
+   * task 3（2026-09-04）：反查到的 pipeline_runs.key，供「連到票詳情頁」的
+   * 連結用。只有 `GET /api/cluster/worker`（WorkerDetail 的 tickets 欄位）才會
+   * 帶這個欄位——查不到對應的 run（還沒落地/尚未被 collector 撈到）是 null，
+   * 不是錯誤；`GET /api/pipelines` 的 `remote` 欄位（PipelinesListView 用）不
+   * 會帶，該處保持原本欄位缺席時 undefined 的既有行為。
+   */
+  runKey?: string | null
 }
 
 /** pipeline_runs 表欄位（lib/db.ts:54-63,85,92）。 */
@@ -446,6 +454,12 @@ export interface PipelineRunDetailResponse {
    * 這一種情境會非 null；其餘情況（非 bug 單、非當前 run、head 本機執行且
    * 就是還沒有任何產物）維持 null，不強加一個不存在的理由。 */
   stagesUnavailableReason: string | null
+  /** task 2（2026-09-04）：`stages` 有內容（已完成階段的檢核表拿得到），但
+   * worker 執行中的票「目前正在跑哪一步」這個即時細節探測失敗（連不上/逾時）
+   * 時帶原因——fail-closed：這時 `stages` 裡不會有任何一列被標成 running，
+   * 這個欄位就是告訴使用者「不是沒在跑，是現在無法確認」。其餘情況（本機
+   * 執行、run 未在跑、探測成功）維持 null。 */
+  liveProgressUnavailableReason: string | null
 }
 
 /* ────────────────────────────── GET /api/agent-trace ────────────────────────────── */

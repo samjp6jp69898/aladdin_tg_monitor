@@ -241,6 +241,36 @@ export async function fetchRemoteStageFiles(url: string, secret: string, ticket:
   }
 }
 
+/** worker `GET /jobs/:ticket/current-stage` 的回應形狀（task 2，2026-09-04）——
+ * 見 telegram-dispatcher/lib/pipeline-runner/local-current-stage.ts 的
+ * CurrentBugStage，與 lib/ingest.ts 的同名 type 同形狀（兩個 repo 各自獨立宣告，
+ * 沒有 import 關係，見該檔頭「跨 repo 用複製對齊邏輯」的既定模式）。 */
+export type RemoteCurrentBugStage = { stageKey: string; agent: string; since: string; reviewRound?: number }
+
+/** fail-closed 的探測結果：`ok:false` 代表打不到／逾時／回應格式不對——呼叫端
+ * 據此顯示「無法確認」，絕不能把它當成「stage:null（確定沒有任何 agent 正在
+ * 跑）」——那是完全不同的語意，見 server.ts buildPipelineRunPayload 呼叫處與
+ * lib/ingest.ts computeBugStages 的 remoteCurrentStage 參數註解。 */
+export type RemoteCurrentStageResult = { ok: true; stage: RemoteCurrentBugStage | null } | { ok: false }
+
+/** 這張 bug 票在 worker 上「目前正在跑哪個 stage／哪位 agent」的即時推定
+ * （task 2）。`startedAt` 須是這次 run 的 started_at（ISO 字串），worker 用它
+ * 錨定該掃哪一份 transcript。打不通/逾時/格式不對一律回 `{ ok: false }`。 */
+export async function fetchRemoteCurrentStage(url: string, secret: string, ticket: string, startedAt: string, timeoutMs = 8_000): Promise<RemoteCurrentStageResult> {
+  try {
+    const res = await fetch(`${url}/jobs/${encodeURIComponent(ticket)}/current-stage?startedAt=${encodeURIComponent(startedAt)}`, {
+      headers: { [CLUSTER_TOKEN_HEADER]: secret },
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+    if (!res.ok) return { ok: false }
+    const body = (await res.json()) as { ok?: boolean; stage?: unknown }
+    if (body?.ok !== true) return { ok: false }
+    return { ok: true, stage: (body.stage ?? null) as RemoteCurrentBugStage | null }
+  } catch {
+    return { ok: false }
+  }
+}
+
 // ---------- worker 名冊管理（中斷／恢復／移除，2026-08-31）----------
 // 這三個動作實際上是打「head 自己」（telegram-dispatcher server.ts，本機
 // 8787）新增的 /cluster/worker/:name/* 端點——head 的 worker 名冊活在它

@@ -131,23 +131,26 @@ export const topics = {
     fetch: (_: void, signal: AbortSignal) => api.fetchLogs(signal),
   }),
 
-  /** `GET /api/log/tail` — 一次性讀檔尾；即時跟隨請用 `useLogFollow()`。 */
+  /** `GET /api/log/tail` — 一次性讀檔尾；即時跟隨請用 `useLogFollow()`。
+   * `host`（task 1，2026-09-04）：worker 執行的票要帶這個參數，見
+   * endpoints.ts fetchLogTail() 註解。 */
   logTail: defineTopic({
     key: 'log-tail',
     intervalMs: POLL_INTERVAL_MS,
-    fetch: (p: { path: string; kb?: number }, signal: AbortSignal) =>
-      api.fetchLogTail(p.path, p.kb, signal),
+    fetch: (p: { path: string; kb?: number; host?: string }, signal: AbortSignal) =>
+      api.fetchLogTail(p.path, p.kb, p.host, signal),
   }),
 
   /**
    * `GET /api/log/since` — 即時跟隨的增量讀取，間隔 1500ms（舊版 index.html:748）。
    * 一般不要直接用，改用 `useLogFollow()`，它會幫你維護 offset 與文字累加。
+   * `host`：同 `logTail` 註解。
    */
   logSince: defineTopic({
     key: 'log',
     streamable: true,
     intervalMs: LOG_FOLLOW_INTERVAL_MS,
-    fetch: (p: { path: string; offset?: number }, signal: AbortSignal) =>
-      api.fetchLogSince(p.path, p.offset, signal),
+    fetch: (p: { path: string; offset?: number; host?: string }, signal: AbortSignal) =>
+      api.fetchLogSince(p.path, p.offset, p.host, signal),
   }),
 }

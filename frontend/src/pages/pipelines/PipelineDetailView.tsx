@@ -65,6 +65,10 @@ export function PipelineDetailView({ runKey }: { runKey: string }) {
   // task 1（2026-09-04）：worker 一時連不上/查無位址時的優雅降級文案——只有
   // 這種情境非 null（見 api/types.ts PipelineRunDetailResponse 註解）。
   const stagesUnavailableReason = data?.stagesUnavailableReason ?? null
+  // task 2（2026-09-04）：階段檢核表拿到了，但「目前正在跑哪一步」這個即時
+  // 細節探測失敗（worker 連不上/逾時）——fail-closed，不會有任何一列顯示成
+  // running，這裡另外提示原因，不要讓使用者誤以為 pipeline 卡住或已結束。
+  const liveProgressUnavailableReason = data?.liveProgressUnavailableReason ?? null
 
   const stageColumns: Column<BugStage>[] = [
     {
@@ -194,6 +198,11 @@ export function PipelineDetailView({ runKey }: { runKey: string }) {
                   rowClassName={s => (s.status === 'running' ? 'stage-running' : undefined)}
                   emptyText=""
                 />
+                {liveProgressUnavailableReason && (
+                  <div className="err" style={{ marginTop: 8 }}>
+                    {liveProgressUnavailableReason}
+                  </div>
+                )}
                 {r?.running && (
                   <div className="mute" style={{ marginTop: 8 }}>
                     run 執行中：本表只反映各階段產物「檔案落地」的狀態，標不出此刻正在跑哪一步——Step

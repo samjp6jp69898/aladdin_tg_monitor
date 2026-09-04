@@ -199,9 +199,16 @@ export function PipelinesListView({ resource }: { resource: Resource<PipelinesRe
         if (row.kind === 'remote') return '在 worker 本機'
         const r = row.data
         // 互動點 5：stdout / stderr / 進度 log 連結
-        const openLog = (path: string | null) => (e: MouseEvent) => {
+        // task 1（2026-09-04）：worker 執行的 history 列（r.host 是該 worker
+        // 名稱）要帶著 host 一起跳轉，LogsPage 才知道要向哪個 worker proxy。
+        // 只用在逐票 stdout/stderr——worker 端 `GET /files` 的白名單刻意只開放
+        // 這兩種副檔名（見 telegram-dispatcher/lib/pipeline-runner/
+        // local-trace-read.ts），共用的 demand-pipeline.log 不在其中，該連結
+        // 維持原本只讀本機的行為，不帶 host（帶了 worker 端會 403）。
+        const host = r.host && r.host !== 'head' && r.host !== 'unknown_pre_migration' ? r.host : undefined
+        const openLog = (path: string | null, h?: string) => (e: MouseEvent) => {
           e.preventDefault()
-          if (path) navigate(logsPath(path))
+          if (path) navigate(logsPath(path, h))
         }
         if (r.kind === 'demand') {
           return (
@@ -216,11 +223,11 @@ export function PipelinesListView({ resource }: { resource: Resource<PipelinesRe
         }
         return (
           <>
-            <a href={logsPath(r.stdout_path ?? undefined)} onClick={openLog(r.stdout_path)}>
+            <a href={logsPath(r.stdout_path ?? undefined, host)} onClick={openLog(r.stdout_path, host)}>
               stdout
             </a>
             {' · '}
-            <a href={logsPath(r.stderr_path ?? undefined)} onClick={openLog(r.stderr_path)}>
+            <a href={logsPath(r.stderr_path ?? undefined, host)} onClick={openLog(r.stderr_path, host)}>
               stderr
             </a>
           </>

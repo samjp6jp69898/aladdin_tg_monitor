@@ -38,10 +38,12 @@ import {
   removeWorker,
   fetchRemoteFile,
   fetchRemoteStageFiles,
+  fetchRemoteCurrentStage,
   retryRemoteDispatch,
   applyRemoteJobStatus,
   evaluateRemoteRetryBlock,
 } from './lib/cluster-state.ts'
+import { tailRemoteLogContent, sinceRemoteLogContent } from './lib/remote-log-slice.ts'
 import { RUNS_HOST } from './lib/mon-db.ts'
 import { listToolsmithRuns } from './lib/toolsmith.ts'
 import { attachAgentRuns } from './lib/agent-runs-summary.ts'
@@ -459,7 +461,22 @@ app.get('/api/cluster/worker', async c => {
   if (ticket && secret && /^(FAQ|ALDREQ)-\d+$/.test(ticket)) {
     ticketStatus = { ticket, status: await fetchWorkerJobStatus(worker.url, secret, ticket) }
   }
-  return c.json({ worker, online: health !== null, health, capacity, tickets: listDispatchEntries().filter(d => d.worker === name), ticketStatus })
+  // task 3（2026-09-04）：Workers 分頁「目前指派在這台的票」表格補上連到
+  // PipelineDetailView 的連結——DispatchEntry（head 記憶體登記表）本身沒有
+  // pipeline_runs.key，這裡比照 buildPipelineRunPayload 的 siblings 查法，用
+  // (kind, ticket) 反查最新一次 run 的 key。查不到（run 還沒落地/尚未被
+  // collector 撈到）就是 null，前端據此決定要不要顯示連結，不是錯誤。
+  const reader = getReader()
+  const tickets = await Promise.all(
+    listDispatchEntries()
+      .filter(d => d.worker === name)
+      .map(async d => {
+        const runs = (await reader.pipelineRunsByTicket(d.kind, d.ticket)) as any[]
+        const latest = runs.slice().sort((a, b) => (a.started_at < b.started_at ? 1 : -1))[0]
+        return { ...d, runKey: latest?.key ?? null }
+      }),
+  )
+  return c.json({ worker, online: health !== null, health, capacity, tickets, ticketStatus })
 })
 
 // 中斷／恢復／移除（只接受本機請求；server 本來就只綁 127.0.0.1）：實際動作
@@ -539,6 +556,12 @@ async function buildPipelineRunPayload(key: string) {
   // 不上時明確給一個理由，不要讓整段功能因為 worker 一時連不上就靜默顯示成
   // 「沒有任何產物」（那會誤導使用者以為 pipeline 什麼都還沒做）。
   let stagesUnavailableReason: string | null = null
+  // task 2：worker 執行中的票，「目前正在跑第幾輪/哪個 agent」的即時細節——跟
+  // stagesUnavailableReason 是兩件事：後者代表整份階段檢核表都拿不到（worker
+  // 連不上，連已完成階段的 mtime 都沒有），這個代表「檢核表拿到了，但無法確認
+  // 此刻正在跑哪一步」（worker 的 current-stage 探測逾時/連不上），fail-closed
+  // 不顯示假的 running 細節，只顯示這句提示。
+  let liveProgressUnavailableReason: string | null = null
   if (run.kind === 'bug' && (me.running || (!ticketHasRunningProc && latest.key === me.key))) {
     if (me.host && me.host !== RUNS_HOST) {
       const secret = getClusterSecret()
@@ -548,7 +571,11 @@ async function buildPipelineRunPayload(key: string) {
       } else {
         const remoteFiles = await fetchRemoteStageFiles(worker.url, secret, run.ticket)
         if (remoteFiles) {
-          stages = computeBugStages(run.ticket, run.started_at, await readTrackerStatusAsync(run.ticket), me.running, remoteFiles)
+          const remoteCurrentStage = me.running ? await fetchRemoteCurrentStage(worker.url, secret, run.ticket, run.started_at) : undefined
+          if (remoteCurrentStage && !remoteCurrentStage.ok) {
+            liveProgressUnavailableReason = `此票執行於 worker「${me.host}」，但目前無法確認正在跑哪一步（worker 連不上或逾時），下方檢核表只反映已完成的階段`
+          }
+          stages = computeBugStages(run.ticket, run.started_at, await readTrackerStatusAsync(run.ticket), me.running, remoteFiles, remoteCurrentStage)
         } else {
           stagesUnavailableReason = `此票執行於 worker「${me.host}」，但目前連不上該 worker 或逾時，暫時無法取得階段進度，請稍後重試`
         }
@@ -574,7 +601,7 @@ async function buildPipelineRunPayload(key: string) {
       else if (s.key === 'final-review' && finalReviewRounds > 0) s.rounds = finalReviewRounds
     }
   }
-  return { run: me, progress, stages, stagesUnavailableReason }
+  return { run: me, progress, stages, stagesUnavailableReason, liveProgressUnavailableReason }
 }
 
 app.get('/api/pipelines/run', async c => {
@@ -1084,9 +1111,29 @@ function tailFile(path: string, maxBytes: number): { text: string; size: number 
   }
 }
 
-app.get('/api/log/tail', c => {
+// worker 執行的票，log 屬於 host-aware（task 1，2026-09-04）：查不到 worker
+// 位址/secret 未設定/worker 連不上或逾時都回 502 + 明確理由（fail-closed，
+// 比照 /api/agent-trace 的同款分流），不靜默回空內容或本機的舊快取當成即時
+// 資料。`missing` 這個 reason 例外——那不是失敗，是「worker 上這個路徑確實
+// 不存在」，跟本機 `!existsSync(path)` 同一種正常狀態，直接比照本機分支的
+// 回應形狀（`{ text: '', size: 0, missing: true }` / `{ text: '', offset: 0,
+// missing: true }`），不當錯誤處理。
+app.get('/api/log/tail', async c => {
   const path = c.req.query('path') ?? ''
+  const host = c.req.query('host') ?? ''
   if (!isAllowedLogPath(path)) return c.text('path not allowed', 403)
+  if (host && host !== RUNS_HOST) {
+    const secret = getClusterSecret()
+    const worker = secret ? findWorkerByName(host) : null
+    if (!worker || !secret) return c.json({ error: `此 log 屬於 worker「${host}」，但目前查不到該 worker 的位址或 CLUSTER_SHARED_SECRET 未設定` }, 502)
+    const remote = await fetchRemoteFile(worker.url, secret, path)
+    if (!remote.ok) {
+      if (remote.reason === 'missing') return c.json({ text: '', size: 0, missing: true })
+      return c.json({ error: `worker「${host}」暫時無法取得 log 內容：${remote.reason}` }, 502)
+    }
+    const kb = Math.min(Number(c.req.query('kb') ?? 64), 2048)
+    return c.json(tailRemoteLogContent(remote.content, kb * 1024))
+  }
   if (!existsSync(path)) return c.json({ text: '', size: 0, missing: true })
   const kb = Math.min(Number(c.req.query('kb') ?? 64), 2048)
   return c.json(tailFile(path, kb * 1024))
@@ -1097,9 +1144,29 @@ app.get('/api/log/tail', c => {
 // repro（多條 SSE 連線硬斷 + cancel callback）實測已修復，SSE 不再是禁區——
 // 但「handler 內同步 spawn 遇斷線 segfault」是另一個踩坑（見 lib/ingest.ts
 // 檔頭），未隨之解除，SSE handler 內仍禁 *Sync spawn。
-app.get('/api/log/since', c => {
+//
+// task 1（2026-09-04）：worker 執行的票，`GET /files` 沒有「從 offset 起讀」
+// 的能力（見 lib/remote-log-slice.ts 檔頭）——host-aware 分支改成每次都把整份
+// 內容從 worker 抓回來，在記憶體裡做跟本機分支相同的 offset 切片
+// （sinceRemoteLogContent()，含同樣的 2MB 單次上限與截斷/輪替重置語意），
+// 1500ms 輪詢一次、pipeline log 檔案量級不大，這是風險最低的做法（不需要在
+// worker 端新增有狀態的 offset 協定）。
+app.get('/api/log/since', async c => {
   const path = c.req.query('path') ?? ''
+  const host = c.req.query('host') ?? ''
   if (!isAllowedLogPath(path)) return c.text('path not allowed', 403)
+  if (host && host !== RUNS_HOST) {
+    const secret = getClusterSecret()
+    const worker = secret ? findWorkerByName(host) : null
+    if (!worker || !secret) return c.json({ error: `此 log 屬於 worker「${host}」，但目前查不到該 worker 的位址或 CLUSTER_SHARED_SECRET 未設定` }, 502)
+    const remote = await fetchRemoteFile(worker.url, secret, path)
+    if (!remote.ok) {
+      if (remote.reason === 'missing') return c.json({ text: '', offset: 0, missing: true })
+      return c.json({ error: `worker「${host}」暫時無法取得 log 內容：${remote.reason}` }, 502)
+    }
+    const offset = Number(c.req.query('offset') ?? 0)
+    return c.json(sinceRemoteLogContent(remote.content, offset))
+  }
   if (!existsSync(path)) return c.json({ text: '', offset: 0, missing: true })
   let offset = Number(c.req.query('offset') ?? 0)
   const size = statSync(path).size

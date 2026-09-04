@@ -22,6 +22,9 @@ export interface UseLogFollowOptions {
   kb?: number
   /** 是否開啟即時跟隨。 */
   follow: boolean
+  /** task 1（2026-09-04）：這個 log 屬於哪台機器（worker 名稱）——省略或等於
+   * 本機 host 就是原本的本機讀取行為，見 endpoints.ts fetchLogTail() 註解。 */
+  host?: string
 }
 
 export interface LogFollowState {
@@ -45,7 +48,7 @@ export interface LogFollowState {
   loadId: number
 }
 
-export function useLogFollow({ path, kb, follow }: UseLogFollowOptions): LogFollowState {
+export function useLogFollow({ path, kb, follow, host }: UseLogFollowOptions): LogFollowState {
   const [text, setText] = useState('')
   const [offset, setOffset] = useState(0)
   const [missing, setMissing] = useState(false)
@@ -81,7 +84,7 @@ export function useLogFollow({ path, kb, follow }: UseLogFollowOptions): LogFoll
 
     const ctrl = new AbortController()
     setLoading(true)
-    fetchLogTail(path, kb, ctrl.signal)
+    fetchLogTail(path, kb, host, ctrl.signal)
       .then(res => {
         if (ctrl.signal.aborted) return
         setText(res.text)
@@ -103,7 +106,8 @@ export function useLogFollow({ path, kb, follow }: UseLogFollowOptions): LogFoll
     return () => ctrl.abort()
     // `follow` 故意列進依賴：對應舊版 `$('#lg-follow').onchange = loadLog`，切換「即時跟隨」
     // 要重新整個流程（重打 tail、重設 offset），不只是啟停階段 2 的訂閱。
-  }, [path, kb, epoch, follow])
+    // `host`（task 1）：換一個屬於不同機器的同名/不同 path 檔案時也要重打 tail。
+  }, [path, kb, epoch, follow, host])
 
   // 階段 2：即時跟隨（1500ms 專屬迴圈，與全域 5 秒心跳無關）
   useEffect(() => {
@@ -114,7 +118,7 @@ export function useLogFollow({ path, kb, follow }: UseLogFollowOptions): LogFoll
         key: 'log',
         streamable: true,
         intervalMs: LOG_FOLLOW_INTERVAL_MS,
-        fetch: (_: void, signal: AbortSignal) => fetchLogSince(path, offsetRef.current, signal),
+        fetch: (_: void, signal: AbortSignal) => fetchLogSince(path, offsetRef.current, host, signal),
       },
       undefined,
       res => {
@@ -129,7 +133,7 @@ export function useLogFollow({ path, kb, follow }: UseLogFollowOptions): LogFoll
       () => {},
     )
     return () => sub.unsubscribe()
-  }, [path, follow, missing, epoch])
+  }, [path, follow, missing, epoch, host])
 
   return { text, offset, missing, size, loading, error, reload, loadId }
 }
