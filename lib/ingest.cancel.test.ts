@@ -11,8 +11,11 @@
 // 完整覆蓋（純函式、假 pool，不依賴 cachedRunning 這個私有狀態）；本檔只驗證
 // cancelPipeline 本身的「契約」沒有因為 async 化而跑掉。
 import './test-tmp-db.ts' // 必須排在 ./ingest.ts 之前：把 sqlite 導向暫存檔（NB-7）
-import { describe, expect, test } from 'bun:test'
-import { cancelPipeline } from './ingest.ts'
+import { describe, expect, test, afterEach } from 'bun:test'
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { cancelPipeline, deriveCancelFlagFields } from './ingest.ts'
 
 describe('cancelPipeline — async 化後的契約（plan-db-as-truth-v3.2.md §6.4(2) 修訂）', () => {
   test('回傳的是一個 Promise（呼叫端必須 await，見 server.ts 的呼叫點）', () => {
@@ -35,5 +38,60 @@ describe('cancelPipeline — async 化後的契約（plan-db-as-truth-v3.2.md §
     const r = await cancelPipeline('demand', 'FAQ-888888')
     expect(r.ok).toBe(false)
     expect(r.killed).toEqual([])
+  })
+})
+
+// 2026-09-04：W4b 六欄修復（impl-errata-g2.md 對應項）——負面測試，退回舊碼
+// （只填 runId/ticket/kind/cancelRequestedAt/resolvedBy/legacyKey 六欄）會打紅，
+// 因為下面每一項都斷言六個新欄位真的有值，不是 undefined。
+describe('deriveCancelFlagFields（W4b 六欄推導，純函式）', () => {
+  let dir: string
+  afterEach(() => { if (dir) rmSync(dir, { recursive: true, force: true }) })
+
+  test('bug kind + 合法 legacyKey + 無 triggered-by sidecar → 六欄有值，triggerSource=cli', () => {
+    dir = mkdtempSync(join(tmpdir(), 'ingest-cancel-'))
+    const extra = '/Users/user/aladdin/telegram-dispatcher/logs/FAQ-1234.2026-09-04T10-00-00-000Z.stdout.log'
+    const legacyKey = 'FAQ-1234.2026-09-04T10-00-00-000Z'
+    const r = deriveCancelFlagFields('bug', extra, legacyKey, dir)
+    expect(r.stdoutPath).toBe(extra)
+    expect(r.stderrPath).toBe('/Users/user/aladdin/telegram-dispatcher/logs/FAQ-1234.2026-09-04T10-00-00-000Z.stderr.log')
+    expect(r.startedAt).toBe('2026-09-04T10:00:00.000Z')
+    expect(r.triggerSource).toBe('cli')
+    expect(r.triggeredByEmail).toBeNull()
+    expect(r.triggeredByName).toBeNull()
+  })
+
+  test('bug kind + 有 triggered-by sidecar → triggerSource=telegram，email/name 真的填進來', () => {
+    dir = mkdtempSync(join(tmpdir(), 'ingest-cancel-'))
+    const legacyKey = 'FAQ-5678.2026-09-04T11-30-00-000Z'
+    writeFileSync(
+      join(dir, `${legacyKey}.triggered-by.json`),
+      JSON.stringify({ name: '測試人員', email: 'tester@example.com', at: '2026-09-04T11:30:00.000Z' }),
+    )
+    const extra = `/Users/user/aladdin/telegram-dispatcher/logs/${legacyKey}.stdout.log`
+    const r = deriveCancelFlagFields('bug', extra, legacyKey, dir)
+    expect(r.triggerSource).toBe('telegram')
+    expect(r.triggeredByEmail).toBe('tester@example.com')
+    expect(r.triggeredByName).toBe('測試人員')
+  })
+
+  test('demand kind：extra 是 assigneeEmail 不是路徑，legacyKey 已由呼叫端 deriveLegacyKey 判為 null → 六欄全 null/cli，不誤把 email 塞進 stdout_path', () => {
+    dir = mkdtempSync(join(tmpdir(), 'ingest-cancel-'))
+    const r = deriveCancelFlagFields('demand', 'someone@example.com', null, dir)
+    expect(r.stdoutPath).toBeNull()
+    expect(r.stderrPath).toBeNull()
+    expect(r.startedAt).toBeNull()
+    expect(r.triggerSource).toBe('cli')
+    expect(r.triggeredByEmail).toBeNull()
+    expect(r.triggeredByName).toBeNull()
+  })
+
+  test('bug kind 但 legacyKey 為 null（deriveLegacyKey 判定格式不合法）→ 不信任 extra，六欄全 null/cli', () => {
+    dir = mkdtempSync(join(tmpdir(), 'ingest-cancel-'))
+    const r = deriveCancelFlagFields('bug', '/some/unexpected/path.log', null, dir)
+    expect(r.stdoutPath).toBeNull()
+    expect(r.stderrPath).toBeNull()
+    expect(r.startedAt).toBeNull()
+    expect(r.triggerSource).toBe('cli')
   })
 })

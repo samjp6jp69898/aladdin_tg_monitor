@@ -95,20 +95,71 @@ const DEMAND_RE = /^([A-Z]+-\d+)\.(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z)\.
  * pipeline.ts 寫入處）——只在 Telegram 認領觸發時存在，人工終端機跑
  * /create-mr、自動重試、tg-monitor 手動重試按鈕都不會有這份檔案，回傳 null
  * 是預期情況、不是錯誤。
+ * 2026-09-04：抽出 readTriggeredByRecord 承載完整 {name, email}，本函式改
+ * 為薄封裝，行為對既有呼叫端（scanPipelineRuns）逐位元組不變——cancelPipeline
+ * 的 W4b 六欄修復需要 email，不重寫一份讀檔邏輯。
  */
-function readTriggeredBy(key: string): string | null {
+function readTriggeredByRecord(key: string, logDir: string = DISPATCHER_LOG_DIR): { name: string | null; email: string | null } | null {
   try {
-    const raw = readFileSync(join(DISPATCHER_LOG_DIR, `${key}.triggered-by.json`), 'utf8')
-    const parsed = JSON.parse(raw) as { name?: string }
-    return parsed.name || null
+    const raw = readFileSync(join(logDir, `${key}.triggered-by.json`), 'utf8')
+    const parsed = JSON.parse(raw) as { name?: string; email?: string }
+    return { name: parsed.name ?? null, email: parsed.email ?? null }
   } catch {
     return null
   }
 }
 
+function readTriggeredBy(key: string): string | null {
+  return readTriggeredByRecord(key)?.name || null
+}
+
 function fileTsToIso(t: string): string {
   // 2026-08-21T01-23-16-901Z → 2026-08-21T01:23:16.901Z
   return t.replace(/T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z$/, 'T$1:$2:$3.$4Z')
+}
+
+/**
+ * 2026-09-04：cancelPipeline() 的 W4b 六欄修復（見 impl-errata-g2.md 對應項）
+ * ——抽成純函式方便單測，因為 cachedRunning 是私有狀態，只有真的呼叫
+ * scanRunningPipelineProcs()（真 ps）才會填入，ingest.cancel.test.ts 因此測
+ * 不到 isMonitorDbEnabled() 分支內的邏輯。
+ *
+ * extra 只有 kind==='bug' 時才是 stdout log 絕對路徑——demand 的 extra 是
+ * assigneeEmail（見 scanRunningPipelineProcs 的 ps 正則、spawn-demand-
+ * pipeline.ts 的 spawnDetachedProcess 呼叫第三個位置參數），deriveLegacyKey
+ * 對這個輸入本來就回 null，以下欄位因此對 demand 維持既有的全 null 降級，
+ * 不是本次修復新引入的缺口，也不會把 assigneeEmail 誤寫進 stdout_path。
+ */
+export function deriveCancelFlagFields(
+  kind: 'bug' | 'demand',
+  extra: string,
+  legacyKey: string | null,
+  logDir: string = DISPATCHER_LOG_DIR,
+): {
+  stdoutPath: string | null
+  stderrPath: string | null
+  startedAt: string | null
+  triggerSource: 'telegram' | 'cli'
+  triggeredByEmail: string | null
+  triggeredByName: string | null
+} {
+  const stdoutPath = kind === 'bug' && legacyKey ? extra : null
+  const stderrPath = stdoutPath ? stdoutPath.replace(/\.stdout\.log$/, '.stderr.log') : null
+  let startedAt: string | null = null
+  if (stdoutPath) {
+    const m = BUG_RE.exec(stdoutPath.split('/').pop() ?? '')
+    if (m) startedAt = fileTsToIso(m[2])
+  }
+  // 比照 spawn-create-mr.ts:434 的既有慣例：有 sidecar ⇒ 'telegram'，沒有 ⇒ 'cli'。
+  const triggeredByRecord = legacyKey ? readTriggeredByRecord(legacyKey, logDir) : null
+  return {
+    stdoutPath,
+    stderrPath,
+    startedAt,
+    triggerSource: triggeredByRecord ? 'telegram' : 'cli',
+    triggeredByEmail: triggeredByRecord?.email ?? null,
+    triggeredByName: triggeredByRecord?.name ?? null,
+  }
 }
 
 export type RunningProc = { pid: number; etime: string; kind: 'bug' | 'demand'; ticket: string; extra: string }
@@ -214,6 +265,11 @@ export async function cancelPipeline(kind: 'bug' | 'demand', ticket: string): Pr
     const legacyKey = deriveLegacyKey(target.extra)
     const cancelRequestedAt = new Date().toISOString()
 
+    // 2026-09-04（W4b 六欄真正接上，見 impl-errata-g2.md 對應項）：邏輯抽成
+    // deriveCancelFlagFields（純函式，見上方定義與單測）。
+    const { stdoutPath, stderrPath, startedAt, triggerSource, triggeredByEmail, triggeredByName } =
+      deriveCancelFlagFields(kind, target.extra, legacyKey)
+
     // 步驟 4：單一 1000ms 預算涵蓋「解析 run_id ＋ 寫旗標」整段
     // （【G:MJ-G1】：mysql2 對已建立但對端卡死的連線沒有 per-query 逾時，
     // connectTimeout 管不到，必須整段用 Promise.race 包住）。
@@ -234,6 +290,12 @@ export async function cancelPipeline(kind: 'bug' | 'demand', ticket: string): Pr
         cancelRequestedAt,
         resolvedBy: resolved.resolvedBy,
         legacyKey,
+        stdoutPath,
+        stderrPath,
+        startedAt,
+        triggerSource,
+        triggeredByEmail,
+        triggeredByName,
       })
       return { runId: resolved.runId, resolvedBy: resolved.resolvedBy, ok: write.ok }
     })()
