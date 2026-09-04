@@ -15,7 +15,7 @@
  *   「累加」路徑，用 `before_id` 向舊資料翻頁，不影響上面的輪詢查詢與其參數。
  * - 本頁刻意不用 `ago()`、刻意沒有「無資料」文案（規格 §5）。
  */
-import { useEffect, useState, type KeyboardEvent } from 'react'
+import { useEffect, useRef, useState, type KeyboardEvent } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { fetchEvents } from '../api/endpoints'
 import { topics } from '../api/topics'
@@ -59,6 +59,11 @@ export function EventsPage() {
   const [queryParams, setQueryParams] = useState<EventsParams>(() =>
     toParams({ service, identity, q, errorsOnly, toolOnly }),
   )
+  // 「最新值」ref（比照 hooks/useResource.ts 同一慣例），供 loadMore 判斷回應
+  // 是不是「發起請求當下」那組條件——輪詢或篩選條件變動與 loadMore 交錯時
+  // （Reviewer B MINOR-7），據此丟棄過期回應，不靠時序假設。
+  const queryParamsRef = useRef(queryParams)
+  queryParamsRef.current = queryParams
 
   // events / sessions 的服務下拉來自 /api/overview 的 services（契約 §6.3），只列 hasAudit===true。
   const overview = useResource(topics.overview, undefined)
@@ -130,12 +135,24 @@ export function EventsPage() {
       // 只走 cursor 會在新前端＋舊後端的組合下讓「載入更早」直接失效。
       const usingCursor = cursor != null
       if (!usingCursor && oldestId == null) return null
+      // Reviewer B MINOR-7：輪詢（5 秒整批取代）與「載入更早」（累加）互相獨立發起，
+      // 交錯時舊回應可能在條件已變動（輪詢换頁或使用者改了篩選條件）後才回來。
+      // 用「發起請求當下」的條件序列化字串當快照，回應到達時與當下最新值比對，
+      // 不同就整包丟棄（不 setRows/setCursor/setOldestId）——由值比對而非時序保證正確，
+      // 不是「用等待解決正確性問題」。
+      const requestParamsKey = JSON.stringify(queryParamsRef.current)
       const resp = await fetchEvents(
         usingCursor
           ? { ...queryParams, cursor: cursor!, limit: 200 }
           : { ...queryParams, before_id: oldestId!, limit: 200 },
       )
-      setRows(prev => [...prev, ...resp.rows])
+      if (JSON.stringify(queryParamsRef.current) !== requestParamsKey) return resp
+      // 即使條件沒變，輪詢仍可能在這次請求飛行期間整批取代過 rows——用 id 去重
+      // 而非直接 append，避免 DataTable 的 rowKey（r.id）撞鍵。
+      setRows(prev => {
+        const seen = new Set(prev.map(r => r.id))
+        return [...prev, ...resp.rows.filter(r => !seen.has(r.id))]
+      })
       if (resp.next_cursor !== undefined) {
         // 新後端：null 代表沒有更早的資料了，據此關掉按鈕並顯示已到底。
         setCursor(resp.next_cursor)
