@@ -255,23 +255,32 @@ export function resolveRunIdLocalOnly(kind: RunKind, marker: MarkerSnapshot): Lo
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// legacy_key（ps 反推側）：格式 `<ticket>.<ISO>`（v3 §10.2），與 spawn 端由
-// stdoutPath 算出的那份必須逐位元組相同——兩者共同輸入是同一個 stdout log
-// 檔名，本函式從檔名反推。
+// legacy_key（ps 反推側）：格式 `<ticket>.<ISO-with-dashes>`（v3 §10.2），與
+// spawn 端由 stdoutPath 算出的那份必須逐位元組相同——兩者共同輸入是同一個
+// stdout log 檔名，本函式從檔名反推。
+//
+// 2026-09-04 修正（Phase 9 單軌自洽性設計稿調查發現，見
+// monitor-db-project-docs/phase9-single-track-design-62.md §2.4）：舊版把時間
+// 戳轉成**真 ISO（冒號）**、demand 的 `.demand-pipeline` 後綴也被吃掉，與寫入端
+// 的**破折號 token**格式不符，導致本函式產出的字串從未與 `legacy_key` 欄位裡
+// 的真實值相同過——上面這段註解宣稱的「逐位元組相同」實際上不成立，兩處消費端
+// （cancel 的 `R3_LEGACY_KEY_SQL`、rounds 的 `ROUNDS_RESOLVE_SQL`）的
+// `legacy_key = ?` 分支因此恆不命中，只靠 `stdout_path` 分支存活（功能上未出過事，
+// 因為那條分支本身就足夠唯一命中；但這是一條看起來在工作、實際是死碼的
+// 防線）。**改法**：不重新拼字串，直接剝掉副檔名——與寫入端
+// `spawn-create-mr.ts` 鑄出 `stdoutPath` 用的是**同一個 `base`**互為可逆運算
+// （`telegram-dispatcher/lib/pipeline-runner/post-run-notify.ts` 的
+// `deriveLegacyKeyFromStdoutPath` 已經是這個寫法，這裡改成同一套，不是新發明）。
+// `STDOUT_LOG_RE` 保留作為格式驗證閘門，不參與重建字串。
 // ─────────────────────────────────────────────────────────────────────────
 
-const STDOUT_LOG_RE = /^([A-Z]+-\d+)\.(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z)\.(?:demand-pipeline\.)?stdout\.log$/
-
-function fileTsToIso(t: string): string {
-  return t.replace(/T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z$/, 'T$1:$2:$3.$4Z')
-}
+const STDOUT_LOG_RE = /^[A-Z]+-\d+\.\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z\.(?:demand-pipeline\.)?stdout\.log$/
 
 /** 由 wrapper 的 stdout log 絕對路徑反推 legacy_key；反推失敗回 null（往下一段降級，非硬錯誤）。 */
 export function deriveLegacyKey(stdoutPath: string): string | null {
   const base = stdoutPath.split('/').pop() ?? ''
-  const m = STDOUT_LOG_RE.exec(base)
-  if (!m) return null
-  return `${m[1]}.${fileTsToIso(m[2]!)}`
+  if (!STDOUT_LOG_RE.test(base)) return null
+  return base.replace(/\.stdout\.log$/, '')
 }
 
 // ─────────────────────────────────────────────────────────────────────────

@@ -163,18 +163,27 @@ describe('resolveRunId（tg-monitor 端複製品）— 與 telegram-dispatcher �
 // ---------- deriveLegacyKey ----------
 
 describe('deriveLegacyKey', () => {
-  test('由 bug pipeline 的 stdout log 絕對路徑反推 <ticket>.<ISO>', () => {
+  // 2026-09-04 修正：格式必須與寫入端（spawn-create-mr.ts 鑄出 stdoutPath 用的
+  // 同一個 base）逐位元組相同——破折號 token，不轉真 ISO；demand 的
+  // `.demand-pipeline` 後綴保留，不吃掉。見函式上方的完整修正說明。
+  test('由 bug pipeline 的 stdout log 絕對路徑反推 <ticket>.<破折號 token>', () => {
     const key = deriveLegacyKey('/Users/user/aladdin/telegram-dispatcher/logs/FAQ-1234.2026-09-02T10-00-00-000Z.stdout.log')
-    expect(key).toBe('FAQ-1234.2026-09-02T10:00:00.000Z')
+    expect(key).toBe('FAQ-1234.2026-09-02T10-00-00-000Z')
   })
 
-  test('demand pipeline 的檔名格式也能反推', () => {
+  test('demand pipeline 的檔名格式也能反推，且 .demand-pipeline 後綴保留', () => {
     const key = deriveLegacyKey('/Users/user/aladdin/telegram-dispatcher/logs/FAQ-5678.2026-09-02T11-30-00-000Z.demand-pipeline.stdout.log')
-    expect(key).toBe('FAQ-5678.2026-09-02T11:30:00.000Z')
+    expect(key).toBe('FAQ-5678.2026-09-02T11-30-00-000Z.demand-pipeline')
   })
 
   test('格式對不上 → null（呼叫端降級到下一段，不是硬錯誤）', () => {
     expect(deriveLegacyKey('/some/random/path.log')).toBeNull()
+  })
+
+  test('與寫入端鑄法（spawn-create-mr.ts 的 base）互為可逆運算：同一個 base 反推得回原值', () => {
+    // spawn-create-mr.ts 的 base = `${ticket}.${timestamp}`，stdoutPath = `${base}.stdout.log`
+    const base = 'FAQ-9999.2026-09-04T12-00-00-000Z'
+    expect(deriveLegacyKey(`/any/dir/${base}.stdout.log`)).toBe(base)
   })
 })
 
