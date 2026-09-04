@@ -485,9 +485,23 @@ function warnDuplicateKeys(rows: any[], keyFn: (r: any) => string, label: string
   }
 }
 
+// C 組／D 組整段包 try/catch（Reviewer B MINOR-4b）：C1 先讀 sqlite 再讀
+// mysql、之後每一格都對 mysql 下 FULL 查詢，`READ_QUERY_TIMEOUT_MS=5000`
+// （mysql.ts）一到就 throw。這些都是頂層 await，原本沒有 try/catch 接住，
+// 逾時或其他例外會變成 unhandled rejection、exit 1 但沒有「結論」列——
+// 總指揮看到的是 stack trace，不是判準結果。catch 到之後印出結構化的
+// [FAIL] 並繼續往下跑到「結論」區塊，不讓例外裸露。
+try {
+
 // C1 events：全量內容必須完全一致（`id` 是各自獨立的 AUTOINCREMENT，不比）
+//
+// 加 `to: iso(now)` 上界（Reviewer B MINOR-4a）：sqlite 與 mysql 是先後兩次
+// 獨立查詢，中間若有 live ingest 寫入新事件，會被其中一軌看到、另一軌看不到，
+// 誤判成 onlyA/onlyB > 0。`now` 在兩次查詢之前就已經取好（:431），把它當上界
+// 讓兩次查詢共用同一個「當下」快照，中間才寫入的事件（ts 必然晚於 now）不會
+// 進入任一邊的結果，兩邊比較的就是同一個時間切片。
 {
-  const f = { errorsOnly: false, toolOnly: false, limit: FULL } as any
+  const f = { errorsOnly: false, toolOnly: false, limit: FULL, to: iso(now) } as any
   const [a, b] = [await sqliteReader.queryEvents(f), await mysqlReader.queryEvents(f)]
   const r = setEqual(a, b, ['id'])
   judge(r.equal, 'C1 events 全量內容一致', `sqlite=${a.length} mysql=${b.length} 只在 sqlite=${r.onlyA} 只在 mysql=${r.onlyB}`)
@@ -802,6 +816,14 @@ console.log('\n═══ D. 寫入端已知缺口（切過去之後畫面上真�
       judge(r.ok, `D ${g.field} 寫入端已接`, `${r.detail}｜負責：${g.owner}｜${g.note}`)
     }
   }
+}
+
+} catch (e) {
+  // C/D 組任何一格中途拋出例外（最典型：mysql 側 FULL 查詢撞
+  // READ_QUERY_TIMEOUT_MS 逾時 throw）—— 印出結構化的 [FAIL]（含原始錯誤
+  // 訊息），不讓例外裸露成 unhandled rejection；已經跑過的格子計數保留，
+  // 往下仍會印出「結論」列（Reviewer B MINOR-4b）。
+  fail('C/D 組完整跑完（沒有中途拋出例外）', e instanceof Error ? `${e.name}: ${e.message}` : String(e))
 }
 
 // ═════════════════════ 結論 ═════════════════════
