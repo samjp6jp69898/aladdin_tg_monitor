@@ -118,6 +118,44 @@ export async function fetchWorkerJobStatus(url: string, secret: string, ticket: 
   }
 }
 
+/** worker-agent.ts 的 `POST /jobs/:ticket/cancel` 回應形狀（見
+ * telegram-dispatcher/lib/pipeline-runner/local-cancel.ts 的
+ * `CancelLocalPipelineResult`）——與本機 `cancelPipeline()`
+ * （lib/ingest.ts）的 `CancelPipelineResult` 同形，`/api/pipelines/cancel`
+ * 轉發時可以直接把回應原樣往前端送，不用另外轉譯。 */
+export type RemoteCancelResult = {
+  ok: boolean
+  killed: number[]
+  wrapperPid?: number
+  reason?: string
+  runId?: string
+  runIdResolvedBy?: string
+  flagWritten?: boolean
+}
+
+/**
+ * 轉發取消請求給 worker（任務 3，2026-09-04）：本機 `ps` 快照查不到這張票時
+ * （`server.ts` 的 `/api/pipelines/cancel` 先查本機，查不到才會呼叫這支），
+ * 改打 worker-agent.ts 新增的 `POST /jobs/:ticket/cancel`。打不通/逾時一律回
+ * `{ok:false}`，不重試——使用者按取消按鈕時逾時，重按一次即可，沒有雙跑風險
+ * （取消不像派工，兩台各自嘗試取消同一張票是安全的，被砍過一次的 wrapper
+ * 再收到一次 SIGTERM 沒有副作用）。
+ */
+export async function cancelRemoteJob(url: string, secret: string, ticket: string, timeoutMs = 8_000): Promise<RemoteCancelResult> {
+  try {
+    const res = await fetch(`${url}/jobs/${encodeURIComponent(ticket)}/cancel`, {
+      method: 'POST',
+      headers: { [CLUSTER_TOKEN_HEADER]: secret },
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+    const body = (await res.json().catch(() => null)) as RemoteCancelResult | null
+    if (!body || typeof body.ok !== 'boolean') return { ok: false, killed: [], reason: `worker 回應格式不對（HTTP ${res.status}）` }
+    return body
+  } catch {
+    return { ok: false, killed: [], reason: 'worker 連不上或逾時未回應' }
+  }
+}
+
 // ---------- worker 名冊管理（中斷／恢復／移除，2026-08-31）----------
 // 這三個動作實際上是打「head 自己」（telegram-dispatcher server.ts，本機
 // 8787）新增的 /cluster/worker/:name/* 端點——head 的 worker 名冊活在它

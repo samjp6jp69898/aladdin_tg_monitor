@@ -222,6 +222,18 @@ export function PipelinesListView({ resource }: { resource: Resource<PipelinesRe
       key: 'actions',
       header: '',
       render: row => {
+        // 互動點 6 延伸（任務 3，2026-09-04）：worker 執行中的列（row.kind ===
+        // 'remote'）原本刻意不顯示取消按鈕——後端當時查不到本機行程只能直接
+        // 回「not running」。現在 /api/pipelines/cancel 本機查不到時會改查
+        // dispatch_attempts/登記表並轉發給對應的 worker（見 server.ts
+        // findRemoteWorkerForTicket），所以這裡改成一樣可以按取消。
+        if (row.kind === 'remote') {
+          return (
+            <Button variant="danger" disabled={cancelAction.pending} onClick={() => handleCancel(row.data.kind, row.data.ticket)}>
+              取消
+            </Button>
+          )
+        }
         if (row.kind !== 'history') return null
         const r = row.data
         if (r.running) {

@@ -571,6 +571,53 @@ export async function readAllStatusLogForGate(): Promise<{ service: string; id: 
   }))
 }
 
+/**
+ * 派工中／已派工但尚未終結的 `dispatch_attempts` 列（`status_rank < 100`）。
+ *
+ * 任務 1（2026-09-04）：修掉 pipelines 列表「worker 執行中時同一張票出現兩筆」
+ * ——舊版 `remote` 陣列讀的是 head 行程記憶體裡的登記表
+ * （telegram-dispatcher/lib/cluster/dispatch-registry.ts `listDispatchEntries()`），
+ * 那份表只在「進行中」期間存在，跟 `runs` 表撈出的 `rows`（worker 一開始執行
+ * 就會寫入）是兩個互不知情的資料源，worker 執行期間兩邊各有一筆、沒有去重。
+ * `dispatch_attempts` 是 head 唯一寫入的監控 DB 表（見 writes.ts 的
+ * createDispatchAttempt/advanceDispatchAttempt），本函式取代對記憶體登記表
+ * 的依賴——實際的去重規則在 `remote-dispatches.ts` 的 `dedupRemoteDispatches`
+ * （純函式，server.ts 呼叫）。
+ *
+ * `triggered_by_email` 是這張表唯一記錄發起人的欄位（沒有存 name，見
+ * telegram-dispatcher migrations 001 的 dispatch_attempts schema）——
+ * `triggeredBy.name` 只能退回 email 本身，好過完全空白。
+ */
+export async function readActiveDispatchAttempts(): Promise<
+  Array<{
+    ticket: string
+    kind: 'bug' | 'demand'
+    status: string
+    workerName: string | null
+    workerUrl: string | null
+    dispatchedAt: string
+    remoteRunId: string | null
+    triggeredByEmail: string | null
+  }>
+> {
+  const rows = await q<any[]>(
+    `SELECT ticket, kind, status, worker_name, worker_url, ${iso('dispatched_at')} AS dispatched_at, remote_run_id, triggered_by_email
+       FROM dispatch_attempts
+      WHERE status_rank < 100
+      ORDER BY dispatched_at DESC`,
+  )
+  return rows.map(r => ({
+    ticket: r.ticket as string,
+    kind: r.kind as 'bug' | 'demand',
+    status: r.status as string,
+    workerName: (r.worker_name ?? null) as string | null,
+    workerUrl: (r.worker_url ?? null) as string | null,
+    dispatchedAt: r.dispatched_at as string,
+    remoteRunId: (r.remote_run_id ?? null) as string | null,
+    triggeredByEmail: (r.triggered_by_email ?? null) as string | null,
+  }))
+}
+
 export const mysqlReader: MonitorReader = {
   source: 'mysql',
 

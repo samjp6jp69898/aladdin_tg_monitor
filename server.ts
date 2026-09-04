@@ -20,11 +20,12 @@ import { resolveNextStaticPath } from './lib/next-static-path.ts'
 // 從 types.ts 匯入，**不是** lib/read/mysql.ts——後者靜態 import 會讓 sqlite 模式
 // 也載入 mysql2，違反 lib/read/index.ts:42-44 的 lazy import 紀律（MAJOR-D1）。
 import { UnresolvableBeforeIdError } from './lib/read/types.ts'
+import { dedupRemoteDispatches, type RemoteDispatchCandidate } from './lib/read/remote-dispatches.ts'
 import { startCollectors, getLastProbes, listRunningPipelineProcs, listBugLocks, loadRoster, cancelPipeline, summarizeEvents, computeBugStages, readTrackerStatusAsync, isBugOutcomeRetryable, parseClaudeEvents, getReviewRoundCounts } from './lib/ingest.ts'
 import { loadConnectedUsers, loadPendingSenders, loadAllTechUsers, assignChatId, unsetChatId, sendTestMessage } from './lib/tg-users.ts'
 import { getWebhookStatus } from './lib/webhook-status.ts'
 import { fetchPipelineLimits, readQueuedTickets } from './lib/pipeline-queue-state.ts'
-import { getClusterSecret, listWorkers, listDispatchEntries, fetchWorkerHealth, fetchWorkerCapacity, fetchWorkerJobStatus, disableWorker, enableWorker, removeWorker } from './lib/cluster-state.ts'
+import { getClusterSecret, listWorkers, listDispatchEntries, fetchWorkerHealth, fetchWorkerCapacity, fetchWorkerJobStatus, cancelRemoteJob, disableWorker, enableWorker, removeWorker } from './lib/cluster-state.ts'
 import { listToolsmithRuns } from './lib/toolsmith.ts'
 import { attachAgentRuns } from './lib/agent-runs-summary.ts'
 
@@ -252,19 +253,59 @@ app.get('/api/status-log', async c => {
   return c.json({ rows })
 })
 
+/**
+ * `remote` 陣列的候選來源（去重前）。
+ *
+ * 任務 1（2026-09-04）：MON_READ_SOURCE=mysql 時改查監控 DB 的
+ * `dispatch_attempts`（head 唯一寫入、`status_rank < 100` 即尚未終結的派工），
+ * 取代原本只讀 head 行程記憶體登記表（`listDispatchEntries()`）——後者只在
+ * 「進行中」期間存在，跟 `runs` 表撈出的 `rows` 是兩個互不知情的資料源，
+ * worker 執行期間兩邊各存在一筆，是「列表出現兩筆相同資料」的根因（見
+ * lib/read/remote-dispatches.ts 檔頭）。sqlite 讀取面沒有 `dispatch_attempts`
+ * 可查，維持讀記憶體登記表（README 已載明目前主要讀取面是
+ * MON_READ_SOURCE=mysql，sqlite 這條分支只是不砍掉既有行為）。
+ *
+ * lazy import lib/read/mysql.ts：sqlite 模式下不觸碰 mysql2（MAJOR-D1 既有
+ * 紀律，見 lib/read/index.ts 的 initReader）。
+ */
+async function listRemoteDispatchCandidates(): Promise<RemoteDispatchCandidate[]> {
+  if (READ_SOURCE !== 'mysql') {
+    // 記憶體登記表（cluster-state.ts DispatchEntry）沒有 remoteRunId 欄位——
+    // 去重完全靠 dedupRemoteDispatches 的 rowKeys 判準，跟遷移前行為一致。
+    return listDispatchEntries()
+  }
+  const { readActiveDispatchAttempts } = await import('./lib/read/mysql.ts')
+  const rows = await readActiveDispatchAttempts()
+  return rows.map(r => ({
+    ticket: r.ticket,
+    kind: r.kind,
+    // dispatch_attempts.status_rank < 100 之下只會看到 'dispatching'（10）或
+    // 'dispatched'（20）——見 telegram-dispatcher/lib/cluster/dispatch-registry.ts
+    // 的 DISPATCH_STATUS_RANK；'dispatched' 對映前端既有的 'confirmed' 語意
+    // （已確認派到哪台，worker 已接單）。
+    status: r.status === 'dispatching' ? 'dispatching' : 'confirmed',
+    worker: r.workerName ?? '',
+    workerUrl: r.workerUrl ?? '',
+    dispatchedAt: r.dispatchedAt,
+    // dispatch_attempts 只存 triggered_by_email（沒有 name 欄，見 migrations
+    // 001 的 schema），name 退回 email 本身，好過完全空白。
+    triggeredBy: r.triggeredByEmail ? { name: r.triggeredByEmail, email: r.triggeredByEmail } : null,
+    remoteRunId: r.remoteRunId,
+  }))
+}
+
 async function buildPipelinesPayload() {
   // 排隊中的單（2026-08-28）：不在 pipeline_runs（還沒 spawn、沒有 log 檔），
   // 從佇列快照另組一段清單，前端顯示在列表最上方。
   const queued = readQueuedTickets()
-  // 派在遠端 worker 上執行中的單（2026-08-31 T37）：這台 head 完全沒有它的
-  // pipeline_runs 紀錄（log 檔落在 worker 那台機器上），唯一的可見痕跡就是
-  // dispatch-registry 這份「派到哪台」登記表——只有進行中的條目，worker 回報
-  // job-done 後就清掉，看不到遠端執行的歷史（見 cluster-state.ts 檔頭）。
-  const remote = listDispatchEntries()
   const reader = getReader()
-  const rows = (await reader.pipelineRuns(300)) as any[]
+  const [remoteCandidates, rows] = await Promise.all([listRemoteDispatchCandidates(), reader.pipelineRuns(300) as Promise<any[]>])
   attachAgentRuns(rows, await reader.allAgentRuns())
   for (const r of rows) delete r.agents // 列表只給彙總，詳情另打 /api/pipelines/run
+  // 任務 1：一張票若已經在 rows（真實 run 記錄）出現，就不該同時出現在
+  // remote 陣列——見 lib/read/remote-dispatches.ts 的 dedupRemoteDispatches。
+  const rowKeys = new Set(rows.map(r => `${r.kind}:${r.ticket}`))
+  const remote = dedupRemoteDispatches(remoteCandidates, rowKeys)
   // 2026-08-28（FAQ-4768 連點事故）：bug run 以 stdout 路徑對應 ps 行程歸戶
   // （見 lib/ingest.ts scanPipelineRuns 同日註解）；demand 維持 ticket+最新
   // 一次的判法。
@@ -481,6 +522,19 @@ app.get('/api/agent-trace', c => {
   })
 })
 
+/**
+ * 這張票目前是否派在某個 worker 上執行中（`status='confirmed'` 且
+ * worker/workerUrl 都有值）——任務 3：`/api/pipelines/cancel` 本機查不到時，
+ * 用它判斷要不要把取消請求轉發過去。直接複用 `listRemoteDispatchCandidates()`
+ * （任務 1 已接上的 dispatch_attempts / 記憶體登記表二選一來源），不再另開
+ * 一條查詢路徑。
+ */
+async function findRemoteWorkerForTicket(kind: 'bug' | 'demand', ticket: string): Promise<{ name: string; url: string } | null> {
+  const candidates = await listRemoteDispatchCandidates()
+  const entry = candidates.find(e => e.kind === kind && e.ticket === ticket && e.status === 'confirmed' && e.worker && e.workerUrl)
+  return entry ? { name: entry.worker, url: entry.workerUrl } : null
+}
+
 // 取消背景 pipeline（只接受本機請求；server 本來就只綁 127.0.0.1）
 app.post('/api/pipelines/cancel', async c => {
   const body = await c.req.json().catch(() => null) as { kind?: string; ticket?: string } | null
@@ -488,8 +542,27 @@ app.post('/api/pipelines/cancel', async c => {
   const ticket = body?.ticket ?? ''
   if ((kind !== 'bug' && kind !== 'demand') || !/^[A-Z]+-\d+$/.test(ticket)) return c.json({ ok: false, reason: 'bad params' }, 400)
   const r = await cancelPipeline(kind, ticket)
-  console.error(`cancel ${kind} ${ticket}: ${JSON.stringify(r)}`)
-  return c.json(r, r.ok ? 200 : 409)
+  if (r.ok) {
+    console.error(`cancel ${kind} ${ticket}: ${JSON.stringify(r)}`)
+    return c.json(r, 200)
+  }
+  // 任務 3：本機 ps 快照查不到時，不直接回「not running」——這張票可能派在
+  // 某台 worker 上執行中（head 完全沒有它的本機行程可查），改查
+  // dispatch_attempts/登記表判斷要不要轉發。
+  const remoteWorker = await findRemoteWorkerForTicket(kind, ticket)
+  if (!remoteWorker) {
+    console.error(`cancel ${kind} ${ticket}: ${JSON.stringify(r)}`)
+    return c.json(r, 409)
+  }
+  const secret = getClusterSecret()
+  if (!secret) {
+    const reason = '這張單派在 worker 上，但 CLUSTER_SHARED_SECRET 未設定，無法轉發取消請求'
+    console.error(`cancel ${kind} ${ticket}: ${reason}`)
+    return c.json({ ok: false, reason }, 409)
+  }
+  const remoteResult = await cancelRemoteJob(remoteWorker.url, secret, ticket)
+  console.error(`cancel ${kind} ${ticket}（轉發至 worker ${remoteWorker.name}）: ${JSON.stringify(remoteResult)}`)
+  return c.json(remoteResult, remoteResult.ok ? 200 : 409)
 })
 
 // 重試（只接受本機請求；server 本來就只綁 127.0.0.1）：2026-08-26 起改為

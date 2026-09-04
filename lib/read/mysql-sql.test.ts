@@ -291,3 +291,19 @@ describe('同步 spawn 禁令（lib/ingest.ts:113-117，未解除的那一條）
     expect(SERVER_SRC).toContain('SSE_MAX_CONNECTIONS')
   })
 })
+
+describe('readActiveDispatchAttempts()：任務 1（pipelines 列表 remote 去重的 mysql 資料源）', () => {
+  test('只查 status_rank < 100（尚未終結的派工），不撈 superseded/cleared 等終態列', () => {
+    expect(MYSQL_SRC).toContain('FROM dispatch_attempts')
+    expect(MYSQL_SRC).toContain('WHERE status_rank < 100')
+  })
+
+  test('本函式不進 MonitorReader 介面（只給 server.ts 的 remote 陣列組裝用，同 readOutcomeMeta/readAllRunsForGate 的既有慣例——不擴大端點契約）', () => {
+    expect(MYSQL_SRC).toContain('export async function readActiveDispatchAttempts')
+  })
+
+  test('回傳欄位涵蓋去重判準需要的 remote_run_id 與轉發取消需要的 worker_url', () => {
+    expect(MYSQL_SRC).toContain('remote_run_id')
+    expect(MYSQL_SRC).toContain('worker_url')
+  })
+})
