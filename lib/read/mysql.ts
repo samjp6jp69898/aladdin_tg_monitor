@@ -712,6 +712,8 @@ export const mysqlReader: MonitorReader = {
     // ORDER BY 也釘 utf8mb4_bin：session 串接靠「同 (service, identity) 的列相鄰」，
     // ai_ci 之下 'Foo' 與 'foo' 排序上相等會交錯，JS 端的 !== 比較就會把一段
     // session 切成很多段。
+    // 補 e.id 破平手（Reviewer B MINOR-1）：同一毫秒內多列（MCP 一次 tool 呼叫常見）
+    // 在 ts 之後順序未定義，讓 /api/sessions 的 tools[] 順序不穩定。
     const rows = await q<any[]>(
       `SELECT e.id AS id, e.service AS service, ${iso('e.ts')} AS ts, e.identity AS identity,
               ${jstr('e', 'tool')} AS tool, ${jstr('e', 'path')} AS path,
@@ -719,7 +721,7 @@ export const mysqlReader: MonitorReader = {
               ${jstr('e', 'agrabahIdentifier')} AS agrabah_identifier
          FROM mcp_usage e
         WHERE ${where.join(' AND ')}
-        ORDER BY e.service COLLATE utf8mb4_bin, e.identity COLLATE utf8mb4_bin, e.ts`,
+        ORDER BY e.service COLLATE utf8mb4_bin, e.identity COLLATE utf8mb4_bin, e.ts, e.id`,
       params,
     )
     return rows.map(r => ({
@@ -790,10 +792,12 @@ export const mysqlReader: MonitorReader = {
     return { perDay, perHour, topIdentities, topTools, authFailures, totalEvents: num(total[0]?.n) }
   },
 
-  async statusLog(service?: string) {
+  async statusLog(service?: string, limit = 200) {
     // pid / detail 在監控 DB 側收在 detail_json 裡（sqlite 是兩個獨立欄位）。
     // 這個約定必須與 Phase 4 的 status collector 寫入端一致：
     //     detail_json = {"pid": <int|null>, "detail": <string|null>}
+    // LIMIT 走 limitClause（驗證過的整數字面值），不走 placeholder——理由見該
+    // 函式註解（mysql2 prepared LIMIT 的版本相依行為）。
     const rows = await q<any[]>(
       `${STATUS_LOG_FLIPS}
        SELECT m.id AS id, m.service AS service, ${iso('m.ts')} AS ts, m.status AS status,
@@ -801,7 +805,7 @@ export const mysqlReader: MonitorReader = {
               ${djstr('m.detail_json', 'detail')} AS detail
          FROM marked m
         WHERE m.is_flip = 1${service ? ' AND m.service = ?' : ''}
-        ORDER BY m.ts DESC, m.id DESC LIMIT 200`,
+        ORDER BY m.ts DESC, m.id DESC${limitClause(limit)}`,
       service ? [service] : [],
     )
     return rows.map(r => ({

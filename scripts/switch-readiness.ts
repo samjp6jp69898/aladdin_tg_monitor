@@ -405,9 +405,47 @@ function setEqual(a: any[], b: any[], drop: string[] = []): { equal: boolean; on
   return { equal: onlyA === 0 && onlyB === 0, onlyA, onlyB }
 }
 
+/**
+ * C4/C5/C6 用 `new Map(rows.map(r => [key(r), r]))` 建索引比對——若鍵不是唯一
+ * （Reviewer B MINOR-3）：`legacy_key` 不是唯一索引（mysql.ts 自己的註解），
+ * `agent_runs` PK 是 `(run_id, path)`、同一個 path 理論上可以對到多個 run_id。
+ * 重複時 Map 留最後一筆，比對用的是任意一筆，而不是「有沒有重複」本身被看見。
+ *
+ * 這支只印 `[WARN]`、不判 FAIL：這條路徑目前資料是否真的有重複未知，先讓它
+ * 會叫（比照 compare-sqlite-mysql.ts 既有對 agent_runs path 重複的處理方式）。
+ */
+function warnDuplicateKeys(rows: any[], keyFn: (r: any) => string, label: string): void {
+  const seen = new Map<string, number>()
+  for (const r of rows) {
+    const k = keyFn(r)
+    seen.set(k, (seen.get(k) ?? 0) + 1)
+  }
+  const dup = [...seen].filter(([, n]) => n > 1)
+  if (dup.length) {
+    console.log(
+      `[WARN] ${label} 有 ${dup.length} 個鍵對到多筆列，Map 索引會靜默併掉重複、比對只用任意一筆：` +
+        dup.slice(0, 5).map(([k, n]) => `${k}×${n}`).join(', '),
+    )
+  }
+}
+
+// C 組／D 組整段包 try/catch（Reviewer B MINOR-4b）：C1 先讀 sqlite 再讀
+// mysql、之後每一格都對 mysql 下 FULL 查詢，`READ_QUERY_TIMEOUT_MS=5000`
+// （mysql.ts）一到就 throw。這些都是頂層 await，原本沒有 try/catch 接住，
+// 逾時或其他例外會變成 unhandled rejection、exit 1 但沒有「結論」列——
+// 總指揮看到的是 stack trace，不是判準結果。catch 到之後印出結構化的
+// [FAIL] 並繼續往下跑到「結論」區塊，不讓例外裸露。
+try {
+
 // C1 events：全量內容必須完全一致（`id` 是各自獨立的 AUTOINCREMENT，不比）
+//
+// 加 `to: iso(now)` 上界（Reviewer B MINOR-4a）：sqlite 與 mysql 是先後兩次
+// 獨立查詢，中間若有 live ingest 寫入新事件，會被其中一軌看到、另一軌看不到，
+// 誤判成 onlyA/onlyB > 0。`now` 在兩次查詢之前就已經取好（:431），把它當上界
+// 讓兩次查詢共用同一個「當下」快照，中間才寫入的事件（ts 必然晚於 now）不會
+// 進入任一邊的結果，兩邊比較的就是同一個時間切片。
 {
-  const f = { errorsOnly: false, toolOnly: false, limit: FULL } as any
+  const f = { errorsOnly: false, toolOnly: false, limit: FULL, to: iso(now) } as any
   const [a, b] = [await sqliteReader.queryEvents(f), await mysqlReader.queryEvents(f)]
   const r = setEqual(a, b, ['id'])
   judge(r.equal, 'C1 events 全量內容一致', `sqlite=${a.length} mysql=${b.length} 只在 sqlite=${r.onlyA} 只在 mysql=${r.onlyB}`)
@@ -498,6 +536,7 @@ let observedMaxDelta = Number.NEGATIVE_INFINITY
 let observedMaxFinishedDelta = Number.NEGATIVE_INFINITY
 {
   const [a, b] = [await sqliteReader.pipelineRuns(FULL), await mysqlReader.pipelineRuns(FULL)]
+  warnDuplicateKeys(b, r => r.key, 'C4/C5 mysql pipelineRuns.key')
   const bk = new Map(b.map(r => [r.key, r]))
   const missing = a.filter(r => !bk.has(r.key))
   // 只要求「sqlite 有的 mysql 都要有」；mysql 多出來的是合理的（遠端 worker 的 run
@@ -605,6 +644,7 @@ let observedMaxFinishedDelta = Number.NEGATIVE_INFINITY
 // C6 agent_runs
 {
   const [a, b] = [await sqliteReader.allAgentRuns(), await mysqlReader.allAgentRuns()]
+  warnDuplicateKeys(b, r => r.path, 'C6 mysql agent_runs.path')
   const bk = new Map(b.map(r => [r.path, r]))
   const missing = a.filter(r => !bk.has(r.path))
   judge(missing.length === 0, 'C6 sqlite 的每一筆 agent_run 在 mysql 都找得到',
@@ -648,8 +688,14 @@ let observedMaxFinishedDelta = Number.NEGATIVE_INFINITY
 }
 
 // C7 status_log：只在「兩軌都有資料」的時間窗內比對翻轉
+//
+// **統計基準要用 FULL，不能用 API 端點的預設 200**（Reviewer B MINOR-2）：
+// 下面用 mysql 側「每個 service 的最早一列」當 collector 起步基準，若兩軌各
+// 自只拿最近 200 筆折疊後的樣本，兩軌的截斷邊界不同（sqlite 是全服務共用
+// 200、mysql 是折疊後 200），會系統性誤判起步基準。API 端點呼叫處
+// （server.ts）維持原本的預設 200，不受此影響。
 {
-  const [a, b] = [await sqliteReader.statusLog(), await mysqlReader.statusLog()]
+  const [a, b] = [await sqliteReader.statusLog(undefined, FULL), await mysqlReader.statusLog(undefined, FULL)]
   if (b.length === 0) {
     fail('C7 status_log 有資料可比', 'mysql 側一筆都沒有（collector 尚未遷移）')
   } else {
@@ -714,6 +760,14 @@ console.log('\n═══ D. 寫入端已知缺口（切過去之後畫面上真�
       judge(r.ok, `D ${g.field} 寫入端已接`, `${r.detail}｜負責：${g.owner}｜${g.note}`)
     }
   }
+}
+
+} catch (e) {
+  // C/D 組任何一格中途拋出例外（最典型：mysql 側 FULL 查詢撞
+  // READ_QUERY_TIMEOUT_MS 逾時 throw）—— 印出結構化的 [FAIL]（含原始錯誤
+  // 訊息），不讓例外裸露成 unhandled rejection；已經跑過的格子計數保留，
+  // 往下仍會印出「結論」列（Reviewer B MINOR-4b）。
+  fail('C/D 組完整跑完（沒有中途拋出例外）', e instanceof Error ? `${e.name}: ${e.message}` : String(e))
 }
 
 // ═════════════════════ 結論 ═════════════════════
