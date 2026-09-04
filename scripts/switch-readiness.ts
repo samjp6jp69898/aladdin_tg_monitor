@@ -33,6 +33,7 @@ import { SERVICES, DISPATCHER_LOG_DIR, AGENT_TRACE_DIR } from '../lib/services.t
 import {
   collectFsRunLogs, judgeRunCoverage, isAgentRunSourcePath, judgeAgentRunCoverage,
   judgeLegacyKeyCoherence, judgeRetryLineage, KEY_TO_STARTED_AT_TOLERANCE_MS,
+  judgeStatusLogOrderSelfConsistency,
 } from '../lib/read/single-track-consistency.ts'
 
 const skipSlow = process.argv.includes('--skip-slow')
@@ -373,6 +374,9 @@ let gateRuns: Awaited<ReturnType<typeof import('../lib/read/mysql.ts')['readAllR
 // 要求「DB 快照時刻」是一個確定值，在真的發 SELECT 之前先記下來，比查詢本身
 // 開始時間更早沒關係（結構性下界，越早越安全，不會誤放過真漏收）。
 let gateRunsSnapshotAtMs: number
+// S9 專用：service_status_log 未折疊全量列（見 lib/read/mysql.ts 的
+// readAllStatusLogForGate 檔頭理由）。
+let gateStatusLog: Awaited<ReturnType<typeof import('../lib/read/mysql.ts')['readAllStatusLogForGate']>>
 try {
   const m = await import('../lib/read/mysql.ts')
   await m.probeMysqlReadable()
@@ -380,6 +384,7 @@ try {
   outcomeMeta = await m.readOutcomeMeta()
   gateRunsSnapshotAtMs = Date.now()
   gateRuns = await m.readAllRunsForGate()
+  gateStatusLog = await m.readAllStatusLogForGate()
 } catch (e) {
   fail('連得上監控 DB', e instanceof Error ? e.message : String(e))
   console.log(`\n═══ 結論：不可切（${fails}/${checks} 項未過）═══`)
@@ -849,6 +854,16 @@ console.log('\n═══ S. 單軌自洽性檢查（不依賴 sqlite，phase9-si
       s6.forkedParents.length ? `forkedParents ${s6.forkedParents.length}` : '',
     ].filter(Boolean).join('｜') || (s6.counted.withLineage === 0 ? '目前零真實樣本，這格從未被觸發過（a7-D14）' : ''))
   if (s6.unexpectedParentOutcome.length) console.log(`[WARN] S6 父列 outcome 不在自動重試值域內（手動重試值域不封閉，只列不判紅，共 ${s6.unexpectedParentOutcome.length} 筆）：${s6.unexpectedParentOutcome.slice(0, 3).join('; ')}`)
+
+  // S9：service_status_log 排序自洽性（a7-D43 修法的可重跑健康信號，非一次性
+  // 回歸測試——見 single-track-consistency.ts 的 judgeStatusLogOrderSelfConsistency
+  // 檔頭：D43 在今天的資料上是 no-op，這一格讓「現在有沒有動搖」變成每次都能
+  // 重新問一次的問題）。
+  const s9 = judgeStatusLogOrderSelfConsistency(gateStatusLog)
+  judge(s9.flipCountMismatch.length === 0, `S9 status_log 折疊翻轉數：ts,id 序與 id 序一致（共 ${s9.checked} 筆原始列）`,
+    s9.flipCountMismatch.length ? s9.flipCountMismatch.slice(0, 5).join('; ') : '')
+  judge(s9.lastChangeMismatch.length === 0, 'S9 lastStatusChanges：ts,id 序與 id 序選中同一列（總覽卡片顯示值不受排序影響）',
+    s9.lastChangeMismatch.length ? s9.lastChangeMismatch.slice(0, 5).join('; ') : '')
 }
 
 } catch (e) {

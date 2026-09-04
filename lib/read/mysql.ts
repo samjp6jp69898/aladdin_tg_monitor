@@ -548,6 +548,29 @@ export async function readAllRunsForGate(): Promise<GateRunRow[]> {
   }))
 }
 
+/**
+ * 擋門 S9 專用：`service_status_log` **未經折疊**的全量投影（`id`/`ts`/`status`
+ * 逐列，不經 `STATUS_LOG_FLIPS` 的 `is_flip` 篩選）。
+ *
+ * **為什麼不能重用 `statusLog()`**：那支函式已經套用折疊（`ts,id` 序）並限制
+ * 200 筆——S9 要做的正是「拿同一份原始列，分別用兩種排序各自折疊一次，比較
+ * 結果」，若輸入本身已經被其中一種排序折過，就沒有東西可比了。
+ * 同 `readAllRunsForGate()` 的既有理由：只給擋門內部判準用，不進
+ * `MonitorReader` 介面、不進任何端點契約。
+ */
+export async function readAllStatusLogForGate(): Promise<{ service: string; id: number; ts: string; status: string | null }[]> {
+  const rows = await q<any[]>(
+    `SELECT s.id AS id, ${exact('s.service')} AS service, ${iso('s.ts')} AS ts, s.status AS status
+       FROM service_status_log s`,
+  )
+  return rows.map(r => ({
+    id: Number(r.id),
+    service: r.service as string,
+    ts: r.ts as string,
+    status: (r.status ?? null) as string | null,
+  }))
+}
+
 export const mysqlReader: MonitorReader = {
   source: 'mysql',
 

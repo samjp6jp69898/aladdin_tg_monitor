@@ -578,3 +578,103 @@ export function judgeRetryLineage(
     counted: { withLineage, total: dbRows.length },
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+
+export interface StatusLogRawRow {
+  service: string
+  id: number
+  ts: string
+  status: string | null
+}
+
+export interface StatusLogOrderSelfConsistencyResult {
+  ok: boolean
+  /** 該 service 在 `ts,id` 序（現行、a7-D43 修法後的正確序）與 `id` 序
+   *  （sqlite 沿用來的舊序）下算出的翻轉數不同——代表 id≠ts 的錯序**已經**
+   *  改變了折疊結果，不是潛在風險，是現在正在發生的事。 */
+  flipCountMismatch: string[]
+  /** `lastStatusChanges`（總覽卡片「最後一次狀態變化」的資料來源）在兩種排序
+   *  下選中不同的翻轉列——這正是 a7-D43 修法在使用者看得到的畫面上真正有
+   *  差異的地方：不只是折疊翻轉數字不同，連「現在顯示的是哪一列」都不同。 */
+  lastChangeMismatch: string[]
+  checked: number
+}
+
+/**
+ * **S9**：`service_status_log` 的排序自洽性（a7-D43/D44 判準的可重跑版本，
+ * `phase9-single-track-design-62.md` §3 S9；邏輯照抄 aladdin-1d-D84 的
+ * `d44-interleave-probe` 補測跑過的三項中的前兩項——見台帳該節）。
+ *
+ * **這不是驗證「`ts,id` 排序本身寫得對不對」**（那件事已經在 a7-D43 修完、
+ * `lib/read/mysql.ts` 的 `STATUS_LOG_FLIPS` 三處都已經是 `ORDER BY ts, id`），
+ * 而是驗證**現在的資料在這兩種排序下會不會給出不同答案**——這是一個持續性
+ * 的健康信號，不是一次性回歸測試：a7-D47 已經記錄過，D43 的修法在 2026-09-04
+ * 當下的資料上是 no-op（改完仍綠，16/695 筆 id≠ts 的反轉不足以動搖任何一個
+ * service 的折疊結果）；**這一格把「現在有沒有動搖」變成每次都能重新問一次
+ * 的問題，而不是停在那次觀察的結論上**——Phase 6 回填、未來的 spool 重放
+ * 都可能把反轉數量推過那個臨界點。
+ *
+ * **不需要 sqlite**：兩個排序都直接對 mysql 的原始列重算，互相比較，不對照
+ * 任何舊軌資料——符合 a7-D38 核定的單軌自洽方向。
+ *
+ * `dbRows` 必須是**單一 service 全部歷史列**的完整集合（不能只給某個時間窗，
+ * 否則折疊會在窗界上出現假翻轉——同構於 `STATUS_LOG_FLIPS` 註解說的「折疊要
+ * 看該 service 的完整歷史」）。
+ *
+ * 第三項 D84 檢查（讀取層 `statusLog()` 逐列交錯處理是否正確）本函式**沒有
+ * 涵蓋**——那是驗證 SQL 函式本身的輸出，需要另外呼叫 `mysqlReader.statusLog()`
+ * 並與本函式的 `tsIdOrdered` 比對，不是這支純函式能獨立回答的事，誠實列在
+ * 設計稿與交接文件裡，不是遺漏。
+ */
+export function judgeStatusLogOrderSelfConsistency(
+  dbRows: readonly StatusLogRawRow[],
+): StatusLogOrderSelfConsistencyResult {
+  const byService = new Map<string, StatusLogRawRow[]>()
+  for (const r of dbRows) {
+    const arr = byService.get(r.service)
+    if (arr) arr.push(r)
+    else byService.set(r.service, [r])
+  }
+
+  const flipCountMismatch: string[] = []
+  const lastChangeMismatch: string[] = []
+
+  const foldFlips = (ordered: readonly StatusLogRawRow[]): { flipCount: number; last: StatusLogRawRow | null } => {
+    let flipCount = 0
+    let last: StatusLogRawRow | null = null
+    for (let i = 0; i < ordered.length; i++) {
+      const isFlip = i === 0 || ordered[i]!.status !== ordered[i - 1]!.status
+      if (isFlip) { flipCount++; last = ordered[i]! }
+    }
+    return { flipCount, last }
+  }
+
+  for (const [service, rows] of byService) {
+    const byTsId = [...rows].sort((a, b) => {
+      const dt = Date.parse(a.ts) - Date.parse(b.ts)
+      return dt !== 0 ? dt : a.id - b.id
+    })
+    const byIdOnly = [...rows].sort((a, b) => a.id - b.id)
+
+    const tsId = foldFlips(byTsId)
+    const idOnly = foldFlips(byIdOnly)
+
+    if (tsId.flipCount !== idOnly.flipCount) {
+      flipCountMismatch.push(`${service}: ts,id 序=${tsId.flipCount} id 序=${idOnly.flipCount}（Δ=${tsId.flipCount - idOnly.flipCount}）`)
+    }
+    if (tsId.last?.id !== idOnly.last?.id) {
+      lastChangeMismatch.push(
+        `${service}: ts,id 序選中 id=${tsId.last?.id ?? 'null'}(ts=${tsId.last?.ts ?? 'null'}, status=${JSON.stringify(tsId.last?.status ?? null)}) ` +
+        `id 序選中 id=${idOnly.last?.id ?? 'null'}(ts=${idOnly.last?.ts ?? 'null'}, status=${JSON.stringify(idOnly.last?.status ?? null)})`,
+      )
+    }
+  }
+
+  return {
+    ok: flipCountMismatch.length === 0 && lastChangeMismatch.length === 0,
+    flipCountMismatch: flipCountMismatch.sort(),
+    lastChangeMismatch: lastChangeMismatch.sort(),
+    checked: dbRows.length,
+  }
+}

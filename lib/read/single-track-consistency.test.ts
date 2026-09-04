@@ -14,7 +14,8 @@ import {
   isAgentRunSourcePath, judgeAgentRunCoverage,
   judgeLegacyKeyCoherence, KEY_TO_STARTED_AT_TOLERANCE_MS, fileTsToIso,
   judgeRetryLineage,
-  type DbRunRow, type AgentRunRow, type AgentRunPathSources,
+  judgeStatusLogOrderSelfConsistency,
+  type DbRunRow, type AgentRunRow, type AgentRunPathSources, type StatusLogRawRow,
 } from './single-track-consistency.ts'
 
 const LOGS = '/Users/user/aladdin/telegram-dispatcher/logs'
@@ -357,5 +358,69 @@ describe('S6 retry/resume 血緣自洽（retry_of_run_id）', () => {
     expect(r.counted.withLineage).toBe(0)
     // 但 S4 必須看得到它們是兩把不同的 key（沒有互撞）
     expect(judgeLegacyKeyCoherence([a, b]).duplicateKeys).toEqual([])
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────
+describe('S9 service_status_log 排序自洽性（ts,id 序 vs id 序）', () => {
+  const row = (over: Partial<StatusLogRawRow>): StatusLogRawRow => ({
+    service: 'svc-a', id: 1, ts: '2026-09-04T00:00:00.000Z', status: 'up', ...over,
+  })
+
+  test('id 序 ≡ ts 序（單一寫入者、事件當下寫入）→ 兩種排序完全一致，判綠', () => {
+    const rows = [
+      row({ id: 1, ts: '2026-09-04T00:00:00.000Z', status: 'up' }),
+      row({ id: 2, ts: '2026-09-04T00:01:00.000Z', status: 'down' }),
+      row({ id: 3, ts: '2026-09-04T00:02:00.000Z', status: 'up' }),
+    ]
+    const r = judgeStatusLogOrderSelfConsistency(rows)
+    expect(r.ok).toBe(true)
+    expect(r.flipCountMismatch).toEqual([])
+    expect(r.lastChangeMismatch).toEqual([])
+    expect(r.checked).toBe(3)
+  })
+
+  test('id≠ts 但反轉發生在同一段連續狀態內 → 折疊結果不受影響，仍判綠（負面對照：不是所有反轉都會冒出來）', () => {
+    // id=2 的 ts 比 id=1 早，但兩者 status 相同（都是 up），折疊後不算翻轉，
+    // 兩種排序看到的翻轉序列完全一樣。
+    const rows = [
+      row({ id: 1, ts: '2026-09-04T00:00:05.000Z', status: 'up' }),
+      row({ id: 2, ts: '2026-09-04T00:00:00.000Z', status: 'up' }), // id 較大但 ts 較早（回填典型形狀）
+      row({ id: 3, ts: '2026-09-04T00:01:00.000Z', status: 'down' }),
+    ]
+    const r = judgeStatusLogOrderSelfConsistency(rows)
+    expect(r.ok).toBe(true)
+  })
+
+  test('回填典型形狀：歷史列 id 大於現有 collector 列但 ts 較早，且翻轉發生在歷史列 → 折疊翻轉數與最後翻轉列皆不同，判紅', () => {
+    // 比照 phase9-readiness.md §4.4 第 3 項寫死的資料構造要求：歷史列 ts 在前、
+    // id 在後，且翻轉發生在歷史列裡、該列 id 大於後續 collector 列。
+    const rows = [
+      row({ id: 10, ts: '2026-08-21T00:00:00.000Z', status: 'up' }),   // collector 早期列
+      row({ id: 90, ts: '2026-08-27T00:00:00.000Z', status: 'down' }), // 回填的歷史翻轉列，id 卻很大
+      row({ id: 86, ts: '2026-09-02T00:00:00.000Z', status: 'up' }),   // collector 近期列，id 比上面小
+    ]
+    const r = judgeStatusLogOrderSelfConsistency(rows)
+    expect(r.ok).toBe(false)
+    // ts,id 序：up(10)→down(90)→up(86) = 3 段 = 2 次翻轉；id 序：up(10)→up(86)→down(90) = 2 段 = 1 次翻轉
+    expect(r.flipCountMismatch).toEqual(['svc-a: ts,id 序=3 id 序=2（Δ=1）'])
+    // ts,id 序最後翻轉＝id=86(up)；id 序最後翻轉＝id=90(down)——兩種排序連「現在是什麼狀態」都會顯示不同答案
+    expect(r.lastChangeMismatch).toHaveLength(1)
+    expect(r.lastChangeMismatch[0]).toContain('ts,id 序選中 id=86')
+    expect(r.lastChangeMismatch[0]).toContain('id 序選中 id=90')
+  })
+
+  test('多個 service 各自獨立判斷，一個紅不影響另一個維持綠', () => {
+    const healthy = [row({ service: 'svc-healthy', id: 1, status: 'up' }), row({ service: 'svc-healthy', id: 2, ts: '2026-09-04T00:01:00.000Z', status: 'down' })]
+    const broken = [
+      row({ service: 'svc-broken', id: 10, ts: '2026-08-21T00:00:00.000Z', status: 'up' }),
+      row({ service: 'svc-broken', id: 90, ts: '2026-08-27T00:00:00.000Z', status: 'down' }),
+      row({ service: 'svc-broken', id: 86, ts: '2026-09-02T00:00:00.000Z', status: 'up' }),
+    ]
+    const r = judgeStatusLogOrderSelfConsistency([...healthy, ...broken])
+    expect(r.ok).toBe(false)
+    expect(r.flipCountMismatch).toHaveLength(1)
+    expect(r.flipCountMismatch[0]).toContain('svc-broken')
+    expect(r.checked).toBe(5)
   })
 })
