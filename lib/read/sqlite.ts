@@ -111,10 +111,10 @@ export const sqliteReader: MonitorReader = {
     return { perDay, perHour, topIdentities, topTools, authFailures, totalEvents: total.n }
   },
 
-  async statusLog(service?: string) {
+  async statusLog(service?: string, limit = 200) {
     return (service
-      ? db.prepare('SELECT * FROM status_log WHERE service = ? ORDER BY id DESC LIMIT 200').all(service)
-      : db.prepare('SELECT * FROM status_log ORDER BY id DESC LIMIT 200').all()) as StatusLogRow[]
+      ? db.prepare('SELECT * FROM status_log WHERE service = ? ORDER BY id DESC LIMIT ?').all(service, limit)
+      : db.prepare('SELECT * FROM status_log ORDER BY id DESC LIMIT ?').all(limit)) as StatusLogRow[]
   },
 
   async pipelineRuns(limit: number) {

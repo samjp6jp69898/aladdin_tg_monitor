@@ -704,8 +704,14 @@ let observedMaxFinishedDelta = Number.NEGATIVE_INFINITY
 }
 
 // C7 status_log：只在「兩軌都有資料」的時間窗內比對翻轉
+//
+// **統計基準要用 FULL，不能用 API 端點的預設 200**（Reviewer B MINOR-2）：
+// 下面用 mysql 側「每個 service 的最早一列」當 collector 起步基準，若兩軌各
+// 自只拿最近 200 筆折疊後的樣本，兩軌的截斷邊界不同（sqlite 是全服務共用
+// 200、mysql 是折疊後 200），會系統性誤判起步基準。API 端點呼叫處
+// （server.ts）維持原本的預設 200，不受此影響。
 {
-  const [a, b] = [await sqliteReader.statusLog(), await mysqlReader.statusLog()]
+  const [a, b] = [await sqliteReader.statusLog(undefined, FULL), await mysqlReader.statusLog(undefined, FULL)]
   if (b.length === 0) {
     fail('C7 status_log 有資料可比', 'mysql 側一筆都沒有（collector 尚未遷移）')
   } else {

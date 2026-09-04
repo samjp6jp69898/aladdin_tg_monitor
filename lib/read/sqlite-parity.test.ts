@@ -21,6 +21,10 @@
 //      順序不穩定——這是行為修正，不是重構，比照 a7-D51 的原則：改動 sqlite
 //      軌需要明確理由，且 parity 測試要繼續反映真實 SQL、不能被繞過（本檔的
 //      baseline 字串已同步更新為含 `, id` 的版本，不是刪掉那條測試）。
+//   3. `status-log` 兩條的 `LIMIT 200` 在這裡是 `LIMIT ?`、由呼叫端傳
+//      200（Reviewer B MINOR-2，2026-09-04）：與第 1 點同款——reader 介面把
+//      筆數當參數，讓擋門（switch-readiness.ts C7）能在需要時傳 FULL，API
+//      端點呼叫處仍傳預設 200，行為不變。
 //
 // （為什麼把期望值寫死在測試裡而不是 `git show f3dbe92:server.ts`：測試不該
 // 依賴 git 歷史還在不在、也不該在 worktree／淺 clone 下失效。寫死的代價是
@@ -92,8 +96,8 @@ const BASELINE_SQL: [string, string][] = [
     `SELECT service, source_ip, reason, COUNT(*) AS n, MAX(ts) AS last_ts FROM events WHERE ts >= ? AND event = 'auth_failure' GROUP BY service, source_ip, reason ORDER BY n DESC LIMIT 50`,
   ],
   ['stats.total', `SELECT COUNT(*) AS n FROM events`],
-  ['status-log（有 service）', `SELECT * FROM status_log WHERE service = ? ORDER BY id DESC LIMIT 200`],
-  ['status-log（全部）', `SELECT * FROM status_log ORDER BY id DESC LIMIT 200`],
+  ['status-log（有 service）', `SELECT * FROM status_log WHERE service = ? ORDER BY id DESC LIMIT ?`],
+  ['status-log（全部）', `SELECT * FROM status_log ORDER BY id DESC LIMIT ?`],
   ['attachAgentRuns 的 agent_runs', `SELECT * FROM agent_runs ORDER BY started_at`],
   ['pipelines 列表', `SELECT * FROM pipeline_runs ORDER BY started_at DESC LIMIT `],
   ['pipelines/run 單筆', `SELECT * FROM pipeline_runs WHERE key = ?`],

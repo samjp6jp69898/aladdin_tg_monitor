@@ -195,7 +195,12 @@ export interface MonitorReader {
   queryEvents(f: EventsFilter): Promise<EventRow[]>
   sessionEvents(f: SessionsFilter): Promise<SessionEventRow[]>
   stats(since: string, hourWindowSince: string): Promise<StatsResult>
-  statusLog(service?: string): Promise<StatusLogRow[]>
+  /**
+   * `limit` 預設 200（＝ API 端點既有行為）。擋門（switch-readiness.ts C7）
+   * 呼叫時帶 FULL——兩軌各自 `LIMIT 200` 的截斷邊界不同，用 200 筆樣本推
+   * 「collector 起步基準」會系統性誤判（Reviewer B MINOR-2）。
+   */
+  statusLog(service?: string, limit?: number): Promise<StatusLogRow[]>
   pipelineRuns(limit: number): Promise<PipelineRunRow[]>
   pipelineRunByKey(key: string): Promise<PipelineRunRow | null>
   pipelineRunsByTicket(kind: string, ticket: string): Promise<PipelineRunRow[]>
