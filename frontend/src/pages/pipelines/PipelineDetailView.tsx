@@ -23,19 +23,23 @@ export function PipelineDetailView({ runKey }: { runKey: string }) {
   // 進 run 詳情時（本元件重新 mount，因為 PipelinesPage 用 key={runKey}）自然歸零，
   // 等同舊版 openRun() 的 `curAgentPath = null`。
   const [agentPath, setAgentPath] = useState<string | null>(null)
+  // task 1（2026-09-04）：worker 執行的 agent 要帶著 host 一起送，後端才知道
+  // proxy 給哪台 worker（見 endpoints.ts fetchAgentTrace 註解）。
+  const [agentHost, setAgentHost] = useState<string | undefined>(undefined)
   const agentTrace = useResource(
     topics.agentTrace,
-    { path: agentPath ?? '' },
+    { path: agentPath ?? '', host: agentHost },
     { enabled: !!agentPath, autoRefresh: false }, // 不隨 5 秒輪詢自動更新
   )
 
-  function handleOpenAgent(path: string) {
+  function handleOpenAgent(agent: AgentRunRow) {
     // 規格：「每次點擊表格列都重新呼叫（不快取）」——重點同一列也要強制重打，
     // useResource 只在 params 變動時才重新訂閱，所以同一 path 改呼叫 reload()。
-    if (path === agentPath) {
+    if (agent.path === agentPath) {
       void agentTrace.reload()
     } else {
-      setAgentPath(path)
+      setAgentPath(agent.path)
+      setAgentHost(agent.host)
     }
   }
 
@@ -58,6 +62,9 @@ export function PipelineDetailView({ runKey }: { runKey: string }) {
   const agents = r?.agents ?? []
   const stages = data?.stages ?? []
   const progress = data?.progress ?? []
+  // task 1（2026-09-04）：worker 一時連不上/查無位址時的優雅降級文案——只有
+  // 這種情境非 null（見 api/types.ts PipelineRunDetailResponse 註解）。
+  const stagesUnavailableReason = data?.stagesUnavailableReason ?? null
 
   const stageColumns: Column<BugStage>[] = [
     {
@@ -174,29 +181,35 @@ export function PipelineDetailView({ runKey }: { runKey: string }) {
       </Toolbar>
 
       <div className="stack">
-        {stages.length > 0 && (
+        {(stages.length > 0 || stagesUnavailableReason) && (
           <Card title="Pipeline 階段檢核表">
-            <DataTable
-              columns={stageColumns}
-              rows={stages}
-              rowKey={(s, i) => s.key || i}
-              rowClassName={s => (s.status === 'running' ? 'stage-running' : undefined)}
-              emptyText=""
-            />
-            {r?.running && (
-              <div className="mute" style={{ marginTop: 8 }}>
-                run 執行中：本表只反映各階段產物「檔案落地」的狀態，標不出此刻正在跑哪一步——Step
-                5（fixer TDD 修復）不產出獨立文件所以沒有列；審查被否決後重做時，Step 6
-                在新報告落地前仍顯示「沿用上輪」；Step 2b 的 done 也可能是 fixer 往
-                analysis-notes 追加 TDD 紀錄（同一份文件）。
-              </div>
+            {stagesUnavailableReason ? (
+              <div className="mute">{stagesUnavailableReason}</div>
+            ) : (
+              <>
+                <DataTable
+                  columns={stageColumns}
+                  rows={stages}
+                  rowKey={(s, i) => s.key || i}
+                  rowClassName={s => (s.status === 'running' ? 'stage-running' : undefined)}
+                  emptyText=""
+                />
+                {r?.running && (
+                  <div className="mute" style={{ marginTop: 8 }}>
+                    run 執行中：本表只反映各階段產物「檔案落地」的狀態，標不出此刻正在跑哪一步——Step
+                    5（fixer TDD 修復）不產出獨立文件所以沒有列；審查被否決後重做時，Step 6
+                    在新報告落地前仍顯示「沿用上輪」；Step 2b 的 done 也可能是 fixer 往
+                    analysis-notes 追加 TDD 紀錄（同一份文件）。
+                  </div>
+                )}
+                <div className="mute" style={{ marginTop: 8 }}>
+                  單一 claude -p session 內部各階段用 Task 呼叫子 agent，非獨立
+                  process，拿不到每階段各自的 token 用量——input/output token
+                  只有整次執行的合計，見下方「Agent 流程」表。開始/結束時間根據 Debug
+                  產物檔案存在與 mtime 推算，「開始」= 前一個已完成階段的結束時間，非精確量測。
+                </div>
+              </>
             )}
-            <div className="mute" style={{ marginTop: 8 }}>
-              單一 claude -p session 內部各階段用 Task 呼叫子 agent，非獨立
-              process，拿不到每階段各自的 token 用量——input/output token
-              只有整次執行的合計，見下方「Agent 流程」表。開始/結束時間根據 Debug
-              產物檔案存在與 mtime 推算，「開始」= 前一個已完成階段的結束時間，非精確量測。
-            </div>
           </Card>
         )}
 
@@ -206,7 +219,7 @@ export function PipelineDetailView({ runKey }: { runKey: string }) {
             rows={agents}
             rowKey={a => a.path}
             rowClassName={a => (a.path === agentPath ? 'agent-row on' : 'agent-row')}
-            onRowClick={a => handleOpenAgent(a.path)}
+            onRowClick={a => handleOpenAgent(a)}
             emptyText={
               r?.kind === 'demand'
                 ? '尚無 agent trace（只有 2026-08-21 12:30 之後觸發的需求單才有；更早的執行 dispatcher 沒有保存 agent 輸出）'

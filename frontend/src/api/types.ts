@@ -400,6 +400,10 @@ export interface AgentRunRow {
   tool_calls: number
   is_error: number
   result_preview: string | null
+  /** task 1（2026-09-04）：這個 agent 在哪台機器執行——只有 MON_READ_SOURCE=mysql
+   * 才會帶（同 PipelineRun.host 的既有 §8.1 可選欄位慣例）。`fetchAgentTrace()`
+   * 帶著它一起送，讓 `/api/agent-trace` 知道要不要 proxy 給 worker。 */
+  host?: string
 }
 
 export interface PipelineRunDetailResponse {
@@ -429,6 +433,11 @@ export interface PipelineRunDetailResponse {
   progress: DemandProgressEntry[]
   /** 僅 kind='bug' 且此 run 為當前/最新一次時才計算，否則 []。 */
   stages: BugStage[]
+  /** task 1（2026-09-04）：`stages` 本該非空卻是空陣列時，這裡帶原因——
+   * 目前只有「此 run 在 worker 上執行，但暫時連不上該 worker 或查不到位址」
+   * 這一種情境會非 null；其餘情況（非 bug 單、非當前 run、head 本機執行且
+   * 就是還沒有任何產物）維持 null，不強加一個不存在的理由。 */
+  stagesUnavailableReason: string | null
 }
 
 /* ────────────────────────────── GET /api/agent-trace ────────────────────────────── */
@@ -506,6 +515,13 @@ export interface RetryPipelineResponse {
   ok: boolean
   pid?: number
   reason?: string
+  /** task 2（2026-09-04）：cluster 啟用時走 head 的分派判斷，可能落到某個
+   * worker——status/worker 只有這種情境才會出現（'remote_started' /
+   * 'already_running_remote' 帶 worker；'queued'/'already_running'/
+   * 'already_queued' 是本機佇列語意但沒有額外欄位可顯示）。單機部署仍只有
+   * `pid`（沒有 status 欄），前端顯示邏輯要能兩種都處理。 */
+  status?: 'started' | 'queued' | 'already_running' | 'already_queued' | 'remote_started' | 'already_running_remote'
+  worker?: string
 }
 
 /* ────────────────────────────── GET /api/toolsmith ────────────────────────────── */

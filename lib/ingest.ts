@@ -973,17 +973,48 @@ export function getReviewRoundCounts(ticket: string, runStartedAt: string): { re
  * 估計，不是精確量測；跟 finished_at（真實檔案 mtime）性質不同，UI 顯示時
  * 要能分辨。
  */
-export function computeBugStages(ticket: string, runStartedAt: string, tracker: { status: string; completedAt: string | null } | null, running = false): BugStage[] {
+/** worker 執行的票在該台機器上的階段產物檔 mtime 原始資料（task 1，
+ * 2026-09-04）——見 telegram-dispatcher/lib/pipeline-runner/local-stage-files.ts
+ * 的 LocalStageFiles（同形狀，兩邊各自獨立宣告，兩個 repo 沒有 import 關係）。
+ * server.ts 用 lib/cluster-state.ts 的 fetchRemoteStageFiles() 向 worker 拿到
+ * 這份資料後傳進 computeBugStages。 */
+export type RemoteStageFiles = {
+  debugFiles: Record<string, string | null>
+  worktreeBootstrapLog: string | null
+}
+
+/**
+ * remoteFiles（task 1，2026-09-04）：省略／undefined 時完全比照舊行為，直接
+ * 掃 head 本機的 Debug/worktrees 路徑（run.host 是 head 自己執行的票）。帶值
+ * 時改用 worker 回報的 mtime 原始資料組裝同一份階段檢核表——head 沒有這些
+ * 檔案的本機路徑可掃（worker 執行時 Debug/worktrees 只落在 worker 本地檔案
+ * 系統），見 lib/cluster-state.ts fetchRemoteStageFiles() 呼叫處。
+ *
+ * 只有「產物檔存在＋mtime」這部分能做到跟本機執行的票一致；`running` 為
+ * true 時本函式仍會嘗試 inferCurrentBugStage()（transcript 掃描）推定目前
+ * 正在跑哪一步——那份 transcript（~/.claude/projects/...）一樣只在執行機
+ * 本地，remoteFiles 模式下天生推不出來，是本輪已知、留待下一輪的限制（見
+ * server.ts buildPipelineRunPayload 呼叫處與最終回報）。
+ */
+export function computeBugStages(
+  ticket: string,
+  runStartedAt: string,
+  tracker: { status: string; completedAt: string | null } | null,
+  running = false,
+  remoteFiles?: RemoteStageFiles,
+): BugStage[] {
   const dir = join(DEBUG_DIR, ticket)
   // Debug/{ticket} 產物跨同一張票的多次執行共用（重試不會清掉上一輪留下的
   // 檔案）。只認「這次 run 開始之後才更新」的 mtime，避免「重試」後新 run
   // 才剛開始，卻讀到上一輪留下的舊檔案，誤判成本輪已完成、甚至讓
   // finished_at 早於 started_at 顯示出負數耗時。
-  const rawAt = (file: string) => fileMtimeIso(join(dir, `${ticket}-${file}`))
+  const rawAt = (file: string) => (remoteFiles ? (remoteFiles.debugFiles[file] ?? null) : fileMtimeIso(join(dir, `${ticket}-${file}`)))
   const at = (file: string) => {
     const m = rawAt(file)
     return m && m >= runStartedAt ? m : null
   }
+  const worktreeBootstrapRawAt = () =>
+    remoteFiles ? remoteFiles.worktreeBootstrapLog : fileMtimeIso(join('/Users/user/aladdin/worktrees', ticket, 'bootstrap.log'))
   const reviewFiles = ['reviewer-report.md', 'adversarial-review.md', 'tdd-fidelity-review.md']
   const reviewMtimes = reviewFiles.map(f => at(f)).filter((x): x is string => x !== null)
 
@@ -1002,7 +1033,7 @@ export function computeBugStages(ticket: string, runStartedAt: string, tracker: 
     // 只在執行中（或殘留未清）時有訊號——歷史 run 顯示 pending 屬正常。
     // Step 5（fixer）刻意沒有列：它不產出獨立文件，commit 與 reset 都動同一個
     // branch ref，沒有便宜且不誤判的完成訊號（見 pd-stages-note 的 UI 說明）。
-    { key: 'worktree', label: 'Step 4 隔離環境（worktree + bootstrap）', finishedAt: (() => { const m = fileMtimeIso(join('/Users/user/aladdin/worktrees', ticket, 'bootstrap.log')); return m && m >= runStartedAt ? m : null })(), reused: !!fileMtimeIso(join('/Users/user/aladdin/worktrees', ticket, 'bootstrap.log')) },
+    { key: 'worktree', label: 'Step 4 隔離環境（worktree + bootstrap）', finishedAt: (() => { const m = worktreeBootstrapRawAt(); return m && m >= runStartedAt ? m : null })(), reused: !!worktreeBootstrapRawAt() },
     { key: 'review', label: 'Step 6 三重平行審查', finishedAt: reviewMtimes.length === reviewFiles.length ? reviewMtimes.sort().slice(-1)[0]! : null, reused: reviewFiles.every(f => rawAt(f) !== null) },
     // Step 6.5（2026-09-02 create-mr 新增）：三位 reviewer 全 PASSED 後的最終
     // 對抗性驗證。注意 'adversarial-review.md' 是本檔名的子字串——at() 用精確
@@ -1035,7 +1066,11 @@ export function computeBugStages(ticket: string, runStartedAt: string, tracker: 
   // 進行中的 run：從 session transcript 推定此刻在跑哪一步，把該列標成
   // running（覆蓋 done/reused——例如審查否決後重跑 review 時，舊報告的 done
   // 會被即時的 running 蓋掉）。Step 5（fixer）沒有產物列，動態插一列。
-  if (running) {
+  //
+  // remoteFiles 模式（worker 執行的票）目前跳過這段：transcript
+  // （~/.claude/projects/...）只在執行機本地，head 這裡天生推不出來——已知
+  // 限制，留待下一輪（見本函式檔頭與最終回報「殘留風險」）。
+  if (running && !remoteFiles) {
     const cur = inferCurrentBugStage(ticket, runStartedAt)
     if (cur) {
       if (cur.stageKey === 'fixer') {

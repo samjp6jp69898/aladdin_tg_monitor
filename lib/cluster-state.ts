@@ -156,6 +156,51 @@ export async function cancelRemoteJob(url: string, secret: string, ticket: strin
   }
 }
 
+/**
+ * 讀取 worker 白名單目錄下某個檔案的內容（task 1，2026-09-04）：`/api/agent-trace`
+ * 對 worker 執行的 run proxy 用。白名單規則在 worker 那一端（見
+ * telegram-dispatcher/lib/pipeline-runner/local-trace-read.ts 的
+ * isAllowedTracePath，逐字比照 lib/services.ts 的 isAllowedTracePath——兩邊
+ * 各自獨立宣告，改動任一邊都要同步）。打不通/逾時/被拒絕都回 `{ok:false}`，
+ * reason 帶可讀訊息，不拋例外。
+ */
+export type RemoteFileResult = { ok: true; content: string } | { ok: false; reason: string }
+
+export async function fetchRemoteFile(url: string, secret: string, path: string, timeoutMs = 8_000): Promise<RemoteFileResult> {
+  try {
+    const res = await fetch(`${url}/files?path=${encodeURIComponent(path)}`, { headers: { [CLUSTER_TOKEN_HEADER]: secret }, signal: AbortSignal.timeout(timeoutMs) })
+    const body = (await res.json().catch(() => null)) as { ok?: boolean; content?: string; reason?: string } | null
+    if (!body || body.ok !== true || typeof body.content !== 'string') {
+      return { ok: false, reason: body?.reason ?? `worker 回應格式不對（HTTP ${res.status}）` }
+    }
+    return { ok: true, content: body.content }
+  } catch {
+    return { ok: false, reason: 'worker 連不上或逾時未回應' }
+  }
+}
+
+/** worker `GET /jobs/:ticket/stage-files` 的回應形狀（task 1）——見
+ * telegram-dispatcher/lib/pipeline-runner/local-stage-files.ts 的
+ * LocalStageFiles，與 lib/ingest.ts computeBugStages() 的 RemoteStageFiles
+ * 參數同形狀。 */
+export type RemoteStageFiles = { debugFiles: Record<string, string | null>; worktreeBootstrapLog: string | null }
+
+/** 這張 bug 票在 worker 上的階段產物檔 mtime 原始資料（task 1：
+ * `/api/pipelines/run` 組裝 computeBugStages() 用）。打不通/逾時/格式不對回
+ * null——呼叫端據此顯示「暫時無法取得階段進度」，不當作「沒有任何產物」
+ * （那會誤導成好像這步驟真的什麼都沒做）。 */
+export async function fetchRemoteStageFiles(url: string, secret: string, ticket: string, timeoutMs = 8_000): Promise<RemoteStageFiles | null> {
+  try {
+    const res = await fetch(`${url}/jobs/${encodeURIComponent(ticket)}/stage-files`, { headers: { [CLUSTER_TOKEN_HEADER]: secret }, signal: AbortSignal.timeout(timeoutMs) })
+    if (!res.ok) return null
+    const body = (await res.json()) as { ok?: boolean; debugFiles?: unknown; worktreeBootstrapLog?: unknown }
+    if (body?.ok !== true || typeof body.debugFiles !== 'object' || body.debugFiles === null) return null
+    return { debugFiles: body.debugFiles as Record<string, string | null>, worktreeBootstrapLog: (body.worktreeBootstrapLog as string | null) ?? null }
+  } catch {
+    return null
+  }
+}
+
 // ---------- worker 名冊管理（中斷／恢復／移除，2026-08-31）----------
 // 這三個動作實際上是打「head 自己」（telegram-dispatcher server.ts，本機
 // 8787）新增的 /cluster/worker/:name/* 端點——head 的 worker 名冊活在它
@@ -179,3 +224,41 @@ async function postClusterAdmin(path: string, secret: string, timeoutMs = 5_000)
 export const disableWorker = (name: string, secret: string) => postClusterAdmin(`/cluster/worker/${encodeURIComponent(name)}/disable`, secret)
 export const enableWorker = (name: string, secret: string) => postClusterAdmin(`/cluster/worker/${encodeURIComponent(name)}/enable`, secret)
 export const removeWorker = (name: string, secret: string) => postClusterAdmin(`/cluster/worker/${encodeURIComponent(name)}/remove`, secret)
+
+// ---------- 續跑改走一般派工的分派判斷（task 2，2026-08-31 觀察／2026-09-04 修）----------
+// `/api/pipelines/retry` 原本寫死呼叫本機 CLI 版 submitCreateMr()，完全繞過
+// head（telegram-dispatcher server.ts）的 dispatchBug()（worker 分派判斷）。
+// 這裡打 head 自己新增的 POST /cluster/retry（見 cluster-head.ts），跟上面
+// 三個 worker 名冊管理動作同一種模式——同一個長駐 head 行程、同一份記憶體
+// 狀態，不會有雙份登記表競態（詳細理由見 cluster-head.ts /cluster/retry
+// 端點註解）。CLUSTER_SHARED_SECRET 未設定（單機部署）時這條路由整個沒掛，
+// 呼叫端（server.ts）要自行 fallback 回原本的本機 CLI 路徑，不是本函式的
+// 職責。
+
+/** DispatchResult（telegram-dispatcher/lib/cluster/dispatch.ts）的最小形狀——
+ * 本檔不 import 對方型別，只聲明呼叫端需要的欄位（同上方 RemoteCancelResult
+ * 等既有慣例）。*/
+export type RetryDispatchResult =
+  | { ok: true; status: 'started'; pid: number | undefined; runId?: string }
+  | { ok: true; status: 'queued'; position: number; ahead: number; runId?: string }
+  | { ok: true; status: 'already_queued'; position: number; ahead: number }
+  | { ok: true; status: 'already_running' }
+  | { ok: true; status: 'remote_started'; worker: string }
+  | { ok: true; status: 'already_running_remote'; worker: string }
+  | { ok: false; reason: string }
+
+export async function retryRemoteDispatch(secret: string, ticket: string, triggeredByEmail: string | null, timeoutMs = 15_000): Promise<RetryDispatchResult> {
+  try {
+    const res = await fetch(`${HEAD_URL}/cluster/retry`, {
+      method: 'POST',
+      headers: { [CLUSTER_TOKEN_HEADER]: secret, 'content-type': 'application/json' },
+      body: JSON.stringify({ ticket, ...(triggeredByEmail ? { triggeredByEmail } : {}) }),
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+    const body = (await res.json().catch(() => null)) as RetryDispatchResult | null
+    if (!body || typeof body.ok !== 'boolean') return { ok: false, reason: `head 回應格式不對（HTTP ${res.status}）` }
+    return body
+  } catch {
+    return { ok: false, reason: 'head 連不上或逾時未回應（/cluster/retry）' }
+  }
+}

@@ -75,7 +75,9 @@ export const topics = {
   agentTrace: defineTopic({
     key: 'agent-trace',
     intervalMs: POLL_INTERVAL_MS,
-    fetch: (p: { path: string }, signal: AbortSignal) => api.fetchAgentTrace(p.path, signal),
+    // host（task 1，2026-09-04）：worker 執行的 agent 讓後端 proxy 過去，見
+    // api/endpoints.ts fetchAgentTrace() 註解。
+    fetch: (p: { path: string; host?: string }, signal: AbortSignal) => api.fetchAgentTrace(p.path, p.host, signal),
   }),
 
   /** `GET /api/toolsmith` */

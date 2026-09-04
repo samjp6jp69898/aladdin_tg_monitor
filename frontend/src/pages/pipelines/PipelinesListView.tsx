@@ -47,11 +47,7 @@ export function PipelinesListView({ resource }: { resource: Resource<PipelinesRe
     })
     if (result === null) return
     const raw = result.raw as RetryPipelineResponse
-    window.alert(
-      result.ok
-        ? `已觸發續跑（pid ${raw.pid}），列表會在下個 tick 顯示新的一次執行。`
-        : `重試失敗：${raw.reason || 'unknown'}`,
-    )
+    window.alert(result.ok ? `已觸發續跑（${describeRetryOutcome(raw)}），列表會在下個 tick 顯示新的一次執行。` : `重試失敗：${raw.reason || 'unknown'}`)
     await resource.reload()
   }
 
@@ -108,7 +104,20 @@ export function PipelinesListView({ resource }: { resource: Resource<PipelinesRe
         if (host === 'head') return '本機'
         if (host === 'unknown_pre_migration') return '未知（遷移前）'
         if (!host) return '未知'
-        return host
+        // 任務 3（2026-09-04）：worker 執行的 history 列補上跟 remote 列一樣的
+        // worker 詳情連結——原本只有純文字，跟 remote 列（互動點 8）比起來
+        // 少了一個入口，這輪順手補齊。
+        return (
+          <a
+            href={workersPath(host, row.data.ticket)}
+            onClick={e => {
+              e.preventDefault()
+              navigate(workersPath(host, row.data.ticket))
+            }}
+          >
+            {host}
+          </a>
+        )
       },
     },
     {
@@ -286,4 +295,16 @@ export function PipelinesListView({ resource }: { resource: Resource<PipelinesRe
       />
     </div>
   )
+}
+
+/**
+ * 重試觸發成功後的人話描述（task 2，2026-09-04）：cluster 啟用時可能落到某台
+ * worker（`status`/`worker` 才會出現，見 api/types.ts RetryPipelineResponse
+ * 註解），單機部署仍只有 `pid`——兩種形狀都要能講清楚「續跑去哪了」。
+ */
+function describeRetryOutcome(raw: RetryPipelineResponse): string {
+  if (raw.status === 'remote_started' || raw.status === 'already_running_remote') return `派工至 worker ${raw.worker}`
+  if (raw.status === 'queued') return '已排入背景佇列'
+  if (raw.status === 'already_running' || raw.status === 'already_queued') return '已在執行中/排隊中'
+  return `pid ${raw.pid}`
 }

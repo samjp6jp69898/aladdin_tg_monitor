@@ -110,9 +110,13 @@ export function fetchPipelineRun(key: string, signal?: AbortSignal): Promise<Pip
  * `GET /api/agent-trace` — 單一 agent 對話 trace。
  * `path` 必須通過後端白名單（AGENT_TRACE_DIR/*.json 或 DISPATCHER_LOG_DIR/*.stdout.log），
  * 否則回 **403 純文字** `path not allowed`（ApiError.bodyText 可讀到）。
+ * `host`（task 1，2026-09-04）：這個 agent 執行於哪台機器（帶 `AgentRunRow.host`），
+ * 非 head 時後端會 proxy 給對應的 worker——省略或帶 `undefined` 一律當作本機
+ * （沒有這個欄位的舊資料／sqlite 讀取面沒有 host 概念，行為與加入這個參數之前
+ * 100% 相同）。
  */
-export function fetchAgentTrace(path: string, signal?: AbortSignal): Promise<AgentTraceResponse> {
-  return get<AgentTraceResponse>('/api/agent-trace', { path }, signal)
+export function fetchAgentTrace(path: string, host?: string, signal?: AbortSignal): Promise<AgentTraceResponse> {
+  return get<AgentTraceResponse>('/api/agent-trace', { path, host }, signal)
 }
 
 /** `POST /api/pipelines/cancel` — 取消執行中的 pipeline。`ticket` 需符合 /^[A-Z]+-\d+$/。 */

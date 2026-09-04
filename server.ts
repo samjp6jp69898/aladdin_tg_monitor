@@ -25,7 +25,22 @@ import { startCollectors, getLastProbes, listRunningPipelineProcs, listBugLocks,
 import { loadConnectedUsers, loadPendingSenders, loadAllTechUsers, assignChatId, unsetChatId, sendTestMessage } from './lib/tg-users.ts'
 import { getWebhookStatus } from './lib/webhook-status.ts'
 import { fetchPipelineLimits, readQueuedTickets } from './lib/pipeline-queue-state.ts'
-import { getClusterSecret, listWorkers, listDispatchEntries, fetchWorkerHealth, fetchWorkerCapacity, fetchWorkerJobStatus, cancelRemoteJob, disableWorker, enableWorker, removeWorker } from './lib/cluster-state.ts'
+import {
+  getClusterSecret,
+  listWorkers,
+  listDispatchEntries,
+  fetchWorkerHealth,
+  fetchWorkerCapacity,
+  fetchWorkerJobStatus,
+  cancelRemoteJob,
+  disableWorker,
+  enableWorker,
+  removeWorker,
+  fetchRemoteFile,
+  fetchRemoteStageFiles,
+  retryRemoteDispatch,
+} from './lib/cluster-state.ts'
+import { RUNS_HOST } from './lib/mon-db.ts'
 import { listToolsmithRuns } from './lib/toolsmith.ts'
 import { attachAgentRuns } from './lib/agent-runs-summary.ts'
 
@@ -268,6 +283,47 @@ app.get('/api/status-log', async c => {
  * lazy import lib/read/mysql.ts：sqlite 模式下不觸碰 mysql2（MAJOR-D1 既有
  * 紀律，見 lib/read/index.ts 的 initReader）。
  */
+/** `run.host`（`agent_runs`/`runs.host`，只有 MON_READ_SOURCE=mysql 才會帶）
+ * 對應的 worker 位址——`host` 存的是 CLUSTER_WORKER_NAME，等於 worker 名冊
+ * 的 `.name`（見 telegram-dispatcher/lib/monitor-db/env.ts 的 MON_HOST 慣例）。
+ * 查不到（worker 已退役/名冊沒有）回 null。 */
+function findWorkerByName(name: string): { name: string; url: string } | null {
+  return listWorkers().find(w => w.name === name) ?? null
+}
+
+/**
+ * 修正「worker 執行中的 bug/demand run，`running` 被誤判成 false」（task 1，
+ * 2026-09-04 觀察並修正）：本檔原本每一列的 `running` 只靠 head 本機 ps 掃描
+ * （`listRunningPipelineProcs()`），worker 執行的行程天生不在 head 的 ps
+ * 快照裡——一張票明明還在某台 worker 上跑，head 卻永遠回報「沒在跑」。
+ *
+ * 後果不只是畫面好看與否：`retryable`／取消按鈕的顯示都靠 `running` 判斷
+ * （見上面 buildPipelinesPayload 迴圈、PipelinesListView.tsx 的 actions 欄）——
+ * 誤判為 false 會讓使用者對一張其實還在執行的 worker 票按不到取消。
+ *
+ * 只對「這裡的 rows 已經確定還沒結束（`finished_at===null`）且執行機不是
+ * head」的列另外即時問一次該 worker 的 `/jobs/:ticket`（ground truth）：
+ * 已結束的 run 的 `finished_at` 是執行機自己寫的（R1：`runs` 只有執行機自己
+ * 寫），不受 head 本機 ps 掃描影響，本來就準——這批通常只有個位數列（cluster
+ * 併發上限本來就不大），逐列打一次 worker 成本可接受；secret 未設定
+ * （單機部署）或查無該 worker 時整段是 no-op，維持原本（錯誤但無害）的
+ * false，不讓這段修正在單機模式下引入任何行為變化。
+ */
+async function correctRemoteRunningFlags(rows: { kind: string; ticket: string; host?: string; finished_at: string | null; running: boolean }[]): Promise<void> {
+  const secret = getClusterSecret()
+  if (!secret) return
+  const candidates = rows.filter(r => r.finished_at === null && r.host && r.host !== RUNS_HOST)
+  if (candidates.length === 0) return
+  await Promise.all(
+    candidates.map(async r => {
+      const worker = findWorkerByName(r.host!)
+      if (!worker) return
+      const status = await fetchWorkerJobStatus(worker.url, secret, r.ticket)
+      if (status) r.running = status.queueState === 'running' || status.queueState === 'queued'
+    }),
+  )
+}
+
 async function listRemoteDispatchCandidates(): Promise<RemoteDispatchCandidate[]> {
   if (READ_SOURCE !== 'mysql') {
     // 記憶體登記表（cluster-state.ts DispatchEntry）沒有 remoteRunId 欄位——
@@ -331,6 +387,14 @@ async function buildPipelinesPayload() {
     // tracker（避免對列表裡最多 300 列都同步呼叫 shell）；真正能不能重試以
     // retry 端點送出當下的即時檢查為準，這裡只保證「大致準、失敗會有清楚錯誤訊息」。
     r.retryable = r.kind === 'bug' && !r.running && isBugOutcomeRetryable(r.outcome)
+  }
+  // task 1：worker 執行中的列，running 改問該 worker 本人（見函式註解）。
+  // 這會讓上面剛算好的 retryable 對這批列失真（它假設 running 已經是最終
+  // 值）——worker 執行中的票本來就不該顯示重試按鈕，重算一次同一條件即可，
+  // 不需要整段搬到迴圈之後。
+  await correctRemoteRunningFlags(rows)
+  for (const r of rows) {
+    if (r.host && r.host !== RUNS_HOST) r.retryable = r.kind === 'bug' && !r.running && isBugOutcomeRetryable(r.outcome)
   }
   return { rows, queued, remote }
 }
@@ -421,6 +485,18 @@ async function buildPipelineRunPayload(key: string) {
   me.running = me.kind === 'bug'
     ? procs.some(p => p.kind === 'bug' && p.extra === me.stdout_path)
     : me.finished_at === null && procs.some(p => p.kind === 'demand' && p.ticket === me.ticket) && latest.key === me.key
+  // task 1：這張票在 worker 上執行時，上面的 head 本機 ps 掃描天生看不到，
+  // running 會被誤判成 false（見 correctRemoteRunningFlags 註解，同一個修正
+  // 這裡也需要一份——這個 endpoint 只查單一 ticket，不值得為它複用那個吃
+  // 陣列的版本）。已結束的 run 不受影響（finished_at 是執行機自己寫的）。
+  if (me.finished_at === null && me.host && me.host !== RUNS_HOST) {
+    const secret = getClusterSecret()
+    const worker = secret ? findWorkerByName(me.host) : null
+    if (worker && secret) {
+      const status = await fetchWorkerJobStatus(worker.url, secret, me.ticket)
+      if (status) me.running = status.queueState === 'running' || status.queueState === 'queued'
+    }
+  }
   // 需求單：把 demand-pipeline.log 該區間的進度行一併回傳
   let progress: { ts: string; msg: string }[] = []
   if (run.kind === 'demand') {
@@ -442,12 +518,32 @@ async function buildPipelineRunPayload(key: string) {
   // 最新一次，重複觸發時活著的舊 run 反而分不到檢核表（實際踩過）。
   const ticketHasRunningProc = procs.some(p => p.kind === 'bug' && p.ticket === run.ticket)
   let stages: ReturnType<typeof computeBugStages> = []
+  // task 1：worker 執行的票，Debug/worktrees 產物只落在 worker 本地檔案系統，
+  // head 沒有本機路徑可掃——查不到 worker 位址/secret 未設定/worker 逾時連
+  // 不上時明確給一個理由，不要讓整段功能因為 worker 一時連不上就靜默顯示成
+  // 「沒有任何產物」（那會誤導使用者以為 pipeline 什麼都還沒做）。
+  let stagesUnavailableReason: string | null = null
   if (run.kind === 'bug' && (me.running || (!ticketHasRunningProc && latest.key === me.key))) {
-    // 非同步版本（execFile 非 execFileSync）——這個 endpoint 是票詳情頁開著時
-    // 定期輪詢的，用 *Sync 版本會撞 lib/ingest.ts 檔頭記載的「handler 內同步
-    // spawn 遇客戶端中斷會 segfault」既有踩坑（見 listRunningPipelineProcs 旁
-    // 的註解）。
-    stages = computeBugStages(run.ticket, run.started_at, await readTrackerStatusAsync(run.ticket), me.running)
+    if (me.host && me.host !== RUNS_HOST) {
+      const secret = getClusterSecret()
+      const worker = secret ? findWorkerByName(me.host) : null
+      if (!worker || !secret) {
+        stagesUnavailableReason = `此票執行於 worker「${me.host}」，但目前查不到該 worker 的位址或 CLUSTER_SHARED_SECRET 未設定，暫時無法取得階段進度`
+      } else {
+        const remoteFiles = await fetchRemoteStageFiles(worker.url, secret, run.ticket)
+        if (remoteFiles) {
+          stages = computeBugStages(run.ticket, run.started_at, await readTrackerStatusAsync(run.ticket), me.running, remoteFiles)
+        } else {
+          stagesUnavailableReason = `此票執行於 worker「${me.host}」，但目前連不上該 worker 或逾時，暫時無法取得階段進度，請稍後重試`
+        }
+      }
+    } else {
+      // 非同步版本（execFile 非 execFileSync）——這個 endpoint 是票詳情頁開著時
+      // 定期輪詢的，用 *Sync 版本會撞 lib/ingest.ts 檔頭記載的「handler 內同步
+      // spawn 遇客戶端中斷會 segfault」既有踩坑（見 listRunningPipelineProcs 旁
+      // 的註解）。
+      stages = computeBugStages(run.ticket, run.started_at, await readTrackerStatusAsync(run.ticket), me.running)
+    }
   }
   // 審查輪數（2026-09-02）：跑完的 run 靠 DB 欄位（collector tick 已在最後
   // 一次掃描時持久化，見 ingest.ts persistReviewRounds）；還在跑的 run 額外
@@ -462,7 +558,7 @@ async function buildPipelineRunPayload(key: string) {
       else if (s.key === 'final-review' && finalReviewRounds > 0) s.rounds = finalReviewRounds
     }
   }
-  return { run: me, progress, stages }
+  return { run: me, progress, stages, stagesUnavailableReason }
 }
 
 app.get('/api/pipelines/run', async c => {
@@ -471,13 +567,36 @@ app.get('/api/pipelines/run', async c => {
   return c.json(payload)
 })
 
-// 單一 agent 的完整對話：現讀 trace JSON（或 bug pipeline 的 stdout.log），整理成 turns
-app.get('/api/agent-trace', c => {
+// 單一 agent 的完整對話：現讀 trace JSON（或 bug pipeline 的 stdout.log），整理成 turns。
+// task 1（2026-09-04）：`host` 帶非 head 值時（前端從該 agent 列的 AgentRunRow.host
+// 帶過來，見 frontend fetchAgentTrace 呼叫處）改向該 worker 的 GET /files 要內容，
+// 不再對 worker 執行的 run 直接掃 head 本機路徑（那個絕對路徑只存在於 worker
+// 自己的檔案系統，head 一律 404，見 lib/cluster-state.ts fetchRemoteFile 註解）。
+app.get('/api/agent-trace', async c => {
   const path = c.req.query('path') ?? ''
+  const host = c.req.query('host') ?? ''
   if (!isAllowedTracePath(path)) return c.text('path not allowed', 403)
-  if (!existsSync(path)) return c.json({ error: 'missing' }, 404)
+  let rawText: string
+  if (host && host !== RUNS_HOST) {
+    const secret = getClusterSecret()
+    const worker = secret ? findWorkerByName(host) : null
+    if (!worker || !secret) {
+      return c.json({ error: `此 agent 執行於 worker「${host}」，但目前查不到該 worker 的位址或 CLUSTER_SHARED_SECRET 未設定，暫時無法取得對話內容` }, 502)
+    }
+    const remote = await fetchRemoteFile(worker.url, secret, path)
+    if (!remote.ok) {
+      // worker 端 not_allowed/missing 也會落在這裡（reason 直接透傳），跟本機
+      // 分支的 403/404 語意不完全對齊，但前端只認 traceErrorMessage() 讀
+      // body.error 純文字，不特別分岔狀態碼——502 統一代表「這次沒能從 worker
+      // 拿到內容」，reason 已經足夠讓使用者判斷是白名單問題還是連線問題。
+      return c.json({ error: `worker「${host}」暫時無法取得 trace 內容：${remote.reason}` }, 502)
+    }
+    rawText = remote.content
+  } else {
+    if (!existsSync(path)) return c.json({ error: 'missing' }, 404)
+    rawText = readFileSync(path, 'utf8')
+  }
   let raw: any
-  const rawText = readFileSync(path, 'utf8')
   try {
     raw = JSON.parse(rawText)
   } catch (err) {
@@ -611,6 +730,22 @@ app.post('/api/pipelines/retry', async c => {
   const running = listRunningPipelineProcs()
   if (running.some(p => p.kind === 'bug' && p.ticket === ticket)) return c.json({ ok: false, reason: '這張票目前還在跑，不能重複觸發' }, 409)
   if (running.filter(p => p.kind === 'bug').length >= RETRY_CONCURRENCY_LIMIT) return c.json({ ok: false, reason: `背景 pipeline 併發已達上限（${RETRY_CONCURRENCY_LIMIT}），稍後再試` }, 429)
+  // task 2：上面的 running 只查 head 本機 ps——這張票若正在某台 worker 上跑，
+  // head 的 ps 快照天生看不到（同 correctRemoteRunningFlags 的既有落差）。
+  // tracker 狀態 'in_progress' 同時涵蓋「真的還在跑」與「卡住需要人工重試」
+  // 兩種情境（下面 tracker 檢查會放行 'in_progress'），只靠 tracker 狀態分不
+  // 出來，這裡額外向 worker 求證一次，避免對一張還在執行中的 worker 票重複
+  // 觸發（兩台同時跑同一張票）。
+  const clusterSecret = getClusterSecret()
+  if (clusterSecret) {
+    const remoteWorker = await findRemoteWorkerForTicket('bug', ticket)
+    if (remoteWorker) {
+      const status = await fetchWorkerJobStatus(remoteWorker.url, clusterSecret, ticket)
+      if (status?.queueState === 'running' || status?.queueState === 'queued') {
+        return c.json({ ok: false, reason: `這張票目前還在 worker「${remoteWorker.name}」上跑，不能重複觸發` }, 409)
+      }
+    }
+  }
 
   // 即時查一次（非快取、非同步版本），這裡是唯一的權限判斷——上面 /api/pipelines
   // 回傳的 retryable 只是給前端顯示按鈕用的粗略提示（見 isBugOutcomeRetryable
@@ -630,12 +765,32 @@ app.post('/api/pipelines/retry', async c => {
   } catch (err) {
     return c.json({ ok: false, reason: `tracker.sh set 失敗：${err}` }, 500)
   }
-  // CLI 邊界呼叫 telegram-dispatcher 的 spawn-create-mr.ts（見檔頭 import 註解），
-  // 不是直接 import spawnCreateMr——結果走 stdout 一行 JSON + exit code。
-  // 2026-09-01：重試沿用上一筆 run 的發起人（`--triggered-by-email`），否則
-  // 重試出來的 run 在列表「發起人」欄會空白，看不出這張單是誰認領的。取不到
-  // （上一筆本來就是人工 CLI 跑的、sidecar 缺檔）就不帶旗標，行為同以前。
+  // 2026-09-01：重試沿用上一筆 run 的發起人，否則重試出來的 run 在列表
+  // 「發起人」欄會空白，看不出這張單是誰認領的。取不到（上一筆本來就是人工
+  // CLI 跑的、sidecar 缺檔）就不帶，行為同以前。
   const prevEmail = await readLastTriggeredByEmail(ticket)
+
+  // task 2（2026-09-04）：cluster 啟用時改打 head 的 POST /cluster/retry，讓
+  // 續跑走跟一般派工（claim.ts 的 dispatchBug()）相同的分派判斷——resume 靠
+  // checkout 既有 mr/{ticket} 分支到新 worktree，不依賴哪台機器的本地磁碟
+  // 殘留狀態，所以可能落到跟原本執行機不同的 worker，這是預期內、可接受的
+  // 行為（不用特別要求一定要回到原本那台機器）。見 lib/cluster-state.ts
+  // retryRemoteDispatch() 與 telegram-dispatcher/lib/cluster/cluster-head.ts
+  // 的 /cluster/retry 端點註解。
+  //
+  // cluster 停用（單機部署，CLUSTER_SHARED_SECRET 未設定）時維持原本的本機
+  // CLI 路徑——行為與加入這次改動之前 100% 相同（同 cluster-env.ts 檔頭的
+  // 既有不變式）。CLI 邊界呼叫 telegram-dispatcher 的 spawn-create-mr.ts（見
+  // 檔頭 import 註解），不是直接 import spawnCreateMr——結果走 stdout 一行
+  // JSON + exit code。
+  if (clusterSecret) {
+    const result = await retryRemoteDispatch(clusterSecret, ticket, prevEmail)
+    if (!result.ok) return c.json({ ok: false, reason: `分派失敗（票已設回 rerun，可再按一次重試）：${result.reason}` }, 500)
+    if (result.status === 'started' || result.status === 'queued') return c.json({ ok: true, pid: result.status === 'started' ? result.pid : undefined, status: result.status })
+    if (result.status === 'remote_started' || result.status === 'already_running_remote') return c.json({ ok: true, status: result.status, worker: result.worker })
+    return c.json({ ok: true, status: result.status })
+  }
+
   const spawnArgs = [SPAWN_CREATE_MR_SCRIPT, ticket, '--resume', ...(prevEmail ? ['--triggered-by-email', prevEmail] : [])]
   try {
     const { stdout } = await execFileAsync('bun', spawnArgs, { encoding: 'utf8', timeout: 10_000 })
