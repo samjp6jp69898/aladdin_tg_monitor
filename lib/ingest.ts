@@ -468,6 +468,7 @@ function reconcileWithTracker(ticket: string, outcome: string, finishedAt: strin
   if (tracker.status === 'done') return { outcome: 'recovered', finishedAt: tracker.completedAt }
   if (tracker.status === 'failed') return { outcome: 'failed（人工判定）', finishedAt: tracker.completedAt }
   if (tracker.status === 'needs_qa') return { outcome: 'needs_qa_clarification（人工判定）', finishedAt: tracker.completedAt }
+  if (tracker.status === 'analysis_done') return { outcome: 'analysis_done（人工判定）', finishedAt: tracker.completedAt } // pipeline-modes Phase 2
   return { outcome, finishedAt }
 }
 

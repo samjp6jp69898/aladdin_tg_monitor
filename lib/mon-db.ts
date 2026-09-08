@@ -975,6 +975,10 @@ export function mapTrackerStatusToOutcome(status: string): string | null {
   if (status === 'done') return 'recovered'
   if (status === 'failed') return 'failed'
   if (status === 'needs_qa') return 'needs_qa_clarification'
+  // pipeline-modes Phase 2（2026-09-08）：「只做問題分析」跑完的暫停態——跟
+  // needs_qa 一樣是「有人接手處理過、正常停下」的終態，值域見 dispatcher
+  // lib/monitor-db/types.ts KNOWN_OUTCOME_TIER.analysis_done。
+  if (status === 'analysis_done') return 'analysis_done'
   return null
 }
 
