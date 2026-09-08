@@ -1101,10 +1101,11 @@ function trackerOf(map: Record<string, { status: string; completedAt?: string | 
 }
 
 describe('mapTrackerStatusToOutcome（D-1：值域內裸值，不帶「（人工判定）」後綴）', () => {
-  test('done → recovered；failed → failed；needs_qa → needs_qa_clarification；其餘（pending/rerun/in_progress/未知）→ null 不覆蓋', () => {
+  test('done → recovered；failed → failed；needs_qa → needs_qa_clarification；analysis_done → analysis_done；其餘（pending/rerun/in_progress/未知）→ null 不覆蓋', () => {
     expect(mapTrackerStatusToOutcome('done')).toBe('recovered')
     expect(mapTrackerStatusToOutcome('failed')).toBe('failed')
     expect(mapTrackerStatusToOutcome('needs_qa')).toBe('needs_qa_clarification')
+    expect(mapTrackerStatusToOutcome('analysis_done')).toBe('analysis_done')
     expect(mapTrackerStatusToOutcome('pending')).toBeNull()
     expect(mapTrackerStatusToOutcome('rerun')).toBeNull()
     expect(mapTrackerStatusToOutcome('in_progress')).toBeNull()
@@ -1159,7 +1160,7 @@ describe('reconcileStaleOutcomesToMonDb（W6）', () => {
     expect(trackerCalls.length).toBe(0)
   })
 
-  test('tracker failed / needs_qa → 寫值域內裸值（D-1）；tracker 還沒接手（null / pending / completedAt 不晚於 finished_at）→ 不覆蓋', async () => {
+  test('tracker failed / needs_qa / analysis_done → 寫值域內裸值（D-1）；tracker 還沒接手（null / pending / completedAt 不晚於 finished_at）→ 不覆蓋', async () => {
     restoreFlag = setMonDbFlag('1')
     const pool = new FakeReconcilePool()
     pool.rows.set('run-f', staleRow('run-f', 'FAQ-92', 'infra_failure'))
@@ -1167,6 +1168,7 @@ describe('reconcileStaleOutcomesToMonDb（W6）', () => {
     pool.rows.set('run-p', staleRow('run-p', 'FAQ-94', 'timeout'))
     pool.rows.set('run-n', staleRow('run-n', 'FAQ-95', 'skipped'))
     pool.rows.set('run-e', staleRow('run-e', 'FAQ-96', 'timeout'))
+    pool.rows.set('run-a', staleRow('run-a', 'FAQ-97', 'infra_failure'))
 
     const r = await reconcileStaleOutcomesToMonDb(
       pool,
@@ -1176,18 +1178,21 @@ describe('reconcileStaleOutcomesToMonDb（W6）', () => {
         'FAQ-94': { status: 'pending', completedAt: null }, // 還沒被接手
         'FAQ-95': null, // tracker 查不到
         'FAQ-96': { status: 'done', completedAt: new Date(Date.now() - 7200_000).toISOString() }, // 更早的一次 done，不是這次執行的解決
+        'FAQ-97': { status: 'analysis_done' },
       }),
       undefined,
       0,
     )
-    expect(r).toEqual({ swept: true, applied: 2 })
+    expect(r).toEqual({ swept: true, applied: 3 })
     expect(pool.rows.get('run-f')!.outcome).toBe('failed')
     expect(pool.rows.get('run-f')!.outcome_source).toBe('tracker_reconcile')
     expect(pool.rows.get('run-q')!.outcome).toBe('needs_qa_clarification')
     expect(pool.rows.get('run-p')!.outcome).toBe('timeout') // 原值不動
     expect(pool.rows.get('run-n')!.outcome).toBe('skipped')
     expect(pool.rows.get('run-e')!.outcome).toBe('timeout')
-    expect(pool.calls.filter(c => c.startsWith('w6:')).length).toBe(2)
+    expect(pool.rows.get('run-a')!.outcome).toBe('analysis_done')
+    expect(pool.rows.get('run-a')!.outcome_source).toBe('tracker_reconcile')
+    expect(pool.calls.filter(c => c.startsWith('w6:')).length).toBe(3)
   })
 
   test('D-3 範圍限制：tier 1（unknown_failure 等）與非未解決分類、出窗、非 bug、非本機列都不是候選', async () => {

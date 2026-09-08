@@ -61,9 +61,10 @@ describe('isOutcomeDifference3Exempt', () => {
   test('sqlite 已轉 recovered 且 mysql 仍 tier1 → 豁免', () => {
     expect(isOutcomeDifference3Exempt('recovered', 1)).toBe(true)
   })
-  test('人工判定兩種形狀也豁免', () => {
+  test('人工判定三種形狀也豁免', () => {
     expect(isOutcomeDifference3Exempt('failed（人工判定）', 1)).toBe(true)
     expect(isOutcomeDifference3Exempt('needs_qa_clarification（人工判定）', 1)).toBe(true)
+    expect(isOutcomeDifference3Exempt('analysis_done（人工判定）', 1)).toBe(true)
   })
   test('mysql tier=2（已被正常 reconcile）不豁免——這才是真差異該抓的情況', () => {
     expect(isOutcomeDifference3Exempt('recovered', 2)).toBe(false)

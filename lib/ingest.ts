@@ -196,6 +196,8 @@ function scanRunningPipelineProcs(): RunningProc[] {
       // resume 退到 $4：`run-create-mr <ticket> <stdout> [mode] [resume]`。mode 群組寫
       // 可選以相容加 mode 之前就 spawn 的舊 wrapper。與 telegram-dispatcher 的
       // post-run-notify.ts RUN_CREATE_MR_PROC_RE、local-proc-scan.ts 同款正則，三處同步改。
+      // mode 值域須與 telegram-dispatcher lib/pipeline-runner/bug-mode.ts BUG_MODES 同步
+      // （兩個獨立 repo，不互相 import，改動要手動同步）。
       let mm = /^bash -c [\s\S]*\brun-create-mr\s+([A-Z]+-\d+)\s+(\S+?)(?:\s+(?:full|analysis|fix|reanalyze))?(?:\s+resume)?\s*$/.exec(cmd)
       if (mm) {
         res.push({ pid: Number(m[1]), etime, kind: 'bug', ticket: mm[1], extra: mm[2] })

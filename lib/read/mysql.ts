@@ -346,7 +346,8 @@ export const AGENT_RUNS_SELECT = `
  *
  * 兩軌的寫入差異（97 的 W6 tracker reconcile，a7 已核准）：
  *   - sqlite（`tg-monitor/lib/ingest.ts` 的 `reconcileWithTracker`）：outcome 直接寫
- *     顯示字串 `recovered` / `failed（人工判定）` / `needs_qa_clarification（人工判定）`。
+ *     顯示字串 `recovered` / `failed（人工判定）` / `needs_qa_clarification（人工判定）` /
+ *     `analysis_done（人工判定）`。
  *   - mysql（W6）：寫值域內裸值 + `outcome_source='tracker_reconcile'`。
  *     §11.2 驗收禁值域外的值；把來源編碼進值字串會讓一個欄位承載兩種資訊。
  *
@@ -355,7 +356,9 @@ export const AGENT_RUNS_SELECT = `
  */
 function displayOutcome(outcome: string | null, outcomeSource: string | null): string | null {
   if (outcome === null || outcomeSource !== 'tracker_reconcile') return outcome
-  return outcome === 'failed' || outcome === 'needs_qa_clarification' ? `${outcome}（人工判定）` : outcome
+  return outcome === 'failed' || outcome === 'needs_qa_clarification' || outcome === 'analysis_done'
+    ? `${outcome}（人工判定）`
+    : outcome
 }
 
 function toPipelineRunRow(r: any): PipelineRunRow {

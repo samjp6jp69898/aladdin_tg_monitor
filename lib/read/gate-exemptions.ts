@@ -51,7 +51,7 @@ export function isFinishedAtExempt(outcomeSource: string | null): boolean {
 
 /** C5 outcome「差異 3」豁免（§9.2-2）：sqlite 轉 recovered/人工判定，
  * mysql 停在 tier 1（依設計不被 W6 reconcile）。 */
-const OUTCOME_TIER1_SQLITE_SHAPES = new Set(['recovered', 'failed（人工判定）', 'needs_qa_clarification（人工判定）'])
+const OUTCOME_TIER1_SQLITE_SHAPES = new Set(['recovered', 'failed（人工判定）', 'needs_qa_clarification（人工判定）', 'analysis_done（人工判定）'])
 export function isOutcomeDifference3Exempt(sqliteOutcome: string | null, mysqlOutcomeTier: number | null): boolean {
   return sqliteOutcome !== null && OUTCOME_TIER1_SQLITE_SHAPES.has(sqliteOutcome) && mysqlOutcomeTier === 1
 }
