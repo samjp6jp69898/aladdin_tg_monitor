@@ -45,6 +45,13 @@ export const topics = {
     fetch: (p: { days?: number }, signal: AbortSignal) => api.fetchStats(p.days, signal),
   }),
 
+  /** `GET /api/maintenance` — 維護模式現況（head + 每台 worker）。 */
+  maintenance: defineTopic({
+    key: 'maintenance',
+    intervalMs: POLL_INTERVAL_MS,
+    fetch: (_: void, signal: AbortSignal) => api.fetchMaintenance(signal),
+  }),
+
   /** `GET /api/status-log` */
   statusLog: defineTopic({
     key: 'status-log',

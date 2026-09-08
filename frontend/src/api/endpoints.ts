@@ -21,6 +21,8 @@ import type {
   LogSinceResponse,
   LogTailResponse,
   LogsResponse,
+  MaintenanceResponse,
+  MaintenanceToggleResponse,
   OkReason,
   OkResult,
   OverviewResponse,
@@ -64,6 +66,18 @@ export function fetchOverview(signal?: AbortSignal): Promise<OverviewResponse> {
 /** `POST /api/services/restart` — 重啟某個 launchd 服務。成功訊息前綴 `RESTART_OK`。 */
 export function postServiceRestart(id: string, signal?: AbortSignal): Promise<OkResult> {
   return postResult<OkResult>('/api/services/restart', { id }, signal)
+}
+
+/* ────────────────────────────── 維護模式 ────────────────────────────── */
+
+/** `GET /api/maintenance` — head + 每台 worker 的維護模式現況。 */
+export function fetchMaintenance(signal?: AbortSignal): Promise<MaintenanceResponse> {
+  return get<MaintenanceResponse>('/api/maintenance', undefined, signal)
+}
+
+/** `POST /api/maintenance` — 一鍵切換 head + 全部已註冊 worker。 */
+export function postMaintenance(on: boolean, signal?: AbortSignal): Promise<MaintenanceToggleResponse> {
+  return postResult<MaintenanceToggleResponse>('/api/maintenance', { on }, signal)
 }
 
 /* ────────────────────────────── events ────────────────────────────── */

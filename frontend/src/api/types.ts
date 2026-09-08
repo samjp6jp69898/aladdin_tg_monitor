@@ -27,6 +27,30 @@ export interface OkReason {
   reason?: string
 }
 
+/* ────────────────────────────── GET/POST /api/maintenance ────────────────────────────── */
+
+/** 單台 worker 的維護模式現況；`on: null` = 打不到該台（或 secret 未設定）。 */
+export interface MaintenanceWorkerEntry {
+  name: string
+  url: string
+  on: boolean | null
+}
+
+/** `GET /api/maintenance` */
+export interface MaintenanceResponse {
+  secretConfigured: boolean
+  head: { on: boolean }
+  workers: MaintenanceWorkerEntry[]
+}
+
+/** `POST /api/maintenance` 的回傳形狀——不是 `{ ok, result | reason }` 這種單一訊息慣例，
+ * 逐台結果都要顯示，前端讀這個型別而不是走 `normalizeActionResult()`。 */
+export interface MaintenanceToggleResponse {
+  ok: boolean
+  head: { ok: boolean }
+  workers: { name: string; ok: boolean }[]
+}
+
 /* ────────────────────────────── GET /api/overview ────────────────────────────── */
 
 /** lib/ingest.ts:854-862 */

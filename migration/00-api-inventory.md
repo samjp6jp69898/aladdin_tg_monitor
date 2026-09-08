@@ -7,10 +7,11 @@
 來源：`/Users/user/aladdin/tg-monitor/server.ts`（809 行，讀於 2026-09-02）。
 輔助讀取（僅為確認回傳欄位）：`lib/services.ts`、`lib/db.ts`、`lib/ingest.ts`、`lib/tg-users.ts`、`lib/webhook-status.ts`、`lib/pipeline-queue-state.ts`、`lib/cluster-state.ts`、`lib/toolsmith.ts`；前端 tab 名稱對照讀 `public/index.html`。
 
-**端點總數：36**（`grep -cE "app\.(get|post)\(" server.ts` = 36，2026-09-02 實測）。
+**端點總數：38**（`grep -cE "app\.(get|post)\(" server.ts` = 38，2026-09-08 實測）。
 組成：**原始盤點的 32 個 API 端點**（各有 `###` 小節）＋ Phase 8 新增的 `GET /api/stream`（`###` 小節）
 與 `GET /api/read-source`（獨立 `##` 小節）＋ React 前端的兩條靜態路由 `GET /next`、`GET /next/*`
-（見下方「前端靜態路由」節）。**原有 32 個端點的路徑、參數、回應形狀一律未變**——這是後端改造
+（見下方「前端靜態路由」節）＋ 2026-09-08 新增的 `GET /api/maintenance`／`POST /api/maintenance`
+（各有 `###` 小節，見「維護模式」節）。**原有 32 個端點的路徑、參數、回應形狀一律未變**——這是後端改造
 「回應形狀不變」的驗收基準。
 
 **SSE：有一支**（2026-09-02 Phase 8 新增 `GET /api/stream`，見本檔末的「SSE 端點」節）。**原有 32 個端點的路徑、參數、回應形狀一律不變**，`/api/stream` 是**額外**加的一條，不取代任何既有端點；不打它的客戶端行為與遷移前完全相同。
@@ -302,6 +303,36 @@ app.get('/', c => c.html(Bun.file(new URL('./public/index.html', import.meta.url
   - head 回其他非 2xx 或連不上 → 409 `{ ok: false, reason: 'head 回應 ${status || '（連不上）'}' }`
 - 成功：200 `{ ok: true }`
 - 服務分頁：Workers（中斷/恢復/移除按鈕）
+
+## 維護模式（2026-09-08 新增）
+
+手動控制 Bug／需求單受理開關：head 與每台 worker 各自獨立一份旗標（見 telegram-dispatcher
+`lib/maintenance/mode-store.ts`），開著時 head 端 `claim.ts`／`demand-claim.ts` 一律拒絕新的認領、
+worker 端 `worker-agent.ts` 的 `POST /jobs` 一律拒絕新單，TG bot 回覆使用者維護中訊息。
+
+### GET /api/maintenance — server.ts:511
+
+- Query：無
+- 回傳：
+  ```
+  {
+    secretConfigured: boolean,
+    head: { on: boolean },
+    workers: [{ name: string, url: string, on: boolean | null }],
+  }
+  ```
+  `head.on` 直讀 `telegram-dispatcher/logs/maintenance-mode.json`（同一台機器，比照 `listWorkers()` 的既有讀法）；`workers[].on` 為 `null` 代表打不到該台（`CLUSTER_SHARED_SECRET` 未設定時全部為 `null`）。
+- 服務分頁：總覽（維護模式卡片）
+
+### POST /api/maintenance — server.ts:524
+
+- Body：`{ on: boolean }`
+- 錯誤：
+  - `on` 缺或型別不對 → 400 `{ ok: false, reason: 'missing on' }`
+  - `CLUSTER_SHARED_SECRET` 未設定 → 409 `{ ok: false, reason: 'CLUSTER_SHARED_SECRET 未設定，cluster 機制停用' }`
+- 成功／部分成功：`{ ok: boolean, head: { ok: boolean }, workers: [{ name: string, ok: boolean }] }`；`ok` 為 head 與全部 worker 都成功時才 `true`，單台 worker 打不通不影響其他台（HTTP 200 全成功／207 部分或全部失敗）
+- 特殊行為：對 head 打 `POST http://127.0.0.1:8787/cluster/maintenance`，對每台已註冊 worker 平行打各自的 `POST {url}/maintenance`（皆帶 `x-cluster-token`），不是 all-or-nothing
+- 服務分頁：總覽（維護模式卡片，一鍵切換）
 
 ### GET /api/pipelines/run — server.ts:463
 

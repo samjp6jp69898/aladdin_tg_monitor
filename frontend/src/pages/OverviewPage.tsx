@@ -8,9 +8,9 @@
  * 分頁專屬子元件放在 src/pages/overview/ 底下。
  */
 import { useNavigate } from 'react-router-dom'
-import { postPipelineCancel, postServiceRestart } from '../api/endpoints'
+import { postMaintenance, postPipelineCancel, postServiceRestart } from '../api/endpoints'
 import { topics } from '../api/topics'
-import type { CancelPipelineResponse, QueuedTicket, RunningProc, StatusLogRow } from '../api/types'
+import type { CancelPipelineResponse, MaintenanceToggleResponse, QueuedTicket, RunningProc, StatusLogRow } from '../api/types'
 import { Badge, Button, Card, CardGrid, type Column, DataTable, EmptyState, KeyValueGrid, TwoColumn } from '../components/shared'
 import { useAction, useResource } from '../hooks'
 import { ago, dur, fmt } from '../lib/format'
@@ -22,9 +22,32 @@ export function OverviewPage() {
 
   const overview = useResource(topics.overview, undefined)
   const statusLog = useResource(topics.statusLog, {})
+  const maintenance = useResource(topics.maintenance, undefined)
 
   const restartAction = useAction()
   const cancelAction = useAction()
+  const maintenanceAction = useAction()
+
+  const handleMaintenanceToggle = async (nextOn: boolean) => {
+    const result = await maintenanceAction.run(() => postMaintenance(nextOn), {
+      confirm: nextOn
+        ? '確定要開啟維護模式嗎？\n\nhead 與全部已註冊 worker 會立即停止受理新的 Bug／需求單認領，TG bot 對認領請求一律回覆維護中訊息；目前已在跑的工作不受影響。'
+        : '確定要關閉維護模式嗎？\n\nhead 與全部已註冊 worker 會立即恢復受理新單。',
+      onSettled: maintenance.reload,
+    })
+    if (!result) return
+    const raw = result.raw as MaintenanceToggleResponse
+    if (result.ok) {
+      window.alert(`已${nextOn ? '開啟' : '關閉'}維護模式（head：${raw.head.ok ? '成功' : '失敗'}；worker：${raw.workers.filter(w => w.ok).length}/${raw.workers.length} 台成功）`)
+    } else {
+      const failedWorkers = raw.workers?.filter(w => !w.ok).map(w => w.name) ?? []
+      window.alert(
+        `維護模式切換部分失敗：head ${raw.head?.ok ? '成功' : '失敗'}` +
+          (failedWorkers.length ? `；以下 worker 沒切成功：${failedWorkers.join(', ')}（可能剛好斷線，稍後重試或個別確認）` : '') +
+          (result.message ? `\n${result.message}` : ''),
+      )
+    }
+  }
 
   const reloadAll = async () => {
     await Promise.all([overview.reload(), statusLog.reload()])
@@ -105,8 +128,56 @@ export function OverviewPage() {
     { key: 'detail', header: 'detail', className: 'mono mute', render: r => r.detail || '' },
   ]
 
+  const m = maintenance.data
+  const anyMaintenanceOn = m ? m.head.on || m.workers.some(w => w.on === true) : false
+
   return (
     <>
+      <div className="section">
+        <Card title="維護模式（手動開關受理 Bug／需求單）">
+          {m ? (
+            <>
+              <KeyValueGrid
+                rows={[
+                  {
+                    label: 'head',
+                    value: <Badge variant={m.head.on ? 'warn' : 'ok'}>{m.head.on ? '維護中' : '正常受理'}</Badge>,
+                  },
+                  ...m.workers.map(w => ({
+                    label: w.name,
+                    value:
+                      w.on === null ? (
+                        <Badge variant="bad">無法確認（連不上）</Badge>
+                      ) : (
+                        <Badge variant={w.on ? 'warn' : 'ok'}>{w.on ? '維護中' : '正常受理'}</Badge>
+                      ),
+                  })),
+                ]}
+              />
+              <div style={{ marginTop: '8px' }}>
+                {m.secretConfigured ? (
+                  <Button
+                    variant={anyMaintenanceOn ? 'default' : 'warn'}
+                    disabled={maintenanceAction.pending}
+                    onClick={() => handleMaintenanceToggle(!anyMaintenanceOn)}
+                  >
+                    {anyMaintenanceOn ? '關閉維護模式' : '開啟維護模式'}
+                  </Button>
+                ) : (
+                  <span className="mute">CLUSTER_SHARED_SECRET 未設定，維護模式開關停用</span>
+                )}
+              </div>
+              <div className="mute" style={{ fontSize: '15px', marginTop: '8px' }}>
+                開啟期間 head 與該台 worker 一律拒絕新的 Bug／需求單認領（TG bot 回覆維護中訊息），已經在跑的工作不受影響。head 與每台
+                worker 各自獨立一份旗標，「無法確認」代表該台當下連不上，不代表它正在受理。
+              </div>
+            </>
+          ) : (
+            <EmptyState text="讀取中…" />
+          )}
+        </Card>
+      </div>
+
       <div className="section">
         <h2>
           服務 / Port（每 5 秒探測；「目前使用中」= 最近 <span>{d.activeWindowMin}</span> 分鐘內有稽核紀錄的人）

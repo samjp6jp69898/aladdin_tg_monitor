@@ -36,6 +36,10 @@ import {
   disableWorker,
   enableWorker,
   removeWorker,
+  readHeadMaintenance,
+  setHeadMaintenance,
+  fetchWorkerMaintenance,
+  setWorkerMaintenance,
   fetchRemoteFile,
   fetchRemoteStageFiles,
   fetchRemoteCurrentStage,
@@ -497,6 +501,40 @@ async function handleWorkerAction(c: any, action: (name: string, secret: string)
 app.post('/api/cluster/worker/disable', c => handleWorkerAction(c, disableWorker))
 app.post('/api/cluster/worker/enable', c => handleWorkerAction(c, enableWorker))
 app.post('/api/cluster/worker/remove', c => handleWorkerAction(c, removeWorker))
+
+// ---------- 維護模式（2026-09-08，手動控制 Bug／需求單受理開關）----------
+// head 與每台 worker 各自獨立一份旗標（見 telegram-dispatcher
+// lib/maintenance/mode-store.ts 檔頭「belt-and-braces」說明），這裡把兩邊
+// 現況彙整成一個回應給前端顯示，並提供「一鍵全部切換」的寫入端點——head
+// 讀本機檔案（同 listWorkers() 的既有做法），worker 得逐台即時打
+// GET /maintenance（遠端機器沒有本機檔案可讀）。
+app.get('/api/maintenance', async c => {
+  const secret = getClusterSecret()
+  const workers = listWorkers()
+  const workerRows = await Promise.all(
+    workers.map(async w => ({ name: w.name, url: w.url, on: secret ? await fetchWorkerMaintenance(w.url, secret) : null })),
+  )
+  return c.json({ secretConfigured: secret !== null, head: { on: readHeadMaintenance() }, workers: workerRows })
+})
+
+// 一鍵切換：head + 全部已註冊 worker 一起打。單台打不通不影響其他台，逐台
+// 回報結果讓前端知道哪些沒切成功（例如某台 worker 剛好斷線）——不是「全部
+// 成功才算數」的 all-or-nothing 語意，維護模式本來就是寧可漏開一台也不要
+// 因為一台連不上就完全卡住整個切換動作。
+app.post('/api/maintenance', async c => {
+  const body = (await c.req.json().catch(() => null)) as { on?: unknown } | null
+  if (typeof body?.on !== 'boolean') return c.json({ ok: false, reason: 'missing on' }, 400)
+  const on = body.on
+  const secret = getClusterSecret()
+  if (secret === null) return c.json({ ok: false, reason: 'CLUSTER_SHARED_SECRET 未設定，cluster 機制停用' }, 409)
+  const headResult = await setHeadMaintenance(on, secret)
+  const workers = listWorkers()
+  const workerResults = await Promise.all(
+    workers.map(async w => ({ name: w.name, ok: (await setWorkerMaintenance(w.url, secret, on)).ok })),
+  )
+  const ok = headResult.ok && workerResults.every(r => r.ok)
+  return c.json({ ok, head: { ok: headResult.ok }, workers: workerResults }, ok ? 200 : 207)
+})
 
 // 單一 run 詳情：run 本身 + 每個 agent 的摘要
 // 找不到該 key 回 null（呼叫端負責決定要 404 還是略過不推）。

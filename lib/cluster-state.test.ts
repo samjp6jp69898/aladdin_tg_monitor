@@ -3,7 +3,19 @@
 // 確認」），不能 fail-open（視為「確定沒在跑」）。純函式，不打真實 worker、
 // 不碰 DB/檔案。
 import { describe, expect, test } from 'bun:test'
-import { applyRemoteJobStatus, evaluateRemoteRetryBlock, type JobStatus } from './cluster-state.ts'
+import { applyRemoteJobStatus, evaluateRemoteRetryBlock, readHeadMaintenance, type JobStatus } from './cluster-state.ts'
+
+// readHeadMaintenance() 讀的是 telegram-dispatcher/logs/maintenance-mode.json
+// ——這台機器上 head 實際讀寫的同一份檔案，不是測試專用的隔離路徑，所以這裡
+// 只驗證「不管檔案現況是什麼，函式都回一個 boolean、不拋例外」，不斷言具體
+// 值（那是這台機器當下的真實維護模式狀態，測試不該對它有任何假設，也不該
+// 去改它）。read/write 語意本身已經在 dispatcher 側的
+// lib/maintenance/mode-store.test.ts 用隔離的暫存檔完整覆蓋。
+describe('readHeadMaintenance（唯讀，不碰真實檔案內容）', () => {
+  test('回傳值是 boolean，不拋例外', () => {
+    expect(typeof readHeadMaintenance()).toBe('boolean')
+  })
+})
 
 describe('applyRemoteJobStatus（correctRemoteRunningFlags / buildPipelineRunPayload 共用）', () => {
   test('status === null（worker 逾時/連不上）：不把 running 誤判成確定的 false，改標記 runningStatusUnknown', () => {

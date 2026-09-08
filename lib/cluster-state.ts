@@ -46,6 +46,77 @@ export function getClusterSecret(): string | null {
 
 export type WorkerInfo = { name: string; url: string; registeredAt: string; disabled?: boolean }
 
+/**
+ * head 自己的維護模式現況（2026-09-08，tg-monitor 手動控制）：跟上面
+ * listWorkers()／listDispatchEntries() 同一套讀法——head 落地到
+ * telegram-dispatcher/logs/maintenance-mode.json（tmp+rename 原子寫入，見
+ * dispatcher lib/maintenance/mode-store.ts），tg-monitor 跟 head 同一台機器，
+ * 直讀檔案比再開一支 GET /cluster/maintenance 划算（head 記憶體單例才是
+ * claim.ts／demand-claim.ts 真正吃到的權威值，這裡讀檔案只是給 UI 顯示用，
+ * 兩者理論上應該一致——head 每次 setOn 都會落盤，唯一的落後窗口是 head 剛
+ * 收到請求但檔案 write 還沒完成的那一瞬間，可忽略）。檔案不存在／壞掉一律
+ * 當非維護，跟 dispatcher 端 createMaintenanceModeStore 的預設一致。
+ */
+export function readHeadMaintenance(): boolean {
+  const p = `${DISPATCHER_LOG_DIR}/maintenance-mode.json`
+  if (!existsSync(p)) return false
+  try {
+    const parsed = JSON.parse(readFileSync(p, 'utf8')) as { on?: unknown }
+    return parsed.on === true
+  } catch {
+    return false
+  }
+}
+
+/** 切換 head 自己的維護模式：打 head 自己新增的 POST /cluster/maintenance
+ * （同一台機器；帶 JSON body，寫法比照下面 retryRemoteDispatch 打
+ * /cluster/retry，而非 postClusterAdmin——後者不帶 body，worker 名冊管理三個
+ * 動作靠 path 帶參數就夠，這裡需要 `{on}`）。 */
+export async function setHeadMaintenance(on: boolean, secret: string, timeoutMs = 5_000): Promise<ClusterAdminResult> {
+  try {
+    const res = await fetch(`${HEAD_URL}/cluster/maintenance`, {
+      method: 'POST',
+      headers: { [CLUSTER_TOKEN_HEADER]: secret, 'content-type': 'application/json' },
+      body: JSON.stringify({ on }),
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+    return { ok: res.ok, status: res.status }
+  } catch {
+    return { ok: false, status: 0 }
+  }
+}
+
+/** 讀某台 worker 自己的維護模式現況（worker 是遠端機器，沒有本機檔案可讀，
+ * 跟 head 那份不同，必須即時打 GET /maintenance）。打不通/逾時回 null——
+ * 呼叫端據此顯示「無法確認」，不能當成「確定關閉」。 */
+export async function fetchWorkerMaintenance(url: string, secret: string, timeoutMs = 2_500): Promise<boolean | null> {
+  try {
+    const res = await fetch(`${url}/maintenance`, { headers: { [CLUSTER_TOKEN_HEADER]: secret }, signal: AbortSignal.timeout(timeoutMs) })
+    if (!res.ok) return null
+    const body = (await res.json()) as { on?: unknown }
+    return body?.on === true
+  } catch {
+    return null
+  }
+}
+
+/** 切換某台 worker 自己的維護模式：直接打該 worker 的 POST /maintenance
+ * （不經 head 轉發，見 telegram-dispatcher cluster-head.ts /cluster/maintenance
+ * 端點註解「兩邊各自收各自的請求」）。 */
+export async function setWorkerMaintenance(url: string, secret: string, on: boolean, timeoutMs = 5_000): Promise<ClusterAdminResult> {
+  try {
+    const res = await fetch(`${url}/maintenance`, {
+      method: 'POST',
+      headers: { [CLUSTER_TOKEN_HEADER]: secret, 'content-type': 'application/json' },
+      body: JSON.stringify({ on }),
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+    return { ok: res.ok, status: res.status }
+  } catch {
+    return { ok: false, status: 0 }
+  }
+}
+
 export function listWorkers(): WorkerInfo[] {
   const p = `${DISPATCHER_LOG_DIR}/cluster-workers.json`
   if (!existsSync(p)) return []
