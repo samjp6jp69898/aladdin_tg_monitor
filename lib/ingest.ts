@@ -192,7 +192,11 @@ function scanRunningPipelineProcs(): RunningProc[] {
       // {'resume', ''} 兩個值——2026-08-26 實際踩過：加了 resume 之後這條 regex
       // 沒跟上，resume run 全部掃不到，被 scanPipelineRuns 誤當「已結束」秒判
       // outcome=empty，取消/防重複觸發也一起失明。
-      let mm = /^bash -c [\s\S]*\brun-create-mr\s+([A-Z]+-\d+)\s+(\S+?)(?:\s+resume)?\s*$/.exec(cmd)
+      // 2026-09-08 起尾端多一個恆帶的 mode 位置參數（$3 = full|analysis|fix|reanalyze），
+      // resume 退到 $4：`run-create-mr <ticket> <stdout> [mode] [resume]`。mode 群組寫
+      // 可選以相容加 mode 之前就 spawn 的舊 wrapper。與 telegram-dispatcher 的
+      // post-run-notify.ts RUN_CREATE_MR_PROC_RE、local-proc-scan.ts 同款正則，三處同步改。
+      let mm = /^bash -c [\s\S]*\brun-create-mr\s+([A-Z]+-\d+)\s+(\S+?)(?:\s+(?:full|analysis|fix|reanalyze))?(?:\s+resume)?\s*$/.exec(cmd)
       if (mm) {
         res.push({ pid: Number(m[1]), etime, kind: 'bug', ticket: mm[1], extra: mm[2] })
         continue
