@@ -11,6 +11,22 @@ const TECH_USERS_CSV = '/Users/user/aladdin/aladdin_ai/commands/create-mr/refere
 const UNKNOWN_SENDERS_LOG = '/Users/user/aladdin/telegram-dispatcher/logs/unknown-senders.jsonl'
 const TG_MAP_SCRIPT = '/Users/user/aladdin/aladdin_ai/scripts/tg-map-chatids.sh'
 const TG_NOTIFY_SCRIPT = '/Users/user/aladdin/aladdin_ai/scripts/tg-notify.sh'
+// TG_MAP_SCRIPT 內部用 bun 執行 telegram-dispatcher/lib/registry/tech-users-sync.ts，
+// 該檔案 main() 寫死以 'mon_head' 角色連監控 DB（loadMonitorEnv 斷言 MON_DB_USER
+// 必須等於 'mon_head'）。tg-monitor 常駐行程本身啟動於 tg-monitor 目錄下，bun
+// 啟動當下已自動讀入 tg-monitor/.env（MON_DB_USER=mon_ui，唯讀角色）寫進
+// process.env——這個值會被子行程原樣繼承，光改子行程的 cwd 沒用：bun 的 .env
+// 自動載入只補「目前還沒有的」key，已經從父行程繼承到的 MON_DB_USER 不會被
+// 子行程自己 cwd 下的 .env 覆蓋。必須連同 MON_DB_*／MON_FIELD_KEY_V1／
+// MON_BIDX_KEY 一起從子行程環境清掉、且 cwd 指到 telegram-dispatcher，子行程
+// 的 bun 才會真的去讀該目錄的 .env（MON_DB_USER=mon_head）補上正確角色。
+const TG_MAP_SCRIPT_CWD = '/Users/user/aladdin/telegram-dispatcher'
+const MON_DB_ENV_KEYS = ['MON_DB_HOST', 'MON_DB_PORT', 'MON_DB_SCHEMA', 'MON_DB_USER', 'MON_DB_PASSWORD', 'MON_FIELD_KEY_V1', 'MON_BIDX_KEY']
+function envWithoutInheritedMonDb(): NodeJS.ProcessEnv {
+  const env = { ...process.env }
+  for (const k of MON_DB_ENV_KEYS) delete env[k]
+  return env
+}
 
 export type ConnectedUser = { name: string; email: string; chat_id: string }
 export type PendingSender = { chat_id: string; first_name: string; last_name: string; username: string; last_ts: string }
@@ -79,7 +95,7 @@ export function assignChatId(email: string, chatId: string, opts: { force?: bool
   if (opts.force) args.push('--force')
   let result: string
   try {
-    result = execFileSync('bash', [TG_MAP_SCRIPT, ...args], { encoding: 'utf8', timeout: 15_000 }).trim()
+    result = execFileSync('bash', [TG_MAP_SCRIPT, ...args], { encoding: 'utf8', timeout: 15_000, cwd: TG_MAP_SCRIPT_CWD, env: envWithoutInheritedMonDb() }).trim()
   } catch (err: any) {
     result = `SET_ERR_EXEC: ${err?.message ?? err}`
   }
@@ -98,7 +114,7 @@ export function assignChatId(email: string, chatId: string, opts: { force?: bool
 export function unsetChatId(email: string): { ok: boolean; result: string } {
   let result: string
   try {
-    result = execFileSync('bash', [TG_MAP_SCRIPT, '--unset', email], { encoding: 'utf8', timeout: 15_000 }).trim()
+    result = execFileSync('bash', [TG_MAP_SCRIPT, '--unset', email], { encoding: 'utf8', timeout: 15_000, cwd: TG_MAP_SCRIPT_CWD, env: envWithoutInheritedMonDb() }).trim()
   } catch (err: any) {
     result = `UNSET_ERR_EXEC: ${err?.message ?? err}`
   }
