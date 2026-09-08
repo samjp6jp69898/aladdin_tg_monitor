@@ -45,10 +45,14 @@ export const topics = {
     fetch: (p: { days?: number }, signal: AbortSignal) => api.fetchStats(p.days, signal),
   }),
 
-  /** `GET /api/maintenance` — 維護模式現況（head + 每台 worker）。 */
+  /** `GET /api/maintenance` — 維護模式現況（head + 每台 worker）。
+   * intervalMs 刻意比 POLL_INTERVAL_MS 長（20 秒）：後端這支對每台已註冊
+   * worker 各發一次認證過的 HTTP 請求（review 發現：維護模式只會被人手動
+   * 切換，不需要 5 秒級新鮮度，用一般輪詢間隔等於平白讓 worker 數量放大成
+   * 常態性額外流量）。 */
   maintenance: defineTopic({
     key: 'maintenance',
-    intervalMs: POLL_INTERVAL_MS,
+    intervalMs: 20_000,
     fetch: (_: void, signal: AbortSignal) => api.fetchMaintenance(signal),
   }),
 

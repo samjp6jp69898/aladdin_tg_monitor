@@ -36,15 +36,22 @@ export function OverviewPage() {
       onSettled: maintenance.reload,
     })
     if (!result) return
-    const raw = result.raw as MaintenanceToggleResponse
+    const raw = result.raw as Partial<MaintenanceToggleResponse> & { reason?: string }
+    // 400（缺 on）／409（secret 未設定）這兩種是請求本身被拒絕，body 形狀是
+    // `{ ok: false, reason }`，完全沒有 head/workers 欄位——這時候顯示「head
+    // 失敗」是誤導（head 根本沒被打到）。用 head 欄位存不存在來分辨兩種失敗
+    // （review 發現：原本不分這兩種，一律當成「head 這端切換失敗」）。
+    if (!raw.head) {
+      window.alert(`維護模式切換失敗：${result.message || raw.reason || 'unknown'}`)
+      return
+    }
     if (result.ok) {
-      window.alert(`已${nextOn ? '開啟' : '關閉'}維護模式（head：${raw.head.ok ? '成功' : '失敗'}；worker：${raw.workers.filter(w => w.ok).length}/${raw.workers.length} 台成功）`)
+      window.alert(`已${nextOn ? '開啟' : '關閉'}維護模式（head：${raw.head.ok ? '成功' : '失敗'}；worker：${raw.workers!.filter(w => w.ok).length}/${raw.workers!.length} 台成功）`)
     } else {
       const failedWorkers = raw.workers?.filter(w => !w.ok).map(w => w.name) ?? []
       window.alert(
-        `維護模式切換部分失敗：head ${raw.head?.ok ? '成功' : '失敗'}` +
-          (failedWorkers.length ? `；以下 worker 沒切成功：${failedWorkers.join(', ')}（可能剛好斷線，稍後重試或個別確認）` : '') +
-          (result.message ? `\n${result.message}` : ''),
+        `維護模式切換部分失敗：head ${raw.head.ok ? '成功' : '失敗'}` +
+          (failedWorkers.length ? `；以下 worker 沒切成功：${failedWorkers.join(', ')}（可能剛好斷線，稍後重試或個別確認）` : ''),
       )
     }
   }

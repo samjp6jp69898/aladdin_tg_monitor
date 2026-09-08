@@ -527,11 +527,13 @@ app.post('/api/maintenance', async c => {
   const on = body.on
   const secret = getClusterSecret()
   if (secret === null) return c.json({ ok: false, reason: 'CLUSTER_SHARED_SECRET 未設定，cluster 機制停用' }, 409)
-  const headResult = await setHeadMaintenance(on, secret)
   const workers = listWorkers()
-  const workerResults = await Promise.all(
-    workers.map(async w => ({ name: w.name, ok: (await setWorkerMaintenance(w.url, secret, on)).ok })),
-  )
+  // head 與全部 worker 是各自獨立的請求，平行打（review 發現：原本先 await
+  // head 才開始打 worker，讓 worst-case 延遲變成兩者相加而非取最大值）。
+  const [headResult, workerResults] = await Promise.all([
+    setHeadMaintenance(secret, on),
+    Promise.all(workers.map(async w => ({ name: w.name, ok: (await setWorkerMaintenance(w.url, secret, on)).ok }))),
+  ])
   const ok = headResult.ok && workerResults.every(r => r.ok)
   return c.json({ ok, head: { ok: headResult.ok }, workers: workerResults }, ok ? 200 : 207)
 })

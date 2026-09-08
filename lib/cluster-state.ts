@@ -71,8 +71,13 @@ export function readHeadMaintenance(): boolean {
 /** 切換 head 自己的維護模式：打 head 自己新增的 POST /cluster/maintenance
  * （同一台機器；帶 JSON body，寫法比照下面 retryRemoteDispatch 打
  * /cluster/retry，而非 postClusterAdmin——後者不帶 body，worker 名冊管理三個
- * 動作靠 path 帶參數就夠，這裡需要 `{on}`）。 */
-export async function setHeadMaintenance(on: boolean, secret: string, timeoutMs = 5_000): Promise<ClusterAdminResult> {
+ * 動作靠 path 帶參數就夠，這裡需要 `{on}`）。
+ *
+ * 參數順序（secret, on, timeoutMs）刻意跟下面 setWorkerMaintenance 的尾三個
+ * 參數對齊（review 發現：兩支函式一個 url／secret／on 一個 on／secret／
+ * timeoutMs，順序不一致容易在呼叫端複製貼上時傳錯——兩者型別都是
+ * string/boolean，TypeScript 抓不出來）。 */
+export async function setHeadMaintenance(secret: string, on: boolean, timeoutMs = 5_000): Promise<ClusterAdminResult> {
   try {
     const res = await fetch(`${HEAD_URL}/cluster/maintenance`, {
       method: 'POST',
