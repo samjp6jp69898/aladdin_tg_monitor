@@ -73,8 +73,12 @@ export function upt(s?: number | null): string {
   return `${Math.floor(s / 86400)}d${Math.floor((s % 86400) / 3600)}h`
 }
 
-/** ResultBadge / Badge 的色彩變體。 */
-export type PillVariant = 'default' | 'ok' | 'bad' | 'warn'
+/**
+ * ResultBadge / Badge 的色彩變體。`info`/`done` 是 2026-09-09 為
+ * pages/pipelines/format.ts 的 pipelineOutcomeVariant() 新增，讓 pipeline
+ * outcome 這種多狀態語意不必全部擠進 ok/bad/warn 三色。
+ */
+export type PillVariant = 'default' | 'ok' | 'bad' | 'warn' | 'info' | 'done'
 
 /**
  * events 分頁「結果」欄的徽章顏色判定。對應舊版 index.html:277 的 resPill()

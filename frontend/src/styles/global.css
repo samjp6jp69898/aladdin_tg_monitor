@@ -15,6 +15,7 @@
   --bad: #ff5c5c;
   --warn: #ffb547;
   --acc: #5aa9ff;
+  --done: #c78cff;
   --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
@@ -158,6 +159,8 @@ main { padding: 20px 22px; max-width: 1700px; margin: 0 auto }
 .pill.ok { color: var(--ok); border-color: var(--ok) }
 .pill.bad { color: var(--bad); border-color: var(--bad) }
 .pill.warn { color: var(--warn); border-color: var(--warn) }
+.pill.info { color: var(--acc); border-color: var(--acc) }
+.pill.done { color: var(--done); border-color: var(--done) }
 
 tr.stage-running td {
   color: var(--warn);

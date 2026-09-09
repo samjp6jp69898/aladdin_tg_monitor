@@ -2,10 +2,11 @@ import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { postPipelineCancel, postPipelineRetry } from '../../api/endpoints'
 import type { CancelPipelineResponse, PipelinesResponse, RetryPipelineResponse } from '../../api/types'
-import { Badge, Button, DataTable, ResultBadge, Toolbar, type Column } from '../../components/shared'
+import { Badge, Button, DataTable, Toolbar, type Column } from '../../components/shared'
 import { useAction, type Resource } from '../../hooks'
 import { dur, fmt, fmtTok } from '../../lib/format'
 import { pipelinesPath, workersPath } from '../../lib/navigation'
+import { pipelineOutcomeVariant } from './format'
 import type { PipelineListRow } from './types'
 
 /**
@@ -202,9 +203,10 @@ export function PipelinesListView({ resource }: { resource: Resource<PipelinesRe
       render: row => {
         if (row.kind !== 'history') return null
         const outcome = row.data.outcome
+        if (!outcome) return null
         if (outcome === 'cancelled') return <Badge variant="warn">cancelled</Badge>
-        if (outcome) return <ResultBadge result={outcome === 'success' ? 'success' : outcome.split(' ')[0]} />
-        return null
+        const label = outcome === 'success' ? 'success' : outcome.split(' ')[0]
+        return <Badge variant={pipelineOutcomeVariant(label)}>{label}</Badge>
       },
     },
     {
