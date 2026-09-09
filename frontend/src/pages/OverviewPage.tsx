@@ -31,8 +31,8 @@ export function OverviewPage() {
   const handleMaintenanceToggle = async (nextOn: boolean) => {
     const result = await maintenanceAction.run(() => postMaintenance(nextOn), {
       confirm: nextOn
-        ? '確定要開啟維護模式嗎？\n\nhead 與全部已註冊 worker 會立即停止受理新的 Bug／需求單認領，TG bot 對認領請求一律回覆維護中訊息；目前已在跑的工作不受影響。'
-        : '確定要關閉維護模式嗎？\n\nhead 與全部已註冊 worker 會立即恢復受理新單。',
+        ? '確定要開啟維護模式嗎？\n\nhead 不會再拒絕新的 Bug／需求單認領，而是照收並排入等待佇列，維護結束後依收到順序自動處理，TG 通知認領人；worker 會立即停止接受新工作（不影響 head 收單）。目前已在跑的工作不受影響。'
+        : '確定要關閉維護模式嗎？\n\nhead 會立即開始依序處理維護期間排隊的請求，並恢復正常受理新單；worker 會立即恢復接受新工作。',
       onSettled: maintenance.reload,
     })
     if (!result) return
@@ -175,8 +175,8 @@ export function OverviewPage() {
                 )}
               </div>
               <div className="mute" style={{ fontSize: '15px', marginTop: '8px' }}>
-                開啟期間 head 與該台 worker 一律拒絕新的 Bug／需求單認領（TG bot 回覆維護中訊息），已經在跑的工作不受影響。head 與每台
-                worker 各自獨立一份旗標，「無法確認」代表該台當下連不上，不代表它正在受理。
+                開啟期間 head 照收新的 Bug／需求單認領，排入等待佇列、維護結束後依收到順序自動處理（TG bot 回覆已排隊訊息）；該台 worker
+                則立即停止接受新工作。已經在跑的工作不受影響。head 與每台 worker 各自獨立一份旗標，「無法確認」代表該台當下連不上，不代表它正在受理。
               </div>
             </>
           ) : (

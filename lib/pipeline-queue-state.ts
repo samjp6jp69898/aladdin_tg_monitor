@@ -46,10 +46,15 @@ export type QueuedTicket = {
   position: number
   enqueuedAt: string
   triggeredBy: string | null
+  /** 'concurrency'＝背景併發已滿排隊（pipeline-queue.{bug,demand}.json）；
+   * 'maintenance'＝維護模式期間收到、照收排入等待佇列（見 telegram-dispatcher
+   * 的 lib/maintenance/request-queue.ts，2026-09-09 新增）。兩者是完全獨立
+   * 的兩份狀態檔，position 各自從 1 起算，不是同一條隊伍的順位。 */
+  reason: 'concurrency' | 'maintenance'
 }
 
-/** 讀兩個佇列快照檔，攤平成帶順位的清單。檔案不存在/壞掉都當空佇列（監控
- * 顯示層，不因單一壞檔讓整個 API 掛掉）。 */
+/** 讀兩個併發佇列快照檔，攤平成帶順位的清單。檔案不存在/壞掉都當空佇列
+ * （監控顯示層，不因單一壞檔讓整個 API 掛掉）。 */
 export function readQueuedTickets(): QueuedTicket[] {
   const out: QueuedTicket[] = []
   for (const kind of ['bug', 'demand'] as const) {
@@ -68,11 +73,43 @@ export function readQueuedTickets(): QueuedTicket[] {
           position: i + 1,
           enqueuedAt: typeof e.enqueuedAt === 'string' ? e.enqueuedAt : '',
           triggeredBy: e.triggeredBy?.name ?? null,
+          reason: 'concurrency',
         })
       })
     } catch (err) {
       console.error(`readQueuedTickets: 解析 ${p} 失敗: ${err}`)
     }
   }
+  out.push(...readMaintenanceQueuedTickets())
   return out
+}
+
+/** 讀維護模式的請求佇列快照檔（單一檔案、bug/demand 混排，見
+ * telegram-dispatcher 的 lib/maintenance/request-queue.ts 檔頭）。壞掉/不存在
+ * 都當空佇列，理由同上。 */
+function readMaintenanceQueuedTickets(): QueuedTicket[] {
+  const p = join(DISPATCHER_LOG_DIR, 'maintenance-request-queue.json')
+  if (!existsSync(p)) return []
+  try {
+    const parsed = JSON.parse(readFileSync(p, 'utf8')) as {
+      entries?: { kind?: string; ticket?: string; enqueuedAt?: string; techUser?: { notion_user_name?: string } }[]
+    }
+    if (!Array.isArray(parsed.entries)) return []
+    const out: QueuedTicket[] = []
+    parsed.entries.forEach((e, i) => {
+      if (typeof e?.ticket !== 'string' || (e.kind !== 'bug' && e.kind !== 'demand')) return
+      out.push({
+        kind: e.kind,
+        ticket: e.ticket,
+        position: i + 1,
+        enqueuedAt: typeof e.enqueuedAt === 'string' ? e.enqueuedAt : '',
+        triggeredBy: e.techUser?.notion_user_name ?? null,
+        reason: 'maintenance',
+      })
+    })
+    return out
+  } catch (err) {
+    console.error(`readMaintenanceQueuedTickets: 解析 ${p} 失敗: ${err}`)
+    return []
+  }
 }

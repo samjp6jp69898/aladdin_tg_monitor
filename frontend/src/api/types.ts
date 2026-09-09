@@ -134,13 +134,16 @@ export interface RunningProc {
   extra: string | null
 }
 
-/** lib/pipeline-queue-state.ts:43-49 */
+/** lib/pipeline-queue-state.ts */
 export interface QueuedTicket {
   kind: 'bug' | 'demand'
   ticket: string
   position: number
   enqueuedAt: string
   triggeredBy: string | null
+  /** 'concurrency'＝背景併發已滿排隊；'maintenance'＝維護模式期間照收排隊
+   * （2026-09-09 新增，見 lib/pipeline-queue-state.ts 的 QueuedTicket 註解）。 */
+  reason: 'concurrency' | 'maintenance'
 }
 
 export interface PipelineSlots {

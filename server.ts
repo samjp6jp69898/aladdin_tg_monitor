@@ -528,12 +528,23 @@ app.post('/api/maintenance', async c => {
   const secret = getClusterSecret()
   if (secret === null) return c.json({ ok: false, reason: 'CLUSTER_SHARED_SECRET 未設定，cluster 機制停用' }, 409)
   const workers = listWorkers()
-  // head 與全部 worker 是各自獨立的請求，平行打（review 發現：原本先 await
-  // head 才開始打 worker，讓 worst-case 延遲變成兩者相加而非取最大值）。
-  const [headResult, workerResults] = await Promise.all([
-    setHeadMaintenance(secret, on),
-    Promise.all(workers.map(async w => ({ name: w.name, ok: (await setWorkerMaintenance(w.url, secret, on)).ok }))),
-  ])
+  const toggleWorkers = () => Promise.all(workers.map(async w => ({ name: w.name, ok: (await setWorkerMaintenance(w.url, secret, on)).ok })))
+  // 開啟：head 與全部 worker 是各自獨立的請求，平行打（review 發現：原本先
+  // await head 才開始打 worker，讓 worst-case 延遲變成兩者相加而非取最大值）。
+  // 關閉：worker 先關、head 最後關——head 一關就立刻觸發
+  // drainMaintenanceQueue() 把排隊單重新完整跑一次，若這時候某台 worker 的
+  // 維護旗標還沒真的關掉，帶產物親和性的單會被那台 503 拒絕、誤判成『該機
+  // 離線，請稍後再點一次』（對抗性 review 2026-09-09 發現）；worker 先關
+  // 就不會有這個窗口，代價是關閉這個方向不再是「取最大值」而是稍微加總，
+  // 換到正確性優先。
+  let headResult: Awaited<ReturnType<typeof setHeadMaintenance>>
+  let workerResults: Awaited<ReturnType<typeof toggleWorkers>>
+  if (on) {
+    ;[headResult, workerResults] = await Promise.all([setHeadMaintenance(secret, on), toggleWorkers()])
+  } else {
+    workerResults = await toggleWorkers()
+    headResult = await setHeadMaintenance(secret, on)
+  }
   const ok = headResult.ok && workerResults.every(r => r.ok)
   return c.json({ ok, head: { ok: headResult.ok }, workers: workerResults }, ok ? 200 : 207)
 })

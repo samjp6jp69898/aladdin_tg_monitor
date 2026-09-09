@@ -80,7 +80,18 @@ export function PipelinesListView({ resource }: { resource: Resource<PipelinesRe
       header: 'Worker',
       className: 'mono',
       render: row => {
-        if (row.kind === 'queued') return '本機'
+        if (row.kind === 'queued') {
+          // 維護模式期間照收排隊（見 QueuedTicket.reason 註解）跟背景併發已滿
+          // 排隊是兩份完全獨立的狀態，用同一顆 badge 樣式標出來避免混淆——
+          // 這種單不是「併發滿了在等名額」，是「維護結束才會開始處理」。
+          return row.data.reason === 'maintenance' ? (
+            <>
+              本機 <Badge variant="warn">維護中排隊</Badge>
+            </>
+          ) : (
+            '本機'
+          )
+        }
         if (row.kind === 'remote') {
           const r = row.data
           if (!r.worker) return '(交涉中)'
