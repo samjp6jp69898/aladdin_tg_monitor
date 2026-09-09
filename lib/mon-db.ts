@@ -942,8 +942,15 @@ export function closeSpoolForTest(): void {
 // ─────────────────────────────────────────────────────────────────────────
 
 /** 未解決分類中屬 tier 2、可被 W6 覆寫者。sqlite 側 UNRESOLVED_OUTCOMES 另含
- * `unknown_failure`（tier 1），依 D-3 排除。 */
-export const RECONCILE_UNRESOLVED_OUTCOMES = ['skipped', 'timeout', 'infra_failure', 'cli_failure'] as const
+ * `unknown_failure`（tier 1），依 D-3 排除。
+ * 2026-09-08：補上 `session_limit`——它跟 skipped/timeout/infra_failure/
+ * cli_failure 一樣是 writeRunOutcomeAuthoritative() 寫入的 tier 2 權威終態
+ * （見 dispatcher lib/monitor-db/writes.ts 的 outcome_tier = 2 與
+ * lib/monitor-db/types.ts KNOWN_OUTCOME_TIER 缺漏註記），原本這裡漏收，
+ * 導致票已被後續一次成功執行取代時，畫面仍顯示過期的 session_limit
+ * 失敗列可重試，按下去卻因 tracker 早已是 done/failed 而 409（使用者實測
+ * FAQ-4940 重現：10:03/10:59 兩次 session_limit 之後 11:22 已 success）。 */
+export const RECONCILE_UNRESOLVED_OUTCOMES = ['skipped', 'timeout', 'infra_failure', 'cli_failure', 'session_limit'] as const
 
 const RECONCILE_IN_PLACEHOLDERS = RECONCILE_UNRESOLVED_OUTCOMES.map(() => '?').join(', ')
 

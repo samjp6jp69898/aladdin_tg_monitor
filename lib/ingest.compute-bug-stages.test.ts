@@ -3,7 +3,6 @@
 // 路徑）；帶值時改用 worker 回報的 mtime 原始資料組裝同一份階段檢核表——見
 // lib/ingest.ts computeBugStages 檔頭與 telegram-dispatcher/lib/pipeline-runner/
 // local-stage-files.ts 的對應說明。
-import './test-tmp-db.ts' // 必須排在 ./ingest.ts 之前（NB-7，見 ingest.cancel.test.ts 同款註解）
 import { describe, expect, test } from 'bun:test'
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'

@@ -1,22 +1,23 @@
-// 資料蒐集：
-//  1) tail 各 hosted MCP server 的 audit.jsonl（H32 稽核 log）→ events 表
-//     - 以 (inode, offset) 續讀；inode 變了或檔案縮水（輪替成 .1）就從 0 重讀
-//     - 同一行 JSON 靠 UNIQUE(service, raw) 去重，所以重讀不會重複
-//  2) 掃 telegram-dispatcher/logs 的逐票 pipeline log 檔名 → pipeline_runs 表
-//     - 檔名規則見 spawn-create-mr.ts / spawn-demand-pipeline.ts：
-//       <TICKET>.<ISO ts 以 - 取代 :.>.stdout.log          (bug)
-//       <TICKET>.<ISO ts>.demand-pipeline.stdout.log        (demand)
-//     - 是否仍在跑：ps 裡還有 `run-create-mr <ticket>` / `run-demand-pipeline <ticket>`
-//  3) 探測各 port 存活（/health + lsof 拿 PID）→ status_log 只記翻轉
+// 資料蒐集（背景 tick，見 startCollectors）：
+//  1) 掃 telegram-dispatcher/logs 的逐票 bug pipeline log 檔名，把三位
+//     reviewer／final-adversarial-reviewer 的審查輪數餵給 mon_ui（見
+//     persistReviewRounds／scanPipelineRuns）——sqlite 讀取面退役後
+//     （2026-09-09，維護協議紅區項目 6），這是本節唯一剩下的職責；原本
+//     audit.jsonl 稽核事件 tail、agent-traces 摘要、pipeline_runs/agent_runs
+//     落地都已隨 sqlite 一併移除（mysql 側這些表由 telegram-dispatcher 另一套
+//     完全獨立的寫入路徑產生，不是靠這裡的檔案掃描接力寫入）。
+//     檔名規則見 spawn-create-mr.ts：<TICKET>.<ISO ts 以 - 取代 :.>.stdout.log
+//     是否仍在跑：ps 裡還有 `run-create-mr <ticket>`
+//  2) 探測各 port 存活（/health + lsof 拿 PID）→ 只在 up/down 翻轉時餵給
+//     mysql（見 appendServiceStatusIfChanged）。
 
-import { openSync, readSync, closeSync, fstatSync, statSync, readdirSync, existsSync, readFileSync } from 'node:fs'
-import { execFileSync, execFile } from 'node:child_process'
+import { openSync, readSync, closeSync, statSync, readdirSync, existsSync, readFileSync } from 'node:fs'
+import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { join } from 'node:path'
 
 const execFileAsync = promisify(execFile)
-import { SERVICES, DISPATCHER_LOG_DIR, AGENT_TRACE_DIR, BUG_LOCK_DIR, type ServiceDef } from './services.ts'
-import { db, insertMany, getOffset, setOffset, recordStatusIfChanged, upsertRun, finishRun, reopenRun, markCancelled, agentRunMtime, upsertAgentRun, bumpReviewRounds } from './db.ts'
+import { SERVICES, DISPATCHER_LOG_DIR, BUG_LOCK_DIR, type ServiceDef } from './services.ts'
 import {
   isMonitorDbEnabled,
   getMonitorPool,
@@ -35,60 +36,9 @@ import {
   reconcileStaleOutcomesToMonDb,
 } from './mon-db.ts'
 
-// ---------- 1) audit.jsonl tail ----------
-
-function readNewLines(path: string): string[] {
-  if (!existsSync(path)) return []
-  const fd = openSync(path, 'r')
-  try {
-    const st = fstatSync(fd)
-    const saved = getOffset(path)
-    let start = 0
-    if (saved && saved.inode === st.ino && saved.offset <= st.size) start = saved.offset
-    if (st.size <= start) {
-      if (!saved || saved.inode !== st.ino) setOffset(path, st.ino, start)
-      return []
-    }
-    const len = st.size - start
-    const buf = Buffer.alloc(len)
-    readSync(fd, buf, 0, len, start)
-    const text = buf.toString('utf8')
-    // 只吃到最後一個換行為止，半行留到下次
-    const lastNl = text.lastIndexOf('\n')
-    if (lastNl < 0) return []
-    const consumed = Buffer.byteLength(text.slice(0, lastNl + 1), 'utf8')
-    setOffset(path, st.ino, start + consumed)
-    return text
-      .slice(0, lastNl)
-      .split('\n')
-      .map(l => l.trim())
-      .filter(Boolean)
-  } finally {
-    closeSync(fd)
-  }
-}
-
-export function ingestAuditLogs(): number {
-  let total = 0
-  for (const s of SERVICES) {
-    if (!s.auditLog) continue
-    // 先補讀輪替檔 .1（若有、且還沒讀過），再讀主檔
-    for (const p of [`${s.auditLog}.1`, s.auditLog]) {
-      try {
-        const lines = readNewLines(p)
-        if (lines.length) total += insertMany(s.id, lines)
-      } catch (err) {
-        console.error(`ingest ${p} failed: ${err}`)
-      }
-    }
-  }
-  return total
-}
-
 // ---------- 2) pipeline runs ----------
 
 const BUG_RE = /^([A-Z]+-\d+)\.(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z)\.stdout\.log$/
-const DEMAND_RE = /^([A-Z]+-\d+)\.(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z)\.demand-pipeline\.stdout\.log$/
 
 /**
  * 讀 <key>.triggered-by.json sidecar（見 spawn-create-mr.ts / spawn-demand-
@@ -107,10 +57,6 @@ function readTriggeredByRecord(key: string, logDir: string = DISPATCHER_LOG_DIR)
   } catch {
     return null
   }
-}
-
-function readTriggeredBy(key: string): string | null {
-  return readTriggeredByRecord(key)?.name || null
 }
 
 function fileTsToIso(t: string): string {
@@ -358,7 +304,6 @@ export async function cancelPipeline(kind: 'bug' | 'demand', ticket: string): Pr
       } catch {}
     }
   }, 5000)
-  markCancelled(kind, ticket)
   return { ok: true, killed, wrapperPid: target.pid, ...dbFields }
 }
 
@@ -386,22 +331,6 @@ export function parseClaudeEvents(txt: string): any[] | null {
   return events.length ? events : null
 }
 
-function guessOutcome(stdoutPath: string): string {
-  // 舊格式最後一個元素、新格式最後一行通常是 type=result（見 parseClaudeEvents）
-  try {
-    const txt = readFileSync(stdoutPath, 'utf8').trim()
-    if (!txt) return 'empty'
-    const events = parseClaudeEvents(txt)
-    if (!events) return 'non-json'
-    const last = events.findLast((e: any) => e?.type === 'result') ?? events[events.length - 1]
-    if (last?.subtype) return String(last.subtype)
-    if (last?.is_error) return 'error'
-    return 'done'
-  } catch {
-    return 'non-json'
-  }
-}
-
 // spawn-create-mr.ts 的 WRAPPER_SCRIPT 目前設定 `timeout 10800`（180 分鐘，
 // plan-db-as-truth-v3.2.md §9.0(G) 逐點對照表第 6 列）——兩個 repo 各自獨立、
 // 沒有 import 關係，這裡只能複製常數，改動時要同步調整。
@@ -411,11 +340,10 @@ const POST_RUN_NOTIFY_LOG = join(DISPATCHER_LOG_DIR, 'post-run-notify.log')
 
 /**
  * post-run-notify.ts 的 main() 不管 shouldNotify 結果都會先 log 一行
- * `<ISO ts> <ticket> classification=<...> exitCode=<...>`，涵蓋 classify-result.ts
- * 的全部七種分類（含 2026-08-25 新增的 timeout）——比 guessOutcome() 單看 stdout
- * 準確：stdout 為空時 guessOutcome 只能猜成籠統的 'empty'，區分不出「逾時被砍」
- * 跟「其他 infra 層失敗」；這裡直接讀權威分類結果，guessOutcome 降級為找不到
- * log 行時（例如這支 log 上線前的歷史紀錄）的後備猜測。
+ * `<ISO ts> <ticket> classification=<...> exitCode=<...>`——用來推算這次 run
+ * 真正的結束時間（timeout 的 stdout 常常沒 flush，mtime 落在開始附近，見
+ * scanPipelineRuns 呼叫處）。找不到 log 行時（例如這支 log 上線前的歷史紀錄）
+ * 才退回 stdout 檔案 mtime 當後備猜測。
  */
 function readClassification(ticket: string, startedAt: string, nextStart: string | null): { classification: string; loggedAt: string } | null {
   if (!existsSync(POST_RUN_NOTIFY_LOG)) return null
@@ -436,10 +364,6 @@ function readClassification(ticket: string, startedAt: string, nextStart: string
 }
 
 const TRACKER_SH = '/Users/user/aladdin/scripts/tracker.sh'
-// classify-result.ts 的 NEEDS_NOTIFY 集合（複製，見 CREATE_MR_TIMEOUT_SECONDS
-// 同一則註解——兩個 repo 各自獨立、無 import 關係）：這幾種分類代表 claude -p
-// 這次執行本身沒有走到正常出口，但票本身完全可能事後被人工/其他 agent 補跑完成。
-const UNRESOLVED_OUTCOMES = new Set(['skipped', 'timeout', 'infra_failure', 'cli_failure', 'unknown_failure'])
 
 /**
  * 把 tracker.sh 的 `YYYY-MM-DD HHMM` 完成時間欄轉成 ISO（本機時區，跟
@@ -450,55 +374,6 @@ function trackerCompletedAtToIso(s: string): string | null {
   if (!m) return null
   return new Date(`${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:00`).toISOString()
 }
-
-/**
- * 這一次 claude -p 執行本身沒有跑到正常出口（timeout / infra_failure / …），
- * 但票可能後續被人工或另一個 agent 補跑完（例：FAQ-4723 2026-08-25——背景
- * 流程被 60 分鐘 timeout 砍斷，之後人工派 drive-uploader-mr + mr-pusher 把
- * 剩下的步驟做完，tracker 最終還是 done）。單看這次 process 的 log 只能說
- * 「這次執行 timeout」，不能說「這張票沒解決」——兩者是不同的事實，這裡把
- * tracker.sh 的終態當更晚、更權威的事實來源，覆蓋顯示用的 outcome。
- *
- * 只在 tracker 完成時間**晚於**這次執行原本的 finishedAt 時才覆蓋（避免把
- * 更早、不相關的一次 done 誤蓋到這次執行上）；tracker 仍是 pending/rerun/
- * in_progress（代表還沒被接手處理）時不覆蓋，如實顯示原本的失敗分類。
- */
-function reconcileWithTracker(ticket: string, outcome: string, finishedAt: string): { outcome: string; finishedAt: string } {
-  if (!UNRESOLVED_OUTCOMES.has(outcome)) return { outcome, finishedAt }
-  const tracker = readTrackerStatus(ticket) // 只在 collector tick 呼叫，安全（見該函式註解）
-  if (!tracker || !tracker.completedAt || tracker.completedAt <= finishedAt) return { outcome, finishedAt }
-  if (tracker.status === 'done') return { outcome: 'recovered', finishedAt: tracker.completedAt }
-  if (tracker.status === 'failed') return { outcome: 'failed（人工判定）', finishedAt: tracker.completedAt }
-  if (tracker.status === 'needs_qa') return { outcome: 'needs_qa_clarification（人工判定）', finishedAt: tracker.completedAt }
-  if (tracker.status === 'analysis_done') return { outcome: 'analysis_done（人工判定）', finishedAt: tracker.completedAt } // pipeline-modes Phase 2
-  return { outcome, finishedAt }
-}
-
-/**
- * 需求 pipeline 不寫 stdout（run-demand-pipeline.ts 全部 appendFileSync 到共用的
- * demand-pipeline.log），所以結果/結束時間改從那支 log 取：該 ticket 在
- * [startedAt, nextStart) 區間內的最後一行。
- */
-function demandOutcomeFromLog(ticket: string, startedAt: string, nextStart: string | null): { finishedAt: string; outcome: string } | null {
-  const p = join(DISPATCHER_LOG_DIR, 'demand-pipeline.log')
-  if (!existsSync(p)) return null
-  let last: { ts: string; msg: string } | null = null
-  for (const line of readFileSync(p, 'utf8').split('\n')) {
-    const m = /^(\S+Z) (\S+) (.*)$/.exec(line)
-    if (!m || m[2] !== ticket) continue
-    if (m[1] < startedAt) continue
-    if (nextStart && m[1] >= nextStart) break
-    last = { ts: m[1], msg: m[3] }
-  }
-  if (!last) return null
-  return { finishedAt: last.ts, outcome: last.msg.length > 80 ? last.msg.slice(0, 80) + '…' : last.msg }
-}
-
-// key（<ticket>.<ts>，即 pipeline_runs.key）→ 上次已持久化的輪數，避免每個
-// tick 都對 DB 送一次沒有實際變化的 UPDATE（bumpReviewRounds 本身雖冪等，
-// 但省一次 I/O）。in-memory、行程重啟會清空——不影響正確性：DB 值不會被清掉，
-// 下個 tick 重算出同樣或更大的值，NOOP 或再 bump 一次而已。
-const lastPersistedRounds = new Map<string, { review: number; final: number }>()
 
 // mon_ui 側的 rounds 寫入範圍（對抗審查 BLOCKING-1(a)）：scanPipelineRuns 的
 // finish 分支對 DISPATCHER_LOG_DIR 底下**每一個**歷史 stdout log 每個 tick
@@ -567,10 +442,12 @@ export function persistReviewRoundsToMonDbGuarded(
 }
 
 /**
- * 把目前累計的審查輪數（見 getReviewRoundCounts）持久化到該 run 列，值沒有
- * 進展就不寫 DB。掛在 scanPipelineRuns 的既有 tick 上呼叫，run 執行中與剛
- * 結束的最後一次掃描都會呼叫到（見呼叫處註解），確保 run 結束、transcript
- * 停止增長後，DB 欄位仍留著最終輪數。
+ * 把目前累計的審查輪數（見 getReviewRoundCounts）持久化到 mon_ui 側
+ * （persistReviewRoundsToMonDbGuarded 內建自己的 last-written cache，值沒有
+ * 進展就不重寫，見該函式與 persistReviewRoundsToMonDb 註解）。掛在
+ * scanPipelineRuns 的既有 tick 上呼叫，run 執行中與剛結束的最後一次掃描都
+ * 會呼叫到（見呼叫處註解），確保 run 結束、transcript 停止增長後，DB 欄位
+ * 仍留著最終輪數。
  *
  * `finishedAt`：run 仍在執行中傳 `null`（呼叫端天然有界，見
  * `isRoundsMonDbEligible` 註解）；已結束傳該次執行的結束時間，用來把 mon_ui
@@ -579,143 +456,66 @@ export function persistReviewRoundsToMonDbGuarded(
 function persistReviewRounds(key: string, ticket: string, startedAt: string, stdoutPath: string, finishedAt: string | null): void {
   const counts = getReviewRoundCounts(ticket, startedAt)
   if (!counts) return
-  const last = lastPersistedRounds.get(key)
-  if (!last || counts.reviewRounds > last.review || counts.finalReviewRounds > last.final) {
-    bumpReviewRounds(key, counts.reviewRounds > 0 ? counts.reviewRounds : null, counts.finalReviewRounds > 0 ? counts.finalReviewRounds : null)
-    lastPersistedRounds.set(key, {
-      review: Math.max(counts.reviewRounds, last?.review ?? 0),
-      final: Math.max(counts.finalReviewRounds, last?.final ?? 0),
-    })
-  }
-  // mon_ui 側（Phase 8 讀取面 a4 的唯一 rounds 來源，migration 004 就位）：
-  // 獨立於上面的 sqlite bump——sqlite 那段可能因為值沒進展而跳過，mon_ui 這
-  // 邊仍要跑（它有自己獨立的 last-written cache，見 persistReviewRoundsToMonDb
-  // 註解），兩邊各自只在自己那次寫入成功才推進自己的 cache。
   persistReviewRoundsToMonDbGuarded(key, ticket, stdoutPath, finishedAt, counts)
 }
 
 export function scanPipelineRuns() {
   if (!existsSync(DISPATCHER_LOG_DIR)) { cachedRunning = scanRunningPipelineProcs(); return }
   cachedRunning = scanRunningPipelineProcs()
-  const running = new Set(cachedRunning.map(r => `${r.kind}:${r.ticket}`))
   // 2026-08-28（FAQ-4768 連點兩次事故）：bug run 的歸戶改用 stdout 路徑——
   // wrapper 命令列的位置參數本來就帶著這次 run 專屬的 stdout log 路徑
   // （RunningProc.extra），比「同票最新一次才可能 running」精確：同一張票
   // 短時間內被重複觸發兩條時，舊邏輯會把還活著的舊 run 誤結案成 done、把
-  // 已死的新 run 誤標成 running（實際踩過）。demand 的 extra 是 assignee
-  // email、不帶可識別路徑，維持原本 ticket+最新一次的判法。
+  // 已死的新 run 誤標成 running（實際踩過）。
+  //
+  // sqlite 讀取面退役後（2026-09-09），本函式只剩一個目的：把 bug pipeline
+  // 的三位 reviewer／final-adversarial-reviewer 輪數餵給 mon_ui（見
+  // persistReviewRounds）——demand pipeline 沒有對應的 mon_ui 寫入，因此只
+  // 掃 bug 檔名。
   const runningBugPaths = new Set(cachedRunning.filter(r => r.kind === 'bug').map(r => r.extra))
   const files = readdirSync(DISPATCHER_LOG_DIR)
-  // 每張票各次開始時間（排序）：需求單用來切 demand-pipeline.log 區間；兩種都用來
-  // 判斷「只有最新一次才可能是 running」，舊的同票紀錄一律結案。
-  const demandStarts = new Map<string, string[]>()
   const bugStarts = new Map<string, string[]>()
   for (const f of files) {
-    let m = DEMAND_RE.exec(f)
-    if (m) { demandStarts.set(m[1], [...(demandStarts.get(m[1]) ?? []), fileTsToIso(m[2])].sort()); continue }
-    m = BUG_RE.exec(f)
+    const m = BUG_RE.exec(f)
     if (m) bugStarts.set(m[1], [...(bugStarts.get(m[1]) ?? []), fileTsToIso(m[2])].sort())
   }
   for (const f of files) {
-    let m = DEMAND_RE.exec(f)
-    let kind: 'bug' | 'demand' = 'demand'
-    if (!m) {
-      m = BUG_RE.exec(f)
-      kind = 'bug'
-    }
+    const m = BUG_RE.exec(f)
     if (!m) continue
     const [, ticket, ts] = m
     const key = f.replace(/\.stdout\.log$/, '')
     const stdoutPath = join(DISPATCHER_LOG_DIR, f)
-    const stderrPath = stdoutPath.replace(/\.stdout\.log$/, '.stderr.log')
     const startedAt = fileTsToIso(ts)
-    upsertRun(key, kind, ticket, startedAt, stdoutPath, stderrPath, readTriggeredBy(key))
-    const starts = (kind === 'demand' ? demandStarts : bugStarts).get(ticket) ?? []
-    const isLatest = starts[starts.length - 1] === startedAt
-    const isRunningRow = kind === 'bug' ? runningBugPaths.has(stdoutPath) : running.has(`${kind}:${ticket}`) && isLatest
-    if (!isRunningRow) {
+    if (!runningBugPaths.has(stdoutPath)) {
       try {
-        if (kind === 'demand') {
-          const nextStart = demandStarts.get(ticket)?.find(t => t > startedAt) ?? null
-          const r = demandOutcomeFromLog(ticket, startedAt, nextStart)
-          if (r) finishRun(key, r.finishedAt, r.outcome)
-          else finishRun(key, statSync(stdoutPath).mtime.toISOString(), 'no log')
-        } else {
-          // Bug pipeline：優先用 post-run-notify.log 的權威分類（見
-          // readClassification 註解）；找不到 log 行才退回 stdout 猜測。
-          const nextStart = bugStarts.get(ticket)?.find(t => t > startedAt) ?? null
-          const cls = readClassification(ticket, startedAt, nextStart)
-          let finishedAt: string
-          let outcome: string
-          if (cls) {
-            outcome = cls.classification
+        // 優先用 post-run-notify.log 的權威分類（見 readClassification 註解）
+        // 推算真正的結束時間；找不到 log 行才退回 stdout 檔案 mtime。
+        const nextStart = bugStarts.get(ticket)?.find(t => t > startedAt) ?? null
+        const cls = readClassification(ticket, startedAt, nextStart)
+        const finishedAt = cls
+          ? cls.classification === 'timeout'
             // timeout 的 stdout 在被砍斷時通常什麼都沒 flush 到，檔案 mtime
             // 只落在行程「開始」附近（open 時建立），拿來當結束時間會把耗時
             // 算成接近 0；改用「開始時間 + 設定的 timeout 上限」還原真實耗時。
-            finishedAt =
-              cls.classification === 'timeout'
-                ? new Date(new Date(startedAt).getTime() + CREATE_MR_TIMEOUT_SECONDS * 1000).toISOString()
-                : cls.loggedAt
-          } else {
-            const st = statSync(stdoutPath)
-            finishedAt = st.mtime.toISOString()
-            outcome = guessOutcome(stdoutPath)
-          }
-          finishRun(key, finishedAt, outcome)
-          ingestBugStdout(ticket, startedAt, stdoutPath)
-          // run 剛結束這一刻的最後一次掃描：transcript 可能在行程結束前一瞬間
-          // 才寫下最後幾筆派工事件（例如最後一輪 reviewer 或 Step 6.5），確保
-          // 這些也被算進去再持久化一次——之後 pending 就此不再增長，這是最後
-          // 機會。
-          persistReviewRounds(key, ticket, startedAt, stdoutPath, finishedAt)
-        }
+            ? new Date(new Date(startedAt).getTime() + CREATE_MR_TIMEOUT_SECONDS * 1000).toISOString()
+            : cls.loggedAt
+          : statSync(stdoutPath).mtime.toISOString()
+        // run 剛結束這一刻的最後一次掃描：transcript 可能在行程結束前一瞬間
+        // 才寫下最後幾筆派工事件（例如最後一輪 reviewer 或 Step 6.5），確保
+        // 這些也被算進去再持久化一次——之後 pending 就此不再增長，這是最後
+        // 機會。
+        persistReviewRounds(key, ticket, startedAt, stdoutPath, finishedAt)
       } catch {}
-    } else if (kind === 'bug') {
-      // 行程還活著但列已被結案（重複觸發時舊歸戶邏輯留下的錯誤終態，或本檔
-      // 改版前寫入的歷史值）：清掉終態讓它回到執行中，自癒。
-      try { reopenRun(key) } catch {}
-      // 執行中的 bug run（2026-08-26，stream-json 之後才有意義）：JSONL 逐行
-      // 落盤，執行中就能收出即時的 agent 摘要（ended_at=null → UI 顯示
-      // 進行中）；結束後上面的 finish 分支會用同一個 path upsert 蓋上最終值。
-      // 舊格式（--output-format json）執行中 size=0，這裡自然 no-op。
-      try {
-        ingestBugStdout(ticket, startedAt, stdoutPath, true)
-      } catch {}
-      // 審查輪數持久化（2026-09-02）：掛在既有 collector tick 上，不新增
-      // timer；跟 finish 分支共用同一個 persistReviewRounds（只增不減，值沒變
-      // 就不寫），run 結束前每個 tick 都有機會把最新輪數落地。finishedAt 傳
-      // null：這個分支只有 ps 快照命中的執行中 run 才會走到（天然有界，見
-      // isRoundsMonDbEligible 註解），不受 BLOCKING-1(a) 的 6 小時窗限制。
+    } else {
+      // 執行中的 bug run：跟 finish 分支共用同一個 persistReviewRounds（只
+      // 增不減，值沒變就不寫），run 結束前每個 tick 都有機會把最新輪數落地。
+      // finishedAt 傳 null：這個分支只有 ps 快照命中的執行中 run 才會走到
+      // （天然有界，見 isRoundsMonDbEligible 註解），不受 BLOCKING-1(a) 的
+      // 6 小時窗限制。
       persistReviewRounds(key, ticket, startedAt, stdoutPath, null)
     }
   }
-  reconcileStaleOutcomes()
   reconcileStaleOutcomesToMonDbGuarded()
-}
-
-/**
- * 補跑（人工或另一個 agent 事後把 timeout/failed 的票做完）通常發生在
- * process 結束之後、tracker 更新之前——finishRun 那一刻 tracker 多半還是
- * in_progress，reconcileWithTracker 在那個時間點查不到東西。這裡每個
- * ingest tick 都對「最近 6 小時內結束、目前仍是未解決分類」的 bug pipeline
- * 重新查一次 tracker，一旦 tracker 給出更晚的終態時間就覆蓋 outcome/
- * finished_at；查詢天生會隨結果被 reconcileWithTracker 改掉分類（不再落在
- * UNRESOLVED_OUTCOMES）而自然停止，不需要額外的重試上限。6 小時窗口只是
- * 避免對「已經確定沒人再處理」的舊票每 3 秒重複 spawn tracker.sh，不是正確性
- * 邊界（超過窗口後續若真的被補跑完成，畫面只是繼續顯示原本的失敗分類，不是
- * 顯示錯誤資訊）。
- */
-function reconcileStaleOutcomes(): void {
-  const cutoff = new Date(Date.now() - 6 * 3600 * 1000).toISOString()
-  const placeholders = [...UNRESOLVED_OUTCOMES].map(() => '?').join(',')
-  const rows = db
-    .prepare(`SELECT key, ticket, finished_at, outcome FROM pipeline_runs WHERE kind = 'bug' AND finished_at IS NOT NULL AND finished_at >= ? AND outcome IN (${placeholders})`)
-    .all(cutoff, ...UNRESOLVED_OUTCOMES) as { key: string; ticket: string; finished_at: string; outcome: string }[]
-  const updateStmt = db.prepare('UPDATE pipeline_runs SET outcome = ?, finished_at = ? WHERE key = ?')
-  for (const r of rows) {
-    const resolved = reconcileWithTracker(r.ticket, r.outcome, r.finished_at)
-    if (resolved.outcome !== r.outcome) updateStmt.run(resolved.outcome, resolved.finishedAt, r.key)
-  }
 }
 
 /**
@@ -1118,18 +918,6 @@ function parseTrackerRow(row: string): { status: string; completedAt: string | n
   return { status: cols[3], completedAt: cols[5] ? trackerCompletedAtToIso(cols[5]) : null }
 }
 
-/** 只准在 collector tick（scanPipelineRuns 系列）裡呼叫——見檔頭第 3) 節同一則
- * 「handler 內 spawnSync 會 segfault」的既有踩坑，這裡用同步版本换來 tick
- * 內程式碼可以線性寫、不用整條 async 化，代價是呼叫端要自己保證不在 HTTP
- * request handler 裡叫它。*/
-export function readTrackerStatus(ticket: string): { status: string; completedAt: string | null } | null {
-  try {
-    return parseTrackerRow(execFileSync('bash', [TRACKER_SH, 'row', ticket], { encoding: 'utf8', timeout: 10_000 }))
-  } catch {
-    return null
-  }
-}
-
 /** HTTP request handler 專用的非同步版本（見 server.ts /api/pipelines/run、
  * /api/pipelines/retry）——同一支 tracker.sh，只是換成 execFile（非 *Sync），
  * 避免本檔第 3) 節記載的「Bun 1.2.9 handler 內 *Sync* spawn 遇客戶端中斷會
@@ -1144,30 +932,37 @@ export async function readTrackerStatusAsync(ticket: string): Promise<{ status: 
   }
 }
 
-// classify-result.ts 的 NEEDS_NOTIFY／UNRESOLVED_OUTCOMES 加上 reconcileWithTracker
-// 產生的「（人工判定）」後綴——純字串判斷、不做任何 I/O，供列表頁一次算出
-// 「這一列要不要顯示重試按鈕」，跟 /api/pipelines/retry 的真正權限判斷（那邊
-// 即時查一次 tracker.sh，見 server.ts）分開：這裡只保證「大致準」，真正能不
-// 能重試以送出當下 retry 端點的即時檢查為準——這是 review 2026-08-25 發現
-// 「前端自己另外維護一份判斷、跟後端不同步」問題後的修法：現在前後端共用同
-// 一個判斷式，不會再各自漂移。
-const RETRYABLE_OUTCOME_PREFIXES = new Set(['timeout', 'failed', 'infra_failure', 'cli_failure', 'unknown_failure', 'skipped'])
+// classify-result.ts 的 NEEDS_NOTIFY／UNRESOLVED_OUTCOMES 加上 mysql 側 W6
+// reconcile sweep（reconcileStaleOutcomesToMonDb）產生的「（人工判定）」
+// 後綴——純字串判斷、不做任何 I/O，供列表頁一次算出「這一列要不要顯示重試
+// 按鈕」。2026-09-09 起 `/api/pipelines/retry` 已拿掉 tracker 完成狀態閘門
+// （tracker.md 退役，使用者核准：monitor 對任何狀態的票都能重試，只要「現在
+// 真的沒在跑」），這裡的 retryable 純粹是列表頁的顯示提示，不再對應後端的
+// 權限判斷——按鈕會不會出現看這裡，但按下去會不會成功只看那三關即時安全
+// 檢查（本機 ps／併發上限／worker 查證），兩者故意脫鉤，不是漂移。
+// 2026-09-08：補上 session_limit——classify-result.ts 的 Classification 全部
+// 失敗分類是 failed/timeout/infra_failure/cli_failure/unknown_failure/
+// session_limit，這裡原本漏了 session_limit，導致額度用盡的失敗列在畫面上
+// 沒有重試按鈕（使用者回報）。
+const RETRYABLE_OUTCOME_PREFIXES = new Set(['timeout', 'failed', 'infra_failure', 'cli_failure', 'unknown_failure', 'skipped', 'session_limit'])
 export function isBugOutcomeRetryable(outcome: string | null): boolean {
   if (!outcome) return false
   return RETRYABLE_OUTCOME_PREFIXES.has(outcome.replace(/（.*）$/, '').trim())
 }
 
-// ---------- 2b) agent traces ----------
+// ---------- 2b) agent 摘要（純函式，供 server.ts 現讀檔案即時解析用） ----------
 //
 // telegram-dispatcher/lib/pipeline-runner/claude-exec.ts 帶 trace 選項時，每次
 // claude -p 呼叫落地一份 logs/agent-traces/<ticket>/<startedAt>-<stage>.json：
 // { ticket, stage, startedAt, endedAt, cwd, args, prompt, events | error }。
 // events 是 claude -p --output-format json 的完整事件陣列（system init /
-// assistant / user(tool_result) / result）。這裡只抽摘要進 agent_runs；完整
-// 對話由 /api/agent-trace 現讀檔案。Bug pipeline 的 <ticket>.<ts>.stdout.log
-// 是同樣的事件物件，視為單一 stage 'create-mr' 一併收進來——格式上
-// 2026-08-26 前是單一 JSON 陣列（結束才 flush），之後是 stream-json 的
-// JSONL（逐行即時落盤，執行中也收得到），parseClaudeEvents 雙格式通吃。
+// assistant / user(tool_result) / result）。Bug pipeline 的
+// <ticket>.<ts>.stdout.log 是同樣的事件物件（格式上 2026-08-26 前是單一 JSON
+// 陣列、之後是 stream-json 的 JSONL，parseClaudeEvents 雙格式通吃）。
+//
+// sqlite 讀取面退役後（2026-09-09），本檔不再把這些事件摘要進背景收集迴圈
+// （agent_runs 表已隨 sqlite 一併移除）——server.ts 改成收到請求時才現讀檔案、
+// 呼叫 parseClaudeEvents/summarizeEvents 即時算一次（見 /api/agent-trace）。
 
 export type AgentSummary = {
   model: string | null
@@ -1208,57 +1003,6 @@ export function summarizeEvents(events: any[] | null): AgentSummary {
     }
   }
   return out
-}
-
-export function scanAgentTraces() {
-  if (!existsSync(AGENT_TRACE_DIR)) return
-  for (const ticket of readdirSync(AGENT_TRACE_DIR)) {
-    const dir = join(AGENT_TRACE_DIR, ticket)
-    let files: string[]
-    try { files = readdirSync(dir).filter(f => f.endsWith('.json')) } catch { continue }
-    for (const f of files) {
-      const path = join(dir, f)
-      try {
-        const st = statSync(path)
-        const mtime = st.mtime.toISOString()
-        if (agentRunMtime(path) === mtime) continue
-        const d = JSON.parse(readFileSync(path, 'utf8'))
-        const sum = summarizeEvents(d.events)
-        if (d.error) { sum.is_error = 1; sum.result_preview = String(d.error.message ?? 'error').slice(0, 300) }
-        upsertAgentRun({
-          path, ticket: d.ticket ?? ticket, kind: 'demand', stage: d.stage ?? f.replace(/^.*?Z-/, '').replace(/\.json$/, ''),
-          started_at: d.startedAt ?? mtime, ended_at: d.endedAt ?? null, ...sum, file_mtime: mtime,
-        })
-      } catch (err) {
-        console.error(`agent trace ${path} 解析失敗: ${err}`)
-      }
-    }
-  }
-}
-
-/** Bug pipeline：把 stdout.log（舊格式事件陣列 / 新格式 JSONL，見
- * parseClaudeEvents）當成單一 stage 收進 agent_runs。2026-08-26 起 stream-json
- * 逐行落盤，執行中也有內容可收（running=true 時 ended_at 記 null，UI 顯示
- * 進行中）；舊格式 run 執行中 size=0，行為同以往（結束才收）。上限 50MB：
- * 這裡每個 ingest tick 都會整檔重讀重解析（mtime 變了就解析），異常肥大的
- * log 不值得拖垮 collector，超限就放棄即時摘要、留給結束後人工看檔案。 */
-function ingestBugStdout(ticket: string, startedAt: string, stdoutPath: string, running = false) {
-  try {
-    const st = statSync(stdoutPath)
-    if (st.size === 0 || st.size > 50 * 1024 * 1024) return
-    const mtime = st.mtime.toISOString()
-    // 防重複解析的 guard 值把 running 狀態編進去：執行中存 `<mtime>~live`，
-    // 定稿存純 mtime。若兩邊共用純 mtime，會踩到「claude 剛把整包 stdout 寫完、
-    // wrapper 的 EXIT trap 還在跑（ps 仍看得到）」的空窗——live 路徑先用最終
-    // mtime 寫入 ended_at=null 的列，之後 finish 路徑看 mtime 相同直接跳過，
-    // Agent 流程永遠卡在「進行中」（2026-08-26 FAQ-4743 實際踩過）。
-    const guard = running ? `${mtime}~live` : mtime
-    if (agentRunMtime(stdoutPath) === guard) return
-    const events = parseClaudeEvents(readFileSync(stdoutPath, 'utf8'))
-    if (!events) return
-    const sum = summarizeEvents(events)
-    upsertAgentRun({ path: stdoutPath, ticket, kind: 'bug', stage: 'create-mr', started_at: startedAt, ended_at: running ? null : mtime, ...sum, file_mtime: guard })
-  } catch {}
 }
 
 export function listBugLocks(): { ticket: string; info: string }[] {
@@ -1307,18 +1051,13 @@ function lsofPids(): Map<number, number> {
   return map
 }
 
-/** service_status_log 落地：粒度比照 lib/db.ts 的 recordStatusIfChanged 既有
- * 語意（只在 up/down 翻轉時寫一筆，第一次觀測也算翻轉）——但 DB 側維護自己
- * 獨立的「上次成功落地進 DB 的狀態」（lastWrittenServiceStatus），不借用
- * recordStatusIfChanged 的回傳值：sqlite 那一份在呼叫當下就無條件寫入，不受
- * DB append 成敗影響；若 DB 側直接依賴它的回傳值決定要不要重試，一旦這次
- * DB append 失敗，sqlite 已經記錄「翻轉過」，下一輪同狀態的探測不會再被判定
- * 為翻轉，這次遺失的轉變永遠補不回來。因此這裡自己追蹤，且只在 append 真的
- * 成功後才推進；失敗時保留舊值，讓下一輪同狀態仍會判定為「與上次落地的狀態
- * 不同」而重試。
- * 表沒有 pid/latencyMs/uptimeSeconds 欄，比照 sqlite 的 status_log（只存
- * service/host/ts/status/detail），把 pid 與 detail 一併塞進 detail_json，
- * latency/uptime 兩者 sqlite 本來就不存，本函式同樣不存。 */
+/** service_status_log 落地：粒度比照 sqlite 退役前 recordStatusIfChanged 的
+ * 既有語意（只在 up/down 翻轉時寫一筆，第一次觀測也算翻轉）——維護自己獨立
+ * 的「上次成功落地進 DB 的狀態」（lastWrittenServiceStatus），只在 append 真
+ * 的成功後才推進；失敗時保留舊值，讓下一輪同狀態仍會判定為「與上次落地的
+ * 狀態不同」而重試，避免一次 append 失敗就永久遺失這次轉變。
+ * 表沒有 pid/latencyMs/uptimeSeconds 欄，把 pid 與 detail 一併塞進
+ * detail_json，latency/uptime 皆不存。 */
 const lastWrittenServiceStatus = new Map<string, 'up' | 'down'>()
 
 /** 測試專用：清空「上次成功落地進 DB 的狀態」追蹤，避免跨測試互相污染
@@ -1386,7 +1125,6 @@ async function probeOne(s: ServiceDef, pid: number | null): Promise<ProbeResult>
     detail,
     checkedAt: new Date().toISOString(),
   }
-  recordStatusIfChanged(s.id, status, pid, detail)
   appendServiceStatusIfChanged(s.id, status, pid, detail, res.checkedAt)
   lastProbe.set(s.id, res)
   return res
@@ -1432,9 +1170,7 @@ function heartbeatTick(): void {
 export function startCollectors(opts: { probeEveryMs: number; ingestEveryMs: number }) {
   const tick = async () => {
     try {
-      ingestAuditLogs()
       scanPipelineRuns()
-      scanAgentTraces()
     } catch (err) {
       console.error(`ingest tick failed: ${err}`)
     }
@@ -1446,5 +1182,3 @@ export function startCollectors(opts: { probeEveryMs: number; ingestEveryMs: num
   heartbeatTick()
   setInterval(heartbeatTick, HEARTBEAT_EVERY_MS)
 }
-
-export { db }

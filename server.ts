@@ -10,15 +10,15 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { join } from 'node:path'
 import { SERVICES, DISPATCHER_LOG_DIR, isAllowedLogPath, isAllowedTracePath, restartService } from './lib/services.ts'
-// 讀取面（MON_READ_SOURCE=sqlite|mysql，plan-db-as-truth-v3.md §8.1）。
-// server.ts 只認識這個介面，不再直接碰 sqlite——所有 SQL 都在 lib/read/ 底下，
-// 兩個資料源交出同一個形狀，**回應組裝一律留在本檔**（單一來源、形狀不分岔）。
+// 讀取面（sqlite 已於 2026-09-09 退役，恆為 mysql，見 lib/read/index.ts）。
+// server.ts 只認識這個介面，不直接碰 mysql SQL——所有 SQL 都在 lib/read/ 底下，
+// **回應組裝一律留在本檔**（單一來源、形狀不分岔）。
 import { getReader, initReader } from './lib/read/index.ts'
 import { resolveReadSource } from './lib/read/source.ts'
 import { decodeEventsCursor, encodeEventsCursor } from './lib/events-cursor.ts'
 import { resolveNextStaticPath } from './lib/next-static-path.ts'
-// 從 types.ts 匯入，**不是** lib/read/mysql.ts——後者靜態 import 會讓 sqlite 模式
-// 也載入 mysql2，違反 lib/read/index.ts:42-44 的 lazy import 紀律（MAJOR-D1）。
+// 從 types.ts 匯入，**不是** lib/read/mysql.ts——只是要型別，不需要連帶引入
+// mysql2 的 runtime 依賴。
 import { UnresolvableBeforeIdError } from './lib/read/types.ts'
 import { dedupRemoteDispatches, type RemoteDispatchCandidate } from './lib/read/remote-dispatches.ts'
 import { startCollectors, getLastProbes, listRunningPipelineProcs, listBugLocks, loadRoster, cancelPipeline, summarizeEvents, computeBugStages, readTrackerStatusAsync, isBugOutcomeRetryable, parseClaudeEvents, getReviewRoundCounts } from './lib/ingest.ts'
@@ -65,22 +65,19 @@ const PORT = Number(process.env.TG_MONITOR_PORT ?? 8799)
 const ACTIVE_WINDOW_MIN = 5
 const SESSION_GAP_MIN = 10
 
-// 讀取面來源（MON_READ_SOURCE）。預設 sqlite；切 mysql 失敗會退回 sqlite 並記
-// ERROR（見 lib/read/index.ts 的說明）。切換一律經由重啟：
-//   改 tg-monitor/.env 的一個字 + launchctl kickstart -k com.aladdin.tg-monitor
+// 讀取面固定為 mysql（sqlite 讀取面已於 2026-09-09 退役，維護協議紅區項目 6，
+// 見 lib/read/index.ts）：initReader() 探針失敗會直接 throw，不再有 sqlite
+// 可以退——這是已知取捨（沒有 fallback 才是正確行為：crash-loop 讓 launchd
+// 自動重試，見 lib/read/index.ts 的說明）。
 //
 // ⚠️ **必須排在 startCollectors() 之前**（2026-09-02 實測後調整，不是風格問題）：
 // 監控 DB 的 pool 只有 4 條連線且 `waitForConnections: false`（§4.6 pool 歸屬表 +
 // lib/mon-db.ts），借不到就**立刻報錯、不排隊**。collector 一啟動就會對 MySQL
 // 灌入大量寫入（MON_DB_ENABLED=1 之後，光 rounds 寫入端開機就是數十筆），把 4 條
 // 連線瞬間佔滿；開機探針若排在後面，會搶不到連線、拿到 `No connections available`，
-// 於是**誤判成「監控 DB 連不上」而靜默退回 sqlite** —— MON_READ_SOURCE=mysql 就這樣
-// 失效了，而且只在機器忙的時候發生。實測重現：探針排在後面時，MON_READ_SOURCE
-// 給 mysql / MySQL / 'mysql ' 三種寫法都退回 sqlite，stderr 都是
-// `探針失敗：No connections available.`。
-// 排到前面之後，探針執行時 pool 還沒有任何競爭者，這是結構性的保證，不是靠等待。
-const READ_SOURCE = await initReader()
-console.error(`tg-monitor: 讀取面資料源 = ${READ_SOURCE}`)
+// 誤判成「監控 DB 連不上」。排到前面之後，探針執行時 pool 還沒有任何競爭者，
+// 這是結構性的保證，不是靠等待。
+await initReader()
 
 startCollectors({ probeEveryMs: 5000, ingestEveryMs: 3000 })
 
@@ -279,17 +276,12 @@ app.get('/api/status-log', async c => {
 /**
  * `remote` 陣列的候選來源（去重前）。
  *
- * 任務 1（2026-09-04）：MON_READ_SOURCE=mysql 時改查監控 DB 的
- * `dispatch_attempts`（head 唯一寫入、`status_rank < 100` 即尚未終結的派工），
- * 取代原本只讀 head 行程記憶體登記表（`listDispatchEntries()`）——後者只在
- * 「進行中」期間存在，跟 `runs` 表撈出的 `rows` 是兩個互不知情的資料源，
- * worker 執行期間兩邊各存在一筆，是「列表出現兩筆相同資料」的根因（見
- * lib/read/remote-dispatches.ts 檔頭）。sqlite 讀取面沒有 `dispatch_attempts`
- * 可查，維持讀記憶體登記表（README 已載明目前主要讀取面是
- * MON_READ_SOURCE=mysql，sqlite 這條分支只是不砍掉既有行為）。
- *
- * lazy import lib/read/mysql.ts：sqlite 模式下不觸碰 mysql2（MAJOR-D1 既有
- * 紀律，見 lib/read/index.ts 的 initReader）。
+ * 任務 1（2026-09-04）：改查監控 DB 的 `dispatch_attempts`（head 唯一寫入、
+ * `status_rank < 100` 即尚未終結的派工），取代原本只讀 head 行程記憶體登記表
+ * （`listDispatchEntries()`）——後者只在「進行中」期間存在，跟 `runs` 表撈出
+ * 的 `rows` 是兩個互不知情的資料源，worker 執行期間兩邊各存在一筆，是
+ * 「列表出現兩筆相同資料」的根因（見 lib/read/remote-dispatches.ts 檔頭）。
+ * sqlite 讀取面退役後（2026-09-09）恆走這條 mysql 路徑。
  */
 /** `run.host`（`agent_runs`/`runs.host`，只有 MON_READ_SOURCE=mysql 才會帶）
  * 對應的 worker 位址——`host` 存的是 CLUSTER_WORKER_NAME，等於 worker 名冊
@@ -344,11 +336,6 @@ async function correctRemoteRunningFlags(
 }
 
 async function listRemoteDispatchCandidates(): Promise<RemoteDispatchCandidate[]> {
-  if (READ_SOURCE !== 'mysql') {
-    // 記憶體登記表（cluster-state.ts DispatchEntry）沒有 remoteRunId 欄位——
-    // 去重完全靠 dedupRemoteDispatches 的 rowKeys 判準，跟遷移前行為一致。
-    return listDispatchEntries()
-  }
   const { readActiveDispatchAttempts } = await import('./lib/read/mysql.ts')
   const rows = await readActiveDispatchAttempts()
   return rows.map(r => ({
@@ -785,9 +772,8 @@ app.post('/api/pipelines/cancel', async c => {
 // Solution 彙整起；審查有 FAILED → fixer 帶回饋重做）。盤點失敗時 pipeline
 // 自動退回整張全跑，不會卡死。
 //
-// 沿用既有、已合法的機制：tracker.sh 的 rerun 狀態本來就存在（`next` 子指令
-// 本就優先撿 rerun），create-mr.md Step 0.1 claim 本就接受 pending/rerun——
-// 這裡只是新增一個觸發入口，不是新語意。
+// 2026-09-09 起：tracker.md 退役，權限判斷不再查/寫 tracker.sh，改成只看
+// 「這張票現在是否真的在跑」（下面三關），詳見端點內註解。
 //
 // 併發上限用 ps 現場真實計數（listRunningPipelineProcs），不是
 // spawn-create-mr.ts 裡的 in-memory GLOBAL_CONCURRENCY_LIMIT 計數器：那個
@@ -843,24 +829,15 @@ app.post('/api/pipelines/retry', async c => {
     }
   }
 
-  // 即時查一次（非快取、非同步版本），這裡是唯一的權限判斷——上面 /api/pipelines
-  // 回傳的 retryable 只是給前端顯示按鈕用的粗略提示（見 isBugOutcomeRetryable
-  // 註解），送出當下一律以這裡查到的最新狀態為準。'rerun' 也放行：
-  // tracker.sh set ... rerun 成功、但下面 spawn 失敗（或 spawn 成功但新的一次
-  // 執行來不及 claim 就 skipped/crash）時，票會被留在 rerun 狀態——若這裡不放行
-  // rerun，使用者會撞進一個按鈕自己造成、又自己拒絕重試的死路（review 2026-08-25
-  // 發現）。
-  const tracker = await readTrackerStatusAsync(ticket)
-  if (!tracker) return c.json({ ok: false, reason: 'tracker 查無這張票' }, 404)
-  if (tracker.status !== 'failed' && tracker.status !== 'in_progress' && tracker.status !== 'rerun') {
-    return c.json({ ok: false, reason: `目前 tracker 狀態是「${tracker.status}」，只有 failed / in_progress（卡住）/ rerun 才能用這個按鈕重試` }, 409)
-  }
-
-  try {
-    await execFileAsync('bash', ['/Users/user/aladdin/scripts/tracker.sh', 'set', ticket, 'rerun'], { encoding: 'utf8', timeout: 10_000 })
-  } catch (err) {
-    return c.json({ ok: false, reason: `tracker.sh set 失敗：${err}` }, 500)
-  }
+  // 2026-09-09（使用者核准，紅區：retry 權限判斷語意變更，tracker.md 退役）：
+  // 拿掉「tracker 完成狀態必須是 failed/in_progress/rerun 才放行」這道閘門。
+  // 原因：create-mr pipeline 在 head/worker 端偶爾會出錯而沒有把 Notion
+  // 狀態改到終態（停在「分析中」），造成這張票在任何地方都查不到「可重試」
+  // 的狀態、monitor 卻明明知道它已經不在跑——使用者要 monitor 有權限對任何
+  // 狀態的票重跑，只要上面 3 關（本機 ps／併發上限／worker 即時查證
+  // fail-closed）確認過「這張票現在真的沒在跑」即可。也不再需要 `tracker.sh
+  // set rerun` 這個前置寫入——tracker.md 已退役，claim-ticket.sh 的
+  // `--resume` 旗標本身就會跳過候選檢查（見 aladdin_ai/scripts/claim-ticket.sh）。
   // 2026-09-01：重試沿用上一筆 run 的發起人，否則重試出來的 run 在列表
   // 「發起人」欄會空白，看不出這張單是誰認領的。取不到（上一筆本來就是人工
   // CLI 跑的、sidecar 缺檔）就不帶，行為同以前。
@@ -1459,30 +1436,25 @@ app.get('/api/stream', c => {
   })
 })
 
-// 目前生效的讀取面資料源。**新增的唯讀端點**：`MON_READ_SOURCE=mysql` 但探針
-// 失敗時會退回 sqlite（見 lib/read/index.ts），那件事原本只寫在 stderr，從外面
-// 完全看不出來——操作者會以為在跑 mysql，其實在跑 sqlite，面板還一切正常。
-// 刻意不把它塞進 /api/overview：那會改到既有回應的形狀，破壞「sqlite 模式
-// byte-level 不變」的硬驗收。
+// 目前生效的讀取面資料源。**唯讀端點**：sqlite 讀取面退役前（`MON_READ_SOURCE
+// =mysql` 但探針失敗）會靜默退回 sqlite，這支端點就是為了讓那件事從外面也
+// 看得到（原本只寫在 stderr）。刻意不把它塞進 /api/overview：那會改到既有
+// 回應的形狀。
 app.get('/api/read-source', c => {
   const raw = process.env.MON_READ_SOURCE
   return c.json({
     // 原始字串，未經解析——設定打錯字時要看得到打錯的那個字。
     requested: raw ?? null,
     effective: getReader().source,
-    // 「要的是 mysql，實際退回了 sqlite」＝探針失敗的靜默降級。
-    degraded: READ_SOURCE !== resolveReadSource(raw),
+    // sqlite 退役後（2026-09-09）不再有「探針失敗、靜默退回 sqlite」這個降級
+    // 路徑：探針失敗時 initReader() 直接 throw（見 lib/read/index.ts），行程
+    // 根本起不來，這支端點也就不會被打到——會走到這裡就代表 mysql 是活的，
+    // 恆為 false。欄位保留（不改回應形狀）供 health-monitor 既有的翻轉條件
+    // 沿用。
+    degraded: false,
     // 這個值本身認不認得（2026-09-02 新增，供 health-monitor 的翻轉條件使用）。
-    //
-    // 為什麼需要它、而不是讓呼叫端自己比 `effective !== requested`：那個裸字串
-    // 比對在**完全健康**的設定下也會成立，實測有三種（皆為正常狀態）：
-    //   MON_READ_SOURCE 未設 → run-monitor.sh 會匯出**空字串** → requested=""、effective="sqlite"
-    //   MON_READ_SOURCE=MySQL → resolveReadSource 大小寫不敏感 → effective="mysql"
-    //   MON_READ_SOURCE='mysql ' → .env 的 grep|cut 匯出常帶尾隨空白，解析時會 trim
-    // 拿它當告警條件會在這三種情況下狂叫。
-    // 正確的兩個訊號是分開的：
-    //   degraded === true        → 要 mysql 卻退回了 sqlite（探針失敗）
-    //   requestedValid === false → 這個字串根本不認得（打錯字，fail-safe 成 sqlite）
+    // MON_READ_SOURCE 現在對讀取面已無實際效果（恆為 mysql），這裡仍保留字面
+    // 檢查——純粹是「設定值本身寫得對不對」的診斷，跟讀取面實際行為分開。
     requestedValid: (raw ?? '').trim() === '' || resolveReadSource(raw) === (raw ?? '').trim().toLowerCase(),
   })
 })

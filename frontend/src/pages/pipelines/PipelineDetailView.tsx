@@ -1,13 +1,13 @@
-import { useState } from 'react'
+import { useState, type MouseEvent } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { topics } from '../../api/topics'
 import type { BugStage } from '../../api/types'
 import { Badge, Button, Card, DataTable, Toolbar, type Column } from '../../components/shared'
 import { useResource } from '../../hooks'
 import { dur, fmt, fmtTok, hms } from '../../lib/format'
-import { pipelinesPath } from '../../lib/navigation'
+import { logsPath, pipelinesPath } from '../../lib/navigation'
 import { AgentConversationCard } from './AgentConversationCard'
-import type { AgentRunRow, PipelineRunDetail } from './types'
+import { DEMAND_PIPELINE_LOG_PATH, type AgentRunRow, type PipelineRunDetail } from './types'
 
 /**
  * Pipeline run 詳情頁（`#pl-detail`）。規格：migration/tabs/pipelines.md §1/§3/§4。
@@ -182,6 +182,45 @@ export function PipelineDetailView({ runKey }: { runKey: string }) {
             ? `${fmt(r.started_at)} → ${r.finished_at ? fmt(r.finished_at) : '進行中'} · ${dur(r.started_at, r.finished_at)} · ${r.running ? 'running' : r.runningStatusUnknown ? '無法確認執行狀態（worker 連不上）' : r.outcome || ''}`
             : ''}
         </span>
+        {/* log 欄從列表頁移除後，詳情頁保留唯一的查看 LOG 入口（互動點 5 原址）。
+            task 1（2026-09-04）／worker 執行的 run 要帶著 host 一起跳轉，
+            LogsPage 才知道要向哪個 worker proxy——共用的 demand-pipeline.log
+            不在 worker 端 `GET /files` 白名單內，維持只讀本機、不帶 host。 */}
+        {r && (
+          <span className="mono">
+            {r.kind === 'demand' ? (
+              <a
+                href={logsPath(DEMAND_PIPELINE_LOG_PATH)}
+                onClick={e => {
+                  e.preventDefault()
+                  navigate(logsPath(DEMAND_PIPELINE_LOG_PATH))
+                }}
+                title="需求 pipeline 的進度全部寫在共用的 demand-pipeline.log，逐票 stdout 固定是空的"
+              >
+                進度 log
+              </a>
+            ) : (
+              (() => {
+                const host = r.host && r.host !== 'head' && r.host !== 'unknown_pre_migration' ? r.host : undefined
+                const openLog = (path: string | null) => (e: MouseEvent) => {
+                  e.preventDefault()
+                  if (path) navigate(logsPath(path, host))
+                }
+                return (
+                  <>
+                    <a href={logsPath(r.stdout_path ?? undefined, host)} onClick={openLog(r.stdout_path)}>
+                      stdout
+                    </a>
+                    {' · '}
+                    <a href={logsPath(r.stderr_path ?? undefined, host)} onClick={openLog(r.stderr_path)}>
+                      stderr
+                    </a>
+                  </>
+                )
+              })()
+            )}
+          </span>
+        )}
       </Toolbar>
 
       <div className="stack">

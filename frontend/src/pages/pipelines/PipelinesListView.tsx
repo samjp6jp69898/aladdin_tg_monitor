@@ -1,12 +1,12 @@
-import { useState, type MouseEvent } from 'react'
+import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { postPipelineCancel, postPipelineRetry } from '../../api/endpoints'
 import type { CancelPipelineResponse, PipelinesResponse, RetryPipelineResponse } from '../../api/types'
 import { Badge, Button, DataTable, ResultBadge, Toolbar, type Column } from '../../components/shared'
 import { useAction, type Resource } from '../../hooks'
 import { dur, fmt, fmtTok } from '../../lib/format'
-import { logsPath, pipelinesPath, workersPath } from '../../lib/navigation'
-import { DEMAND_PIPELINE_LOG_PATH, type PipelineListRow } from './types'
+import { pipelinesPath, workersPath } from '../../lib/navigation'
+import type { PipelineListRow } from './types'
 
 /**
  * Pipelines 列表頁。規格：migration/tabs/pipelines.md §1（`#pl-list`）、§3（`loadPipelines()`）。
@@ -199,50 +199,6 @@ export function PipelinesListView({ resource }: { resource: Resource<PipelinesRe
         if (outcome === 'cancelled') return <Badge variant="warn">cancelled</Badge>
         if (outcome) return <ResultBadge result={outcome === 'success' ? 'success' : outcome.split(' ')[0]} />
         return null
-      },
-    },
-    {
-      key: 'log',
-      header: 'log',
-      cellClassName: row => (row.kind === 'remote' ? 'mute' : undefined),
-      render: row => {
-        if (row.kind === 'queued') return null
-        if (row.kind === 'remote') return '在 worker 本機'
-        const r = row.data
-        // 互動點 5：stdout / stderr / 進度 log 連結
-        // task 1（2026-09-04）：worker 執行的 history 列（r.host 是該 worker
-        // 名稱）要帶著 host 一起跳轉，LogsPage 才知道要向哪個 worker proxy。
-        // 只用在逐票 stdout/stderr——worker 端 `GET /files` 的白名單刻意只開放
-        // 這兩種副檔名（見 telegram-dispatcher/lib/pipeline-runner/
-        // local-trace-read.ts），共用的 demand-pipeline.log 不在其中，該連結
-        // 維持原本只讀本機的行為，不帶 host（帶了 worker 端會 403）。
-        const host = r.host && r.host !== 'head' && r.host !== 'unknown_pre_migration' ? r.host : undefined
-        const openLog = (path: string | null, h?: string) => (e: MouseEvent) => {
-          e.preventDefault()
-          if (path) navigate(logsPath(path, h))
-        }
-        if (r.kind === 'demand') {
-          return (
-            <a
-              href={logsPath(DEMAND_PIPELINE_LOG_PATH)}
-              onClick={openLog(DEMAND_PIPELINE_LOG_PATH)}
-              title="需求 pipeline 的進度全部寫在共用的 demand-pipeline.log，逐票 stdout 固定是空的"
-            >
-              進度 log
-            </a>
-          )
-        }
-        return (
-          <>
-            <a href={logsPath(r.stdout_path ?? undefined, host)} onClick={openLog(r.stdout_path, host)}>
-              stdout
-            </a>
-            {' · '}
-            <a href={logsPath(r.stderr_path ?? undefined, host)} onClick={openLog(r.stderr_path, host)}>
-              stderr
-            </a>
-          </>
-        )
       },
     },
     {

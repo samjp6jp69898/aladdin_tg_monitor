@@ -464,6 +464,10 @@ export interface PipelineRunDetailResponse {
     running: boolean
     /** 同 PipelineRun.runningStatusUnknown（見該處註解），單一 run 詳情版本。 */
     runningStatusUnknown?: boolean
+    /** 同 PipelineRun.host（§8.1 可選欄位，只有 MON_READ_SOURCE=mysql 才帶）：
+     *  server.ts buildPipelineRunPayload() 的 `me` 一路帶著這個欄位判斷
+     *  running/重算 retryable，回應裡本來就有，這裡補上原本漏列的型別。 */
+    host?: string
     agents: AgentRunRow[]
     agent_count: number
     total_input: number

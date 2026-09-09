@@ -7,7 +7,6 @@
 // 不是重新驗證 MySQL 語意本身；rounds 相關測試（resolveRunIdForRounds /
 // writeRunRounds / persistReviewRoundsToMonDb）是 tg-monitor 獨有邏輯，沒有
 // telegram-dispatcher 對應實作可比對，直接驗證本檔自己的行為契約。
-import './test-tmp-db.ts' // 必須排在 ./ingest.ts 之前：把 sqlite 導向暫存檔（NB-7）
 import { afterEach, describe, expect, spyOn, test } from 'bun:test'
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -32,8 +31,6 @@ import {
   type ResolveRunIdInput,
   type TrackerReadFn,
 } from './mon-db.ts'
-// 注意 import 順序：./test-tmp-db.ts 必須在本行之前（ingest.ts → db.ts 會在
-// import 當下開 sqlite）。
 import { persistReviewRoundsToMonDbGuarded, isRoundsMonDbEligible, reconcileStaleOutcomesToMonDbGuarded } from './ingest.ts'
 
 // ---------- resolveRunId：假 pool，比對邏輯與 cancel-resolve.ts 相同 ----------
@@ -1049,17 +1046,22 @@ class FakeReconcilePool {
     this.sqls.push(sql)
     if (sql.includes('finished_at >= ?')) {
       this.calls.push('select')
-      const [host, o1, o2, o3, o4, cutoff] = params as [string, string, string, string, string, string]
-      const unresolved = new Set([o1, o2, o3, o4])
+      // params 形狀＝[host, ...RECONCILE_UNRESOLVED_OUTCOMES, cutoff]：不寫死
+      // outcome 值域大小（產品碼 2026-09-08 補上 session_limit 後從 4 個變 5
+      // 個），改用頭尾定位中段，值域再增減這裡不用跟著改。
+      const host = params[0] as string
+      const cutoff = params[params.length - 1] as string
+      const unresolved = new Set(params.slice(1, -1) as string[])
       const out = [...this.rows.values()].filter(
         r => r.host === host && r.kind === 'bug' && r.lifecycle_rank === 100 && r.outcome_tier === 2 && unresolved.has(r.outcome) && r.finished_at >= cutoff,
       )
       return [out.map(r => ({ run_id: r.run_id, ticket: r.ticket, outcome: r.outcome, finished_at: r.finished_at })), []]
     }
     if (sql.includes("'tracker_reconcile'")) {
-      const [outcome, runId, host, o1, o2, o3, o4] = params as [string, string, string, string, string, string, string]
+      // params 形狀＝[outcome, runId, host, ...RECONCILE_UNRESOLVED_OUTCOMES]，同上不寫死值域大小。
+      const [outcome, runId, host] = params as [string, string, string]
       this.calls.push(`w6:${runId}:${outcome}`)
-      const unresolved = new Set([o1, o2, o3, o4])
+      const unresolved = new Set(params.slice(3) as string[])
       const row = this.rows.get(runId)
       if (!row || row.host !== host || row.outcome_tier !== 2 || !unresolved.has(row.outcome)) {
         return [{ info: 'Rows matched: 0  Changed: 0  Warnings: 0' }, []]
@@ -1158,6 +1160,17 @@ describe('reconcileStaleOutcomesToMonDb（W6）', () => {
     expect(r2).toEqual({ swept: true, applied: 0 })
     expect(pool.calls).toEqual(['select'])
     expect(trackerCalls.length).toBe(0)
+  })
+
+  test('2026-09-08 回歸：session_limit 也是候選（原本漏收，票已被後續一次成功執行取代時舊 session_limit 列會永遠顯示可重試，見 FAQ-4940 實測）', async () => {
+    restoreFlag = setMonDbFlag('1')
+    const pool = new FakeReconcilePool()
+    pool.rows.set('run-sl', staleRow('run-sl', 'FAQ-4940', 'session_limit'))
+
+    const r = await reconcileStaleOutcomesToMonDb(pool, trackerOf({ 'FAQ-4940': { status: 'done' } }), undefined, 0)
+    expect(r).toEqual({ swept: true, applied: 1 })
+    expect(pool.rows.get('run-sl')!.outcome).toBe('recovered')
+    expect(pool.rows.get('run-sl')!.outcome_source).toBe('tracker_reconcile')
   })
 
   test('tracker failed / needs_qa / analysis_done → 寫值域內裸值（D-1）；tracker 還沒接手（null / pending / completedAt 不晚於 finished_at）→ 不覆蓋', async () => {
