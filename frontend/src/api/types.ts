@@ -353,6 +353,9 @@ export interface PipelineRunBase {
   key: string
   kind: 'bug' | 'demand'
   ticket: string
+  /** 這一輪 run 建立當下 Notion「AI分析」的原始值（set-once，不隨後續狀態
+   * 變化改寫）。只有詳情頁顯示；舊 run（尚未補這欄的寫入端版本）為 null。 */
+  initial_ai_analysis: string | null
   started_at: string
   stdout_path: string | null
   stderr_path: string | null

@@ -92,6 +92,9 @@ export interface PipelineRunRow {
   key: string
   kind: string
   ticket: string
+  /** migration 007：這一輪 run 建立當下 Notion「AI分析」的原始值，set-once
+   * 不覆蓋。只有詳情頁顯示，列表頁刻意不呈現。 */
+  initial_ai_analysis?: string | null
   started_at: string
   stdout_path: string | null
   stderr_path: string | null

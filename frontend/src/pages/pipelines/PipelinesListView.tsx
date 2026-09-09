@@ -141,21 +141,27 @@ export function PipelinesListView({ resource }: { resource: Resource<PipelinesRe
       },
     },
     {
-      key: 'started',
-      header: '開始',
+      key: 'time',
+      header: '開始／結束',
       className: 'mono',
       cellTitle: row => (row.kind === 'queued' ? '排入佇列時間' : undefined),
       render: row => {
-        if (row.kind === 'queued') return row.data.enqueuedAt ? fmt(row.data.enqueuedAt) : '-'
-        if (row.kind === 'remote') return fmt(row.data.dispatchedAt)
-        return fmt(row.data.started_at)
+        const started =
+          row.kind === 'queued'
+            ? row.data.enqueuedAt
+              ? fmt(row.data.enqueuedAt)
+              : '-'
+            : row.kind === 'remote'
+              ? fmt(row.data.dispatchedAt)
+              : fmt(row.data.started_at)
+        const finished = row.kind === 'history' ? fmt(row.data.finished_at) : '-'
+        return (
+          <div style={{ lineHeight: 1.4 }}>
+            <div>{started}</div>
+            <div className="mute">{finished}</div>
+          </div>
+        )
       },
-    },
-    {
-      key: 'finished',
-      header: '結束',
-      className: 'mono',
-      render: row => (row.kind === 'history' ? fmt(row.data.finished_at) : '-'),
     },
     {
       key: 'duration',

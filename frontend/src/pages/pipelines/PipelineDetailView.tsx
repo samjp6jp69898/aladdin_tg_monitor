@@ -182,6 +182,14 @@ export function PipelineDetailView({ runKey }: { runKey: string }) {
             ? `${fmt(r.started_at)} → ${r.finished_at ? fmt(r.finished_at) : '進行中'} · ${dur(r.started_at, r.finished_at)} · ${r.running ? 'running' : r.runningStatusUnknown ? '無法確認執行狀態（worker 連不上）' : r.outcome || ''}`
             : ''}
         </span>
+        {/* 這一輪 run 建立當下 Notion「AI分析」的原始值（set-once，之後不會
+            跟著票的最新狀態改變）——舊 run（寫入端補這欄之前產生的）為
+            null，直接不顯示，不硬湊一個「無資料」佔位。 */}
+        {r?.initial_ai_analysis && (
+          <span className="mute" title="這一輪 run 建立當下 Notion「AI分析」欄位的值，只記一次，不會跟著票之後的狀態變化更新">
+            起始 AI分析：{r.initial_ai_analysis}
+          </span>
+        )}
         {/* log 欄從列表頁移除後，詳情頁保留唯一的查看 LOG 入口（互動點 5 原址）。
             task 1（2026-09-04）／worker 執行的 run 要帶著 host 一起跳轉，
             LogsPage 才知道要向哪個 worker proxy——共用的 demand-pipeline.log

@@ -278,6 +278,9 @@ export const RUNS_SELECT = `
   SELECT COALESCE(r.legacy_key, r.run_id)                      AS \`key\`,
          r.kind                                                AS kind,
          r.ticket                                              AS ticket,
+         -- migration 007：這一輪 run 建立當下 Notion「AI分析」的原始值，
+         -- set-once 不覆蓋。只有詳情頁會顯示，列表頁刻意不呈現這欄。
+         r.initial_ai_analysis                                 AS initial_ai_analysis,
          ${iso('r.started_at')}                                AS started_at,
          r.stdout_path                                         AS stdout_path,
          r.stderr_path                                         AS stderr_path,
@@ -366,6 +369,7 @@ function toPipelineRunRow(r: any): PipelineRunRow {
     key: r.key,
     kind: r.kind,
     ticket: r.ticket,
+    initial_ai_analysis: r.initial_ai_analysis ?? null,
     started_at: r.started_at,
     stdout_path: r.stdout_path ?? null,
     stderr_path: r.stderr_path ?? null,
